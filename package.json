@@ -1,6 +1,6 @@
 {
   "name": "@sylvan-stack/arbol-codex-driver",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Arbol Codex Driver: the Arbol 2 Driver for Codex.",
   "repository": {
