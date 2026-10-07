@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .errors import Failure
 from .json_types import Json, Object, dumps, number, object_value, string, utf8
+from .run_errors import classify_error
 
 RESULT_LIMIT = 200 * 1024
 
@@ -66,8 +67,8 @@ def plain_command(command: str) -> str:
     return command
 
 
-def vendor_failure(error: Json) -> Object:
-    return Failure("vendor_error", string(object_value(error).get("message")) or "codex failed the turn.").result
+def vendor_failure(error: Json, *, tool_version: str | None = None, secrets: tuple[str, ...] = ()) -> Object:
+    return classify_error(error, tool_version=tool_version, secrets=secrets)
 
 
 def notice_data(method: str, params: Object) -> Object:
@@ -116,8 +117,19 @@ class Agent:
 
 
 class RunEvents:
-    def __init__(self, thread_id: str, turn_id: str, model: str, emit: Callable[[str, Object], None]) -> None:
+    def __init__(
+        self,
+        thread_id: str,
+        turn_id: str,
+        model: str,
+        emit: Callable[[str, Object], None],
+        *,
+        tool_version: str | None = None,
+        secrets: tuple[str, ...] = (),
+    ) -> None:
         self.thread_id, self.turn_id, self.emit = thread_id, turn_id, emit
+        self.tool_version, self.secrets = tool_version, secrets
+        self._credential_rejection: Object | None = None
         self.totals: Object = {"model": model}
         self.last_total: str | None = None
         self.foreign_notice = False
@@ -130,6 +142,20 @@ class RunEvents:
         self.output_produced = False
         self.outcome: str | None = None
         self.error: Object | None = None
+
+    @property
+    def credential_rejection(self) -> Object | None:
+        return self._credential_rejection
+
+    def failure(self, error: Json) -> Object:
+        result = vendor_failure(error, tool_version=self.tool_version, secrets=self.secrets)
+        if result["code"] == "credential_rejected" and self._credential_rejection is None:
+            self._credential_rejection = result
+        return result
+
+    def remember_child_rejection(self, mapper: RunEvents) -> None:
+        if self._credential_rejection is None:
+            self._credential_rejection = mapper.credential_rejection
 
     @property
     def usage(self) -> Object:
@@ -256,6 +282,7 @@ class RunEvents:
             )
             if ancestor is not None and ancestor.mapper is not None and foreign_thread not in self.agents:
                 ancestor.mapper.consume(method, params)
+                self.remember_child_rejection(ancestor.mapper)
                 self.replay_foreign()
                 return
             agent = self.agents.get(foreign_thread)
@@ -274,9 +301,17 @@ class RunEvents:
                             assert agent is not None
                             self.emit(type_, {"parentCallId": agent.parent_call_id, **data})
 
-                        agent.mapper = RunEvents(foreign_thread, turn_id, str(self.totals.get("model", "")), child_emit)
+                        agent.mapper = RunEvents(
+                            foreign_thread,
+                            turn_id,
+                            str(self.totals.get("model", "")),
+                            child_emit,
+                            tool_version=self.tool_version,
+                            secrets=self.secrets,
+                        )
                         agent.active = True
                     agent.mapper.consume(method, params)
+                    self.remember_child_rejection(agent.mapper)
                     if method == "turn/completed":
                         agent.active = False
                 self.replay_foreign()
@@ -391,17 +426,18 @@ class RunEvents:
             error = object_value(params.get("error"))
             if not isinstance(error.get("message"), str) or not isinstance(params.get("willRetry"), bool):
                 raise protocol_failure()
+            failure = self.failure(error)
             if params["willRetry"]:
-                self.emit("notice", {"code": "retrying", "message": error["message"]})
+                self.emit("notice", {"code": "retrying", "message": failure["message"]})
             else:
-                self.error = vendor_failure(error)
+                self.error = failure
         elif method == "turn/completed":
             self.identity(params, turn.get("id"))
             if turn.get("status") not in ("completed", "failed", "interrupted") or self.outcome is not None:
                 raise protocol_failure()
             if turn["status"] == "failed" or turn.get("error") is not None or self.error is not None:
                 self.outcome = "failed"
-                self.error = vendor_failure(turn["error"]) if turn.get("error") else self.error or vendor_failure(None)
+                self.error = self.failure(turn["error"]) if turn.get("error") else self.error or self.failure(None)
             else:
                 self.outcome = str(turn["status"])
 
