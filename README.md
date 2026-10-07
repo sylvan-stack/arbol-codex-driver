@@ -2,10 +2,11 @@
 
 Arbol Codex Driver: the Arbol 2 Driver for Codex.
 
-The base (SYL-79) and Subscription operations (SYL-81) are implemented: `info`,
-settings validation, private state, and account creation, relabelling, removal,
-sign-in/sign-out, status, usage and model catalogs. Inference runs are the next
-task (SYL-86); their command names currently return `unsupported`.
+The base (SYL-79), Subscription operations (SYL-81), and fresh inference runs
+(SYL-86) are implemented. `run` validates its request and account, starts one
+private-home app-server, streams answer and reasoning blocks with gapless
+sequence numbers, reports token totals, and ends with one final event after
+cleanup. Runs in progress are visible through `runs list`.
 
 | | |
 |---|---|
@@ -26,7 +27,35 @@ and a clean environment; it sends no prompt.
 `node test/conformance-subscriptions.mjs ../arbol` runs ten account scenarios,
 with explicit subscription scopes for C4, C5, C7, C8 and C40. Full inference
 scenarios belong to later tasks. Synthetic active-run tests verify account
-refusal and forced removal; they do not claim real Codex inference coverage.
+refusal and forced removal; real fresh-run checks are separate.
+
+`node test/conformance-runs.mjs ../arbol` runs eleven fresh-run scenarios, with
+explicit scopes for C33 (no control input and stdin request) and C40 (fresh-run
+refusals). The shared checks inspect native Codex RPCs as well as Claude input.
+Focused integration tests cover images, settings defaults, control refusals,
+stdout closure, account rechecks, and run-record cleanup.
+
+For example:
+
+```sh
+node bin/arbol-codex-driver.mjs run --subscription test-chatgpt \
+  --model gpt-5.6-luna --effort low "Reply with hello."
+```
+
+This uses an ephemeral thread in an empty folder removed when the run ends.
+`--request <file>` accepts the contract's JSON request, and CLI values override
+it. Images become private temporary `localImage` files. `--output text` prints
+complete answer blocks only. Use `--tools all --cwd <absolute-folder>` for
+unrestricted tools. A run whose tools are `none` uses Codex's read-only sandbox
+with network access off; Codex may still use a tool, whose calls are reported
+normally. Only Codex memories are switched off in its feature configuration.
+
+Conversation continuity (SYL-88), full cancellation and recovery (SYL-89), owner
+tools/sub-agent routing (SYL-90), and vendor error classification and inference
+time limits (SYL-91) remain later tasks. Nonempty history is refused until
+continuity is implemented. Current signal/control cancellation closes the
+app-server and cleans its process group; the full interrupt/sub-agent protocol
+belongs to SYL-89.
 
 `dev stand-in <folder> -- <arguments>` plays C31's supported, old and missing
 variants, C32's `info` variant, and the account scenarios selected by
@@ -35,8 +64,9 @@ including private-home/environment checks and request counts. Version evidence
 is in the Artifact Corpus's
 `research/base-info-2026-10-07.json`; the handshake comes from the first response
 in `research/probe-scripts-2026-10-06/live/codex-all.json`. Older versions and
-changed record values are synthetic test variants. Account RPC shapes come from
-the same recorded runs, with synthetic failures, pagination and concurrency.
+changed record values are synthetic test variants. Account and run RPC shapes
+come from the same recorded runs, with synthetic failures, pagination,
+concurrency, usage counts and oversized output.
 
 Every account child uses its Subscription's private `CODEX_HOME`; Codex keeps
 and renews the login there. Sign-in lasts in one command and emits JSON lines.
@@ -53,6 +83,13 @@ models in the pre-authorized test home. It creates a local account record from
 Codex's confirmed account details when that home has no record yet. It preserves
 the test login and omits the account's email from its saved evidence. The latest
 record is `research/subscriptions-2026-10-07.json` in the Artifact Corpus.
+
+The opt-in `test/probe-run-protocol.mjs <codex-path> <record-path>` sends no
+prompt: it checks the installed stable schema, local image form, configuration,
+handshake and cleanup. `test/probe-run.mjs <codex-path> <state-dir> <record-path>`
+sends two short low-effort Luna messages on `test-chatgpt`, checks events and
+usage, and verifies temporary-folder and record cleanup. Their evidence is in
+`research/run-protocol-2026-10-07.json` and `research/run-2026-10-07.json`.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the

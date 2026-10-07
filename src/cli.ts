@@ -8,8 +8,13 @@ import { State, defaultStateDirectory, fixedWait } from './state.js';
 import { inspectTool, requireTool } from './tool.js';
 import { standIn } from './stand-in.js';
 import { Subscriptions, families } from './subscriptions.js';
+import { EventStream } from './event-stream.js';
+import { run } from './run.js';
+import { Runs } from './runs.js';
 
 export async function main(args: string[]): Promise<number> {
+  const operation = args.filter((arg, index) => arg !== '--state-dir' && args[index - 1] !== '--state-dir' && !arg.startsWith('--state-dir='))[0];
+  const events = operation === 'run' ? new EventStream() : undefined;
   const cancellation = new AbortController();
   const stop = (): void => cancellation.abort();
   process.on('SIGINT', stop);
@@ -27,6 +32,12 @@ export async function main(args: string[]): Promise<number> {
     await state.initialize();
     const identity = await buildIdentity();
     cancellation.signal.throwIfAborted();
+    if (command.name === 'run') return await run(command, new Subscriptions(state, settings, notices, file, process.env, cancellation.signal), events!, process.env, identity.build, cancellation.signal);
+    if (command.name === 'runs list') {
+      const records = await new Runs(state).list();
+      process.stdout.write(JSON.stringify(records.map(({ runId, subscriptionId, startedAt, labels }) => ({ runId, subscriptionId, startedAt, ...(labels === undefined ? {} : { labels }) }))) + '\n'); return 0;
+    }
+    if (command.name === 'runs stop') { await new Runs(state).stop(command.positionals[0]!); return 0; }
     if (command.name === 'info') {
       const tool = await inspectTool(state, settings.toolPath, process.env, cancellation.signal);
       cancellation.signal.throwIfAborted();
@@ -58,6 +69,7 @@ export async function main(args: string[]): Promise<number> {
     if (command.toolRequired) requireTool(await inspectTool(state, settings.toolPath, process.env, cancellation.signal));
     throw new Failure('unsupported', `Command ${command.name} is not implemented in this Driver yet.`);
   } catch (error) {
+    if (events) return events.finish(error, cancellation.signal.aborted).catch(() => 2);
     if (cancellation.signal.aborted) return 2;
     process.stdout.write(JSON.stringify({ error: safeFailure(error) }) + '\n');
     return 1;

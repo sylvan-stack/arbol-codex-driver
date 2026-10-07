@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Failure } from './errors.js';
 import { isObject } from './settings.js';
+import { runStandIn } from './run-stand-in.js';
 
 // Version line: research/base-info-2026-10-07.json (codex-cli 0.159.2).
 // Initialize envelope: the first response in the recorded 6 October run,
@@ -35,6 +36,7 @@ const operation = (method: unknown): string => method === 'account/rateLimits/re
 
 export async function standIn(folder: string, args: string[]): Promise<number> {
   const [scenario, part = 'supported', ...extra] = (await readFile(join(folder, 'scenario'), 'utf8')).trim().split(/\s+/);
+  if (['C10', 'C11', 'C12', 'C13', 'C18', 'C19', 'C20', 'C33', 'C42', 'C43'].includes(scenario!) || scenario === 'C40' && !subscriptionParts.includes(part)) return runStandIn(folder, args);
   const subscriptions = subscriptionScenarios.includes(scenario!);
   const known = scenario === 'C31' && ['supported', 'old', 'missing'].includes(part) || scenario === 'C32' && part === 'info' || subscriptions && subscriptionParts.includes(part);
   if (extra.length || !known) throw new Failure('invalid_input', 'This stand-in does not implement that scenario.');

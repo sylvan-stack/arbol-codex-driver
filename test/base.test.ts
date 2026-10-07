@@ -213,7 +213,9 @@ test('base.cli returns one typed refusal without echoing caller secrets', async 
   for (const args of [[], ['unknown'], ['constructor'], ['toString'], ['__proto__'], ['info', '--unknown'], ['info', '--secret=secret-sentinel'], ['info', '--state-dir'], ['info', 'extra'], ['run', '--tools', 'some'], ['info', '-v', '1']]) {
     const result = await invoke(args, f.env);
     assert.equal(result.code, 1);
-    assert.deepEqual(Object.keys(result.result), ['error']);
+    if (args[0] === 'run') {
+      assert.equal(result.result.type, 'finished'); assert.equal(result.result.outcome, 'failed'); assert.equal(result.result.seq, 1);
+    } else assert.deepEqual(Object.keys(result.result), ['error']);
     assert.equal(result.result.error.code, 'invalid_input');
     assert.equal(result.stdout.includes('secret-sentinel'), false);
     assert.equal(result.stderr, '');
