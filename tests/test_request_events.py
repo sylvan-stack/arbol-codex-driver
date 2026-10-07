@@ -154,6 +154,12 @@ class Requests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(Failure):
             await read_run_request({"request": "-"}, first_line=nonfinite)
+        async def huge_integer() -> str:
+            return dumps(base)[:-1] + ',"limits":{"totalSeconds":' + str(10**400) + '}}'
+
+        with self.assertRaises(Failure) as caught:
+            await read_run_request({"request": "-"}, first_line=huge_integer)
+        self.assertEqual(caught.exception.result["code"], "invalid_input")
         identities: list[Json] = []
 
         async def missing_folder() -> str:
