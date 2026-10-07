@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+import tomllib
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -21,6 +22,7 @@ from .stand_in import ACCOUNT, CONFIG, SOURCE, VERSION, append_record, environme
 
 type Record = dict[str, Any]
 SCENARIOS = {
+    "C9",
     "C10",
     "C11",
     "C12",
@@ -32,7 +34,10 @@ SCENARIOS = {
     "C18",
     "C19",
     "C20",
+    "C25",
     "C33",
+    "C35",
+    "C37",
     "C38",
     "C40",
     "C42",
@@ -67,6 +72,12 @@ PARTS = {
     "linger",
     "stopping",
     "other-call",
+    "early-exit",
+    "no-requests",
+    "collaboration",
+    "nested",
+    "unexpected-tool",
+    "child-late-tool",
 }
 WORKER_PARTS = {
     "tool",
@@ -115,13 +126,27 @@ class RunFixture:
         self.saved_path: Path | None = None
         self.start_discovered: Callable[[], Awaitable[None]] | None = None
         self.exit_code: int | None = None
+        self.server_requests: dict[str, bool] = {}
 
     @property
     def context(self) -> Record:
         return {"threadId": self.thread_id, "turnId": self.turn_id}
 
     def received(self, details: Record | None = None) -> None:
-        append_record(self.directory, {**self.base, **(details or {})})
+        record = {**self.base, **(details or {})}
+        # Owner MCP tables can contain credentials. Even the fixture ledger
+        # records their presence and verification only, never their contents.
+        request = record.get("request")
+        if isinstance(request, dict) and isinstance(request.get("params"), dict):
+            clean = dict(request["params"])
+            if "config" in clean:
+                del clean["config"]
+                request = {**request, "params": clean}
+                record["request"] = request
+                checks = record.get("checks")
+                if isinstance(checks, dict) and "input" in checks:
+                    record["checks"] = {**checks, "input": request}
+        append_record(self.directory, record)
 
     async def write(self, value: Any) -> None:
         async with self.write_lock:
@@ -158,7 +183,7 @@ class RunFixture:
                     "payload": {
                         "id": self.thread_id,
                         "cwd": self.thread_params["cwd"],
-                        "fixtureParams": self.thread_params,
+                        "fixtureParams": {key: value for key, value in self.thread_params.items() if key != "config"},
                     },
                 }
             )
@@ -372,7 +397,26 @@ class RunFixture:
                     "checks": {**self.base["checks"], "input": request, "configurationApplied": True},
                 }
             )
-        if method is None or "id" not in request:
+        if method is None:
+            id_ = request.get("id")
+            if isinstance(id_, str) and id_ in self.server_requests:
+                approve = self.server_requests.pop(id_)
+                correct = (
+                    request.get("result") == {"decision": "accept"} and "error" not in request
+                    if approve
+                    else isinstance(request.get("error"), dict)
+                    and request["error"].get("code") == -32601
+                    and isinstance(request["error"].get("message"), str)
+                    and "result" not in request
+                )
+                if not correct:
+                    raise Failure("tool_failed", "The Driver did not settle the unexpected vendor request correctly.")
+                if not self.server_requests and self.scenario == "C25":
+                    await self.text("permissions-answer", "answer")
+                    await self.completed_turn(self.thread_id, self.turn_id, "completed")
+                    self.turn_active = False
+            return
+        if "id" not in request:
             return
 
         async def answer(result: Any) -> None:
@@ -464,7 +508,7 @@ class RunFixture:
                 not self.logged_in
                 or self.thread_params
                 or not isinstance(params.get("threadId"), str)
-                or set(params) - {"threadId", "model"}
+                or set(params) - {"threadId", "model", "config"}
                 or "model" in params
                 and params["model"] not in ("gpt-6.1-sol", "gpt-6-astra")
             ):
@@ -487,6 +531,7 @@ class RunFixture:
             self.thread_params = {
                 **first["payload"]["fixtureParams"],
                 **({"model": params["model"]} if "model" in params else {}),
+                **({"config": params["config"]} if "config" in params else {}),
             }
             self.thread_id = params["threadId"]
             self.history_items = [record["payload"] for record in records[1:] if isinstance(record, dict)]  # type: ignore[misc]
@@ -688,6 +733,12 @@ class RunFixture:
             "systemPrompt": self.thread_params.get("developerInstructions", ""),
             "nativeHistory": bool(self.history_items),
             "labelledHistory": inputs[0]["text"].startswith("Earlier conversation, for context:"),
+            **(
+                self.owner_checks(readonly)
+                if self.scenario in ("C9", "C37")
+                or (Path(os.environ["HOME"]) / ".agents/skills/fixture-skill/SKILL.md").is_file()
+                else {}
+            ),
         }
         self.received({"stage": "input", "request": request, "checks": checks})
         turn: Record = {
@@ -719,6 +770,12 @@ class RunFixture:
             await self.notify("turn/started", {"threadId": self.thread_id, "turn": turn})
             self.turn_active = True
         input_text = inputs[0]["text"]
+        if self.scenario == "C25" and self.part not in ("no-requests", "malformed"):
+            await self.unexpected_requests()
+            return
+        if self.scenario == "C35":
+            await self.completed_tools(turn)
+            return
         if stop_fixture:
             await self.notify(
                 "item/agentMessage/delta", {**self.context, "itemId": "partial-answer", "delta": "partial"}
@@ -848,6 +905,349 @@ class RunFixture:
             self.later(0.075, finish)
         else:
             await finish()
+
+    def owner_checks(self, readonly: bool) -> Record:
+        assert self.thread_params is not None
+        owner = Path(os.environ["HOME"])
+        owner_config = tomllib.loads((owner / ".codex/config.toml").read_text())
+        supplied = self.thread_params.get("config")
+        expected = {"mcp_servers": owner_config["mcp_servers"]}
+        config = tomllib.loads((self.home / "config.toml").read_text())
+        skill_path = owner / ".agents/skills/fixture-skill/SKILL.md"
+        return {
+            "ownerMcpCorrect": supplied is None if readonly else supplied == expected,
+            "ownerMcpOmitted": supplied is None,
+            "ownerSkillCorrect": skill_path.read_text()
+            == "---\nname: fixture-skill\ndescription: A sentinel skill\n---\nSkill sentinel\n",
+            "ownerSkillPath": str(skill_path),
+            "onlyMemoryFeature": config.get("features") == {"memories": False},
+            "liveWebSearch": config.get("web_search") == "live",
+            "ownerSettingsAbsent": not any(key in config for key in ("model", "developer_instructions", "mcp_servers")),
+        }
+
+    async def unexpected_requests(self) -> None:
+        command = {
+            **self.context,
+            "kind": "command",
+            "itemId": "approval-command",
+            "startedAtMs": int(time.time() * 1000),
+            "environmentId": "local",
+            "command": "/bin/zsh -lc 'echo hi'",
+            "cwd": os.getcwd(),
+            "commandActions": [{"type": "unknown", "command": "echo hi"}],
+            "proposedExecpolicyAmendment": ["echo", "hi"],
+            "availableDecisions": [
+                "accept",
+                {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["echo", "hi"]}},
+                "cancel",
+            ],
+        }
+        patch = {
+            **self.context,
+            "itemId": "approval-patch",
+            "startedAtMs": int(time.time() * 1000),
+            "reason": None,
+            "grantRoot": None,
+        }
+        question = {
+            **self.context,
+            "itemId": "question",
+            "questions": [
+                {
+                    "id": "choice",
+                    "header": "Choose",
+                    "question": "Choose a fixture colour",
+                    "isOther": False,
+                    "isSecret": False,
+                    "options": [{"label": "Blue", "description": "Fixture colour"}],
+                }
+            ],
+            "isBlocking": True,
+            "autoResolutionMs": None,
+        }
+        requests = [
+            ("item/commandExecution/requestApproval", command, True),
+            ("item/fileChange/requestApproval", patch, True),
+            (
+                "item/permissions/requestApproval",
+                {**self.context, "itemId": "permissions", "permissions": {"network": {"enabled": True}}},
+                False,
+            ),
+            ("item/tool/call", {**self.context, "callId": "client-tool", "tool": "fixture", "arguments": {}}, False),
+            (
+                "mcpServer/elicitation/request",
+                {
+                    **self.context,
+                    "serverName": "fixture",
+                    "message": "Provide fixture input",
+                    "requestedSchema": {"type": "object"},
+                },
+                False,
+            ),
+            ("item/tool/requestUserInput", question, False),
+            ("future/request", {**self.context}, False),
+        ]
+        self.server_requests = {f"fixture-request-{index}": approve for index, (_, _, approve) in enumerate(requests)}
+        for index, (method, params, _) in enumerate(requests):
+            await self.write({"id": f"fixture-request-{index}", "method": method, "params": params})
+
+    async def completed_tools(self, turn: Record) -> None:
+        """Recorded item shapes with synthetic refusal and late completion orders."""
+        await self.text("main-before", "main-before")
+        refused = {
+            **self.command(False),
+            "id": "refused",
+            "command": "/bin/zsh -lc rejected-command",
+            "commandActions": [{"type": "unknown", "command": "rejected-command"}],
+        }
+        await self.item("item/started", refused)
+        await self.item(
+            "item/completed",
+            {**refused, "status": "declined", "aggregatedOutput": "Codex refused this command.", "exitCode": None},
+        )
+        patch = {
+            "type": "fileChange",
+            "id": "patch",
+            "changes": [
+                {"path": str(Path.cwd() / "fixture-patch.txt"), "kind": {"type": "add"}, "diff": "fixture patch\n"}
+            ],
+            "status": "inProgress",
+        }
+        search = {"type": "webSearch", "id": "search", "query": "", "action": None, "results": None}
+        # MCP success/error envelopes are synthetic protocol variants; the
+        # recorded 6 October inference contained no MCP tool call.
+        mcp = {
+            "type": "mcpToolCall",
+            "id": "mcp",
+            "server": "fixture",
+            "tool": "echo",
+            "arguments": {"value": "fixture-value"},
+            "status": "inProgress",
+            "result": None,
+            "error": None,
+        }
+        for item in (patch, search, mcp):
+            await self.item("item/started", item)
+        await self.item("item/completed", {**patch, "status": "completed"})
+        await self.item(
+            "item/completed",
+            {
+                **search,
+                "query": "fixture query",
+                "action": {"type": "search", "query": "fixture query", "queries": None},
+                "results": [
+                    {
+                        "type": "text_result",
+                        "domain": "example.invalid",
+                        "ref_id": "fixture-result",
+                        "snippet": "Fixture result",
+                        "title": "Fixture",
+                        "url": "https://example.invalid/",
+                    }
+                ],
+            },
+        )
+        await self.item(
+            "item/completed",
+            {
+                **mcp,
+                "status": "completed",
+                "result": {
+                    "content": [{"type": "text", "text": "fixture-value"}],
+                    "structuredContent": {"value": "fixture-value"},
+                },
+            },
+        )
+        await self.item("item/started", {**mcp, "id": "mcp-failed"})
+        await self.item(
+            "item/completed",
+            {**mcp, "id": "mcp-failed", "status": "failed", "error": {"message": "Fixture MCP refusal."}},
+        )
+        if self.part == "unexpected-tool":
+            await self.text("main-answer", "main-answer")
+            await self.completed_turn(self.thread_id, self.turn_id, "completed")
+            self.turn_active = False
+            return
+        child = {"threadId": "agent", "turnId": "agent-turn"}
+        activity = {
+            "type": "subAgentActivity",
+            "id": "agent-started",
+            "kind": "started",
+            "agentThreadId": "agent",
+            "agentPath": "/root/fixture-worker",
+        }
+        spawn = {
+            "type": "collabAgentToolCall",
+            "id": "agent-spawn",
+            "tool": "spawnAgent",
+            "status": "inProgress",
+            "senderThreadId": self.thread_id,
+            "receiverThreadIds": [],
+            "prompt": "Fixture child",
+            "model": "",
+            "reasoningEffort": "low",
+            "agentsStates": {},
+        }
+
+        async def child_notices() -> None:
+            # Arrive before the child turn and, for collaboration, before its
+            # receiver is announced. Request handling must retain wire order.
+            self.server_requests["fixture-child-request"] = False
+            await self.write(
+                {
+                    "id": "fixture-child-request",
+                    "method": "mcpServer/elicitation/request",
+                    "params": {
+                        "threadId": "agent",
+                        "serverName": "fixture",
+                        "message": "Fixture child question",
+                        "requestedSchema": {"type": "object"},
+                    },
+                }
+            )
+            await self.notify("warning", {"threadId": "agent", "message": "Fixture child warning."})
+
+        if self.part == "collaboration":
+            await self.item("item/started", spawn)
+            await child_notices()
+            await self.notify("turn/started", {"threadId": child["threadId"], "turn": {**turn, "id": child["turnId"]}})
+            await self.notify("item/started", {**child, "item": {**self.command(False), "id": "subcall"}})
+            await self.item(
+                "item/completed",
+                {
+                    **spawn,
+                    "status": "completed",
+                    "receiverThreadIds": ["agent"],
+                    "agentsStates": {"agent": {"status": "pendingInit", "message": None}},
+                },
+            )
+        else:
+            await self.item("item/started", activity)
+            await self.item("item/completed", activity)
+            await child_notices()
+            await self.notify("turn/started", {"threadId": child["threadId"], "turn": {**turn, "id": child["turnId"]}})
+            await self.notify("item/started", {**child, "item": {**self.command(False), "id": "subcall"}})
+        await self.notify("item/agentMessage/delta", {**child, "itemId": "child-answer", "delta": "sub-agent-only"})
+        await self.notify(
+            "item/reasoning/summaryTextDelta", {**child, "itemId": "child-reasoning", "delta": "child-thinking"}
+        )
+        await self.notify("item/commandExecution/outputDelta", {**child, "itemId": "subcall", "delta": "child-output"})
+        nested = {"threadId": "nested-agent", "turnId": "nested-turn"}
+        nested_activity = {
+            **activity,
+            "id": "nested-started",
+            "agentThreadId": nested["threadId"],
+            "agentPath": "/root/fixture-worker/nested",
+        }
+        if self.part == "nested":
+            for method in ("item/started", "item/completed"):
+                await self.notify(method, {**child, "item": nested_activity})
+            await self.notify(
+                "turn/started", {"threadId": nested["threadId"], "turn": {**turn, "id": nested["turnId"]}}
+            )
+            await self.notify("item/started", {**nested, "item": {**self.command(False), "id": "nested-call"}})
+            await self.notify("item/agentMessage/delta", {**nested, "itemId": "nested-answer", "delta": "nested-only"})
+        worker = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-c",
+            "import time; time.sleep(.4); print('background-output')",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        background = {
+            **self.command(False),
+            "id": "background",
+            "processId": str(worker.pid),
+            "command": "/bin/zsh -lc 'sleep .4; echo background-output'",
+            "commandActions": [{"type": "unknown", "command": "sleep .4; echo background-output"}],
+        }
+        await self.item("item/started", background)
+        await self.text("main-answer", "main-answer")
+        await self.completed_turn(self.thread_id, self.turn_id, "completed")
+        self.turn_active = False
+        self.received(
+            {
+                "stage": "main-ended",
+                "checks": {
+                    **self.base["checks"],
+                    "backgroundWasAlive": worker.returncode is None,
+                    "childWasActive": True,
+                },
+            }
+        )
+        if self.part == "early-exit":
+            self.exit_code = 1
+            self.input.close()
+            return
+
+        async def finish_children() -> None:
+            if self.part == "nested":
+                await self.notify(
+                    "item/completed", {**nested, "item": {**self.command(True, "nested-output"), "id": "nested-call"}}
+                )
+                await self.notify("item/completed", {**nested, "item": self.message("nested-answer", "nested-only")})
+                await self.completed_turn(nested["threadId"], nested["turnId"], "completed")
+                for method in ("item/started", "item/completed"):
+                    await self.notify(
+                        method, {**child, "item": {**nested_activity, "id": "nested-completed", "kind": "completed"}}
+                    )
+            await self.notify(
+                "item/completed", {**child, "item": {**self.command(True, "child-output"), "id": "subcall"}}
+            )
+            await self.notify("item/completed", {**child, "item": self.message("child-answer", "sub-agent-only")})
+            await self.notify(
+                "item/completed",
+                {**child, "item": {"type": "reasoning", "id": "child-reasoning", "summary": ["child-thinking"]}},
+            )
+            await self.notify(
+                "thread/tokenUsage/updated",
+                {
+                    **child,
+                    "tokenUsage": {
+                        "total": {"totalTokens": 5, "inputTokens": 3, "outputTokens": 2},
+                        "last": {"totalTokens": 5, "inputTokens": 3, "outputTokens": 2},
+                    },
+                },
+            )
+            if self.part == "child-late-tool":
+                await self.notify("item/started", {**child, "item": {**mcp, "id": "child-late-mcp"}})
+            await self.completed_turn(child["threadId"], child["turnId"], "completed")
+            if self.part != "collaboration":
+                for method in ("item/started", "item/completed"):
+                    await self.item(method, {**activity, "id": "agent-completed", "kind": "completed"})
+            self.received({"stage": "child-ended"})
+
+        async def finish_background() -> None:
+            output, _ = await worker.communicate()
+            await self.notify(
+                "item/commandExecution/outputDelta", {**self.context, "itemId": "background", "delta": output.decode()}
+            )
+            await self.item(
+                "item/completed",
+                {
+                    **background,
+                    "status": "completed",
+                    "aggregatedOutput": output.decode(),
+                    "exitCode": worker.returncode,
+                    "durationMs": 400,
+                },
+            )
+            self.received({"stage": "background-ended"})
+
+        self.later(0.15, finish_children)
+        self.later(0, finish_background)
+        if self.part == "child-late-tool":
+
+            async def finish_child_tool() -> None:
+                await self.notify(
+                    "item/completed",
+                    {**child, "item": {**mcp, "id": "child-late-mcp", "status": "completed", "result": {"late": True}}},
+                )
+                self.received({"stage": "child-tool-ended"})
+
+            self.later(0.55, finish_child_tool)
 
     async def start_subagents(self, command: Record, turn: Record) -> None:
         activity: Record = {

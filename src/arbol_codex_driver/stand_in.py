@@ -30,6 +30,7 @@ SUBSCRIPTION_PARTS = {
     "unknown-windows",
 }
 RUN_SCENARIOS = {
+    "C9",
     "C10",
     "C11",
     "C12",
@@ -41,7 +42,10 @@ RUN_SCENARIOS = {
     "C18",
     "C19",
     "C20",
+    "C25",
     "C33",
+    "C35",
+    "C37",
     "C38",
     "C42",
     "C43",

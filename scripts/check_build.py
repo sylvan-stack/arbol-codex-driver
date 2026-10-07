@@ -85,7 +85,7 @@ def contract(folder: Path) -> int:
         if code:
             return code
     env["ARBOL_DRIVER_ENTRY"] = str(folder / ENTRY)
-    for scope in ("base", "subscriptions", "runs", "continuity", "stops"):
+    for scope in ("base", "subscriptions", "runs", "continuity", "stops", "tools"):
         code = run([node, str(folder / f"test/conformance-{scope}.mjs"), str(repo)], cwd=folder, env=env)
         if code:
             return code
