@@ -4,8 +4,9 @@ import uuid
 from collections.abc import Callable
 
 from .cancellation import Cancellation, interruptible
-from .errors import safe_failure
-from .json_types import Json, Object, dumps, now, utf8
+from .errors import redact, safe_failure
+from .json_types import Json, Object, dumps, now, object_value, utf8
+from .owner_setup import DiagnosticScrubber
 
 
 class Output:
@@ -61,6 +62,8 @@ class EventStream:
         self.finished = False
         self.last: asyncio.Task[None] | None = None
         self.tasks: set[asyncio.Task[None]] = set()
+        self.private_values: tuple[str, ...] = ()
+        self.scrubbers: dict[tuple[str, str, str], DiagnosticScrubber] = {}
 
     def identity(self, run_id: str, labels: Object | None) -> None:
         self.run_id, self.labels = run_id, labels
@@ -68,13 +71,32 @@ class EventStream:
     def emit(self, type_: str, data: Object | None = None) -> None:
         if self.finished:
             return
-        data = data or {}
+        original_data = data or {}
+        data = object_value(redact(original_data, self.private_values))
+        if self.private_values and type_ in ("text_delta", "thinking_delta", "tool_output_delta"):
+            key = (type_, str(data.get("parentCallId", "")), str(data.get("callId", "")))
+            scrubber = self.scrubbers.setdefault(key, DiagnosticScrubber(self.private_values))
+            # Feed the original chunk: a value split across chunks must never
+            # become visible when a caller joins the emitted deltas.
+            original = original_data.get("text", "")
+            data = {**data, "text": scrubber.feed(str(original))}
+            if not data["text"]:
+                return
+        elif self.private_values and type_ in ("text", "thinking", "tool_finished", "finished"):
+            delta_type = {"text": "text_delta", "thinking": "thinking_delta", "tool_finished": "tool_output_delta"}.get(type_)
+            for key in list(self.scrubbers):
+                if type_ == "finished" or (key == (delta_type, str(data.get("parentCallId", "")), str(data.get("callId", "")))):
+                    tail = self.scrubbers.pop(key).feed("", final=True)
+                    if tail:
+                        self.emit(key[0], {"text": tail, **({"parentCallId": key[1]} if key[1] else {}),
+                                           **({"callId": key[2]} if key[2] else {})})
+                        self.scrubbers.pop(key, None)
         self.sequence += 1
         record: Object = {
-            "runId": self.run_id,
+            "runId": redact(self.run_id, self.private_values),
             "seq": self.sequence,
             "at": now(),
-            **({"labels": self.labels} if self.labels is not None else {}),
+            **({"labels": redact(self.labels, self.private_values)} if self.labels is not None else {}),
             "type": type_,
             **data,
         }

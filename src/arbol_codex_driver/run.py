@@ -10,7 +10,7 @@ from .arguments import Command
 from .cancellation import Cancellation, interruptible
 from .catalog import normalize_account, read_model_catalog
 from .continuity import Chats, MessageDigest
-from .errors import Failure
+from .errors import Failure, redact
 from .event_stream import EventStream
 from .history import history_items, labelled_history_input, prepare_turn_input
 from .input_stream import Input
@@ -89,10 +89,8 @@ async def run(
     limits: RunLimits | None = None
 
     def emit(type_: str, data: Object) -> None:
-        if type_ == "notice":
-            data = {**data, "message": sanitize_diagnostic(data.get("message"), private_values)}
         if type_ == "text" and "parentCallId" not in data:
-            fingerprint.add({"type": "message", "role": "assistant", "text": data["text"]})
+            fingerprint.add({"type": "message", "role": "assistant", "text": redact(data["text"], private_values)})
         events.emit(type_, data)
 
     events.output.on_error = cancellation.abort
@@ -157,6 +155,7 @@ async def run(
         child_env = env.copy()
         owner_config = owner_mcp_config(env) if request.tools == "all" else {}
         private_values = diagnostic_values(owner_config)
+        events.private_values = private_values
         if request.search_path:
             child_env["PATH"] = child_env.get("PATH", "") + os.pathsep + os.pathsep.join(request.search_path)
         if request.control:
