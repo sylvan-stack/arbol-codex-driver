@@ -3,7 +3,8 @@
 Arbol Codex Driver: the Arbol 2 Driver for Codex.
 
 The base (SYL-79), Subscription operations (SYL-81), fresh inference runs
-(SYL-86), and conversation continuity (SYL-88) are implemented. `run` validates its request and account, starts one
+(SYL-86), conversation continuity (SYL-88), and stopping and recovery (SYL-89)
+are implemented. `run` validates its request and account, starts one
 private-home app-server, streams answer and reasoning blocks with gapless
 sequence numbers, reports token totals, and ends with one final event after
 cleanup. Runs in progress are visible through `runs list`.
@@ -65,11 +66,29 @@ stand-in. Focused unit and integration checks cover digests, all rebuild reasons
 native and text histories, private image files, model overrides, concurrent
 resumes and map invalidation.
 
-Full cancellation and recovery (SYL-89), owner
-tools/sub-agent routing (SYL-90), and vendor error classification and inference
-time limits (SYL-91) remain later tasks. Current signal/control cancellation closes the
-app-server and cleans its process group; the full interrupt/sub-agent protocol
-belongs to SYL-89.
+Stop a run with `runs stop <run-id>`, an interrupt or termination signal, or a
+`{"type":"stop"}` line on the standard input of `run --control`. Ending that
+control input or losing the event output also stops the run. `runs stop` waits
+for its final event and succeeds for an ended or unknown run. A stop preserves
+events already sent, closes running calls as interrupted, and ends as
+`cancelled` with exit status 2.
+
+The Driver interrupts the main turn and active sub-agent turns concurrently
+under one two-second deadline. It then closes app-server input and ends any
+remaining verified process groups within the fifteen-second stop bound. Run
+records and temporary files go after cleanup. If the Driver is killed outright,
+the next `run`, `runs list`, `runs stop` or Subscription change recovers the
+orphaned tool and its command groups, removes its temporary folder and record,
+and invalidates the matching conversation entry. A program that makes itself a
+separate background service is outside this cleanup, as DRV-D33 specifies.
+
+`node test/conformance-stops.mjs ../arbol` runs shared C15, C16, C17, C38 and
+C33's active-record and peer-stop checks. Caller questions remain excluded from
+Codex's C33 scope. Focused tests cover control and signal stops, event-pipe loss,
+ignored interrupts, active child and descendant turns, process identities,
+simultaneous recovery and conditional conversation invalidation. Full owner
+tools and sub-agent routing (SYL-90), and vendor error classification and
+inference time limits (SYL-91), remain later tasks.
 
 `dev stand-in <folder> -- <arguments>` plays C31's supported, old and missing
 variants, C32's `info` variant, and the account scenarios selected by
@@ -113,6 +132,15 @@ short Luna turns at the lowest offered effort on `test-chatgpt`: a tool turn,
 a resumed follow-up, an edited-history rebuild and a changed-system-prompt
 rebuild. Records are `research/continuity-protocol-2026-10-07.json` and
 `research/continuity-2026-10-07.json`.
+
+`test/probe-stop.mjs <codex-path> <record-path>` sends no prompt or account
+request. It checks the stable interrupt and sub-agent notification schemas, an
+idle interrupt, continued transport use and EOF cleanup in a fresh home. The
+opt-in `test/probe-stop-live.mjs <codex-path> <state-dir> <record-path>` checks
+answer cancellation, stopping a sub-agent's long command and recovery after a
+killed Driver on `test-chatgpt`, after checking available usage. Evidence is
+saved as `research/stopping-protocol-2026-10-07.json` and
+`research/stopping-2026-10-07.json` in the Artifact Corpus.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the
