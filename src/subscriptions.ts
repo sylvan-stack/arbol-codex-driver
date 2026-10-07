@@ -178,10 +178,10 @@ export class Subscriptions {
       server = await this.start(id);
       const account = normalizeAccount(await server.request('account/read', { refreshToken: true }, this.waitOptions()));
       this.signal?.throwIfAborted();
-      return this.merge(initial, account ? { state: 'signed_in', account, checkedAt: now() } :
+      return await this.merge(initial, account ? { state: 'signed_in', account, checkedAt: now() } :
         { state: 'needs_attention', problem: this.rejection('The Codex home has no ChatGPT account.').result, checkedAt: now() });
     } catch (error) {
-      if (error instanceof Failure && error.result.code === 'credential_rejected') return this.merge(initial, { state: 'needs_attention', problem: error.result, checkedAt: now() });
+      if (error instanceof Failure && error.result.code === 'credential_rejected') return await this.merge(initial, { state: 'needs_attention', problem: error.result, checkedAt: now() });
       throw error;
     } finally { await server?.close(); }
   }
@@ -390,7 +390,7 @@ export class Subscriptions {
       await server.request('account/logout', {}, this.waitOptions());
       this.signal?.throwIfAborted();
       await this.finish(id, progress, { state: 'signed_out', checkedAt: now() });
-      return this.get(id);
+      return await this.get(id);
     } finally { await server?.close(); await this.finish(id, progress); }
   }
   async remove(id: string, force = false): Promise<void> {

@@ -8,6 +8,7 @@ import { buildIdentity } from './build.js';
 import { cleanEnvironment } from './environment.js';
 import { Failure, errno, safeText } from './errors.js';
 import { isObject } from './settings.js';
+import { collectProcessGroups, endProcessGroups } from './process-groups.js';
 import { atomicWrite, fixedWait, privateDirectory, processOwner } from './state.js';
 import type { Owner } from './state.js';
 import type { ProcessEnv } from './types.js';
@@ -39,6 +40,7 @@ export interface AppServerOptions {
   requestTimeoutMs?: number;
   onSpawn?: (owner: Owner) => Promise<void> | void;
   onServerRequest?: (method: string, params: unknown) => unknown;
+  launchIdentityPath?: string;
 }
 interface Pending {
   resolve(value: unknown): void;
@@ -83,10 +85,12 @@ export class AppServer {
   private readonly decoder = new StringDecoder('utf8');
   private buffer = '';
   private removeAbort: (() => void) | undefined;
+  private readonly groups = new Map<number, Owner>();
 
   private constructor(private readonly child: ChildProcessWithoutNullStreams, owner: Owner, private readonly timeoutMs: number, private readonly cleanupGraceMs: number,
     private readonly onServerRequest?: AppServerOptions['onServerRequest']) {
     this.ownerRecord = owner;
+    this.groups.set(owner.pid, owner);
     this.closed = new Promise<void>(resolve => { this.closeResolve = resolve; });
     child.stdout.on('data', (chunk: Buffer) => this.consume(this.decoder.write(chunk)));
     child.stdout.once('end', () => {
@@ -118,7 +122,10 @@ export class AppServer {
     await writeDriverConfig(home);
     const identity = await buildIdentity();
     if (options.signal?.aborted) throw aborted();
-    const child = spawn(options.toolPath, ['app-server'], {
+    const launcher = options.launchIdentityPath && process.platform !== 'win32';
+    const child = spawn(launcher ? '/bin/sh' : options.toolPath, launcher ? ['-c',
+      'umask 077; ledger="$1.write"; { printf "%s\\n" "$$"; TZ=UTC LC_ALL=C /bin/ps -p "$$" -o lstart=; } > "$ledger" && /bin/mv -f "$ledger" "$1" || exit 1; exec "$2" app-server',
+      'arbol-codex-launch', options.launchIdentityPath!, options.toolPath] : ['app-server'], {
       cwd: options.cwd ?? home,
       env: cleanEnvironment(options.env, options.env.HOME ?? homedir(), home),
       detached: process.platform !== 'win32',
@@ -131,7 +138,7 @@ export class AppServer {
     // Install listeners before the asynchronous owner lookup: even a wrapper
     // that exits immediately must be drained and its process group stopped.
     const server = new AppServer(child, { pid: child.pid, startedAt: new Date().toISOString() }, requestTimeoutMs, cleanupGraceMs, options.onServerRequest);
-    const abort = (): void => { server.fail(aborted()); void server.close(); };
+    const abort = (): void => { server.fail(aborted()); void server.close().catch(() => {}); };
     if (options.signal) {
       options.signal.addEventListener('abort', abort, { once: true });
       server.removeAbort = () => options.signal?.removeEventListener('abort', abort);
@@ -140,6 +147,7 @@ export class AppServer {
       const owner = await processOwner(child.pid);
       if (!owner) throw new Failure('tool_failed', 'Cannot identify the codex app-server process.');
       server.ownerRecord = owner;
+      server.groups.set(owner.pid, owner);
       await options.onSpawn?.(owner);
       if (options.signal?.aborted) throw aborted();
       const answer = await server.request('initialize', { clientInfo: { name: 'arbol-codex-driver', version: identity.version } });
@@ -195,7 +203,7 @@ export class AppServer {
       const timer = setTimeout(() => {
         const error = new Failure('tool_failed', `codex did not answer ${method} within the request timeout.`);
         this.fail(error);
-        void this.close();
+        void this.close().catch(() => {});
       }, options.timeoutMs ?? this.timeoutMs);
       const dispose = (): void => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); };
       const finish = (error: Error): void => { this.pending.delete(id); dispose(); reject(error); };
@@ -287,11 +295,11 @@ export class AppServer {
 
   private malformed(): void {
     this.fail(new Failure('tool_failed', 'codex returned a malformed app-server message.'));
-    void this.close();
+    void this.close().catch(() => {});
   }
   private oversized(): void {
     this.fail(new Failure('tool_failed', 'codex returned an oversized app-server message.'));
-    void this.close();
+    void this.close().catch(() => {});
   }
   private fail(error: Error): void {
     this.failure ??= error;
@@ -309,33 +317,42 @@ export class AppServer {
       else process.kill(-this.owner.pid, signal);
     } catch (error) { if (!errno(error, 'ESRCH')) this.failure ??= new Failure('tool_failed', 'Cannot stop the codex app-server.'); }
   }
-  close(): Promise<void> {
+  async captureProcessGroups(): Promise<Owner[]> {
+    for (const owner of await collectProcessGroups(this.owner)) this.groups.set(owner.pid, owner);
+    return [...this.groups.values()];
+  }
+  close(deadline = performance.now() + fixedWait(10000)): Promise<void> {
     if (this.closing) return this.closing;
     this.fail(new Failure('tool_failed', 'The codex app-server was stopped.'));
     this.removeAbort?.();
     this.closing = (async () => {
-      this.killGroup('SIGTERM');
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([this.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, this.cleanupGraceMs); })]);
-      if (timer) clearTimeout(timer);
-      this.killGroup('SIGKILL');
+      let cleanupError: unknown;
+      await this.captureProcessGroups().catch(error => { cleanupError = error; });
+      const survivors = await endProcessGroups([...this.groups.values()], deadline).catch(error => {
+        cleanupError ??= error; this.killGroup('SIGKILL'); return [...this.groups.values()];
+      });
       // Detaching does not detach the pipe handles. Bound cleanup even when a
       // grandchild escapes the group and retains one of the inherited pipes.
       this.child.stdin.destroy(); this.child.stdout.destroy(); this.child.stderr.destroy();
       let finalTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([this.closed, new Promise<void>(resolve => { finalTimer = setTimeout(resolve, this.cleanupGraceMs); })]);
       if (finalTimer) clearTimeout(finalTimer);
+      if (cleanupError) throw cleanupError;
+      if (survivors.length) throw new Failure('tool_failed', 'Some codex processes could not be ended.', { detail: { basis: 'fields', excerpt: JSON.stringify(survivors) } });
     })();
     return this.closing;
   }
 
   /** Normal run completion lets the app-server clean up its commands on stdin EOF. */
-  async end(): Promise<void> {
+  async end(deadline = performance.now() + fixedWait(15000)): Promise<void> {
     if (this.closing) return this.closing;
+    let captureError: unknown;
+    await this.captureProcessGroups().catch(error => { captureError = error; });
     this.child.stdin.end();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([this.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, fixedWait(2000)); })]);
+    await Promise.race([this.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, Math.min(fixedWait(2000), Math.max(1, deadline - performance.now()))); })]);
     clearTimeout(timer);
-    await this.close();
+    await this.close(deadline);
+    if (captureError) throw captureError;
   }
 }

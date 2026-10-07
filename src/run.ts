@@ -13,11 +13,36 @@ import { readRunRequest } from './run-request.js';
 import type { RunRequest } from './run-request.js';
 import { Runs } from './runs.js';
 import { isObject } from './settings.js';
-import { fixedWait, privateDirectory, readJson } from './state.js';
+import { fixedWait, privateDirectory, readJson, writeJson } from './state.js';
 import { inspectTool, requireTool } from './tool.js';
 import type { Command } from './arguments.js';
 import type { Subscriptions } from './subscriptions.js';
 import type { ProcessEnv } from './types.js';
+
+/** Interrupt all known turns under one deadline; late child starts join that stop. */
+async function interruptTurns(server: AppServer, mapper: RunEvents, deadline: number): Promise<void> {
+  const sent = new Set<string>();
+  const pending: Promise<unknown>[] = [];
+  const cancellation = new AbortController();
+  const timer = setTimeout(() => cancellation.abort(), Math.max(1, deadline - performance.now()));
+  try {
+    for (const notification of server.takeNotifications()) mapper.consume(notification.method, notification.params);
+    while (performance.now() < deadline) {
+      for (const turn of mapper.activeTurns) {
+        const key = turn.threadId + ':' + turn.turnId;
+        if (sent.has(key)) continue;
+        sent.add(key);
+        pending.push(server.request('turn/interrupt', turn, { signal: cancellation.signal }).catch(() => {}));
+      }
+      if (!mapper.activeTurns.length && !mapper.hasActiveAgents) break;
+      const notification = await server.nextNotification({ signal: cancellation.signal }).catch(() => undefined);
+      if (!notification) break;
+      mapper.consume(notification.method, notification.params);
+    }
+  } finally {
+    cancellation.abort(); clearTimeout(timer); await Promise.allSettled(pending);
+  }
+}
 
 export async function run(command: Command, subscriptions: Subscriptions, events: EventStream,
   env: ProcessEnv, build: string, signal: AbortSignal): Promise<number> {
@@ -34,11 +59,16 @@ export async function run(command: Command, subscriptions: Subscriptions, events
   let request: RunRequest | undefined;
   let plan: ContinuityPlan | undefined;
   let conversation: string | undefined;
+  let currentModel: string | undefined;
+  let stopAt: number | undefined;
   const fingerprint = new MessageDigest();
   const chats = new Chats(subscriptions.state);
   const pendingNotices: Array<Record<string, unknown>> = [];
   const localStop = new AbortController();
   const activeSignal = AbortSignal.any([signal, localStop.signal]);
+  const markStop = (): void => { stopAt ??= performance.now(); };
+  activeSignal.addEventListener('abort', markStop, { once: true });
+  if (activeSignal.aborted) markStop();
   const outputClosed = (): void => localStop.abort();
   events.output.on('error', outputClosed);
   const runs = new Runs(subscriptions.state);
@@ -93,6 +123,7 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     const tool = await inspectTool(subscriptions.state, subscriptions.settings.toolPath, env, activeSignal); requireTool(tool);
     server = await AppServer.start({ toolPath: tool.path!, home: join(subscriptions.state.subscription(subscription.id), 'home'),
       cwd, env: childEnv, signal: activeSignal, requestTimeoutMs: fixedWait(30000, env),
+      launchIdentityPath: join(temporary, 'tool-owner.txt'),
       onSpawn: async owner => { record.tool = owner; await runs.save(record); },
       onServerRequest: (method, _params) => {
         const notice = { code: 'unexpected_request', message: `codex sent ${method}; there is nobody to answer a question in this run.` };
@@ -135,6 +166,7 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     const restoredTurns = new Set(Array.isArray(thread.thread.turns) ? thread.thread.turns.flatMap(turn =>
       isObject(turn) && typeof turn.id === 'string' ? [turn.id] : []) : []);
     conversation = thread.thread.id;
+    currentModel = thread.model;
     record.conversation = conversation; await runs.save(record);
     let turnInput: Pick<RunRequest['input'], 'text' | 'images'> = request.input;
     if (plan!.continuity === 'rebuilt' && request.history.length) {
@@ -154,9 +186,10 @@ export async function run(command: Command, subscriptions: Subscriptions, events
       ...(request.serviceTier === undefined ? {} : { serviceTier: request.serviceTier }) }, { signal: activeSignal });
     if (!isObject(turn) || !isObject(turn.turn) || typeof turn.turn.id !== 'string') throw new Failure('tool_failed', 'Codex returned a malformed turn.');
     mapper = new RunEvents(thread.thread.id, turn.turn.id, thread.model, (type, data) => {
-      if (type === 'text') fingerprint.add({ type: 'message', role: 'assistant', text: data.text as string });
+      if (type === 'text' && data.parentCallId === undefined) fingerprint.add({ type: 'message', role: 'assistant', text: data.text as string });
       events.emit(type, data);
     });
+    await writeJson(join(temporary, 'shell-owners.json'), await server.captureProcessGroups());
     events.emit('started', { continuity: plan!.continuity, ...(plan!.rebuildReason === undefined ? {} : { rebuildReason: plan!.rebuildReason }), subscriptionId: request.subscriptionId, model: thread.model,
       ...(effort === undefined ? {} : { effort }), toolVersion: server.toolVersion ?? tool.version!, driverBuild: build });
     started = true;
@@ -165,8 +198,8 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     for (const notice of subscriptions.notices) events.emit('notice', { ...notice });
     await events.flush();
     let remainingCallsDeadline: number | undefined;
-    while (!mapper.outcome || mapper.openCalls.size) {
-      const waitingForOtherCalls = !!mapper.outcome && ![...mapper.openCalls.values()].some(call => call.type === 'commandExecution');
+    while (!mapper.outcome || mapper.openCalls.size || mapper.waitingForWork) {
+      const waitingForOtherCalls = !!mapper.outcome && !mapper.waitingForWork;
       if (waitingForOtherCalls) remainingCallsDeadline ??= performance.now() + fixedWait(2000, env);
       const remaining = remainingCallsDeadline === undefined ? undefined : remainingCallsDeadline - performance.now();
       if (waitingForOtherCalls && remaining! <= 0) break;
@@ -176,6 +209,11 @@ export async function run(command: Command, subscriptions: Subscriptions, events
       if (plan!.continuity === 'resumed' && notification.method === 'thread/tokenUsage/updated' &&
         isObject(notification.params) && notification.params.threadId === conversation &&
         (notification.params.turnId === undefined || typeof notification.params.turnId === 'string' && restoredTurns.has(notification.params.turnId))) continue;
+      if (notification.method === 'item/started' && isObject(notification.params) &&
+        isObject(notification.params.item) && notification.params.item.type === 'commandExecution') {
+        // The vendor processId is a terminal identifier, never an OS PID.
+        await writeJson(join(temporary, 'shell-owners.json'), await server.captureProcessGroups());
+      }
       mapper.consume(notification.method, notification.params); await events.flush();
     }
     if (mapper.outcome === 'failed') error = new Failure(mapper.error?.code ?? 'vendor_error', mapper.error?.message ?? 'Codex failed the turn.', mapper.error ?? {});
@@ -185,10 +223,29 @@ export async function run(command: Command, subscriptions: Subscriptions, events
   finally {
     settled = true; input?.close();
     if (controlTask) await controlTask;
-    await server?.end().catch(failure => { error ??= failure; });
-    mapper?.closeOpenCalls();
+    if (activeSignal.aborted && server) {
+      if (!mapper && conversation) {
+        const queued = server.takeNotifications();
+        const announced = queued.find(notification => notification.method === 'turn/started' &&
+          isObject(notification.params) && notification.params.threadId === conversation && isObject(notification.params.turn));
+        if (announced && isObject(announced.params) && isObject(announced.params.turn) && typeof announced.params.turn.id === 'string') {
+          mapper = new RunEvents(conversation, announced.params.turn.id, currentModel ?? '', (type, data) => events.emit(type, data));
+          if (!started) events.emit('started', { continuity: plan!.continuity,
+            ...(plan!.rebuildReason === undefined ? {} : { rebuildReason: plan!.rebuildReason }),
+            subscriptionId: request!.subscriptionId, model: currentModel, toolVersion: server.toolVersion, driverBuild: build });
+          for (const notification of queued) mapper.consume(notification.method, notification.params);
+        }
+      }
+      if (mapper) await interruptTurns(server, mapper, stopAt! + fixedWait(2000, env)).catch(() => {});
+    }
+    await server?.end(stopAt === undefined ? undefined : stopAt + fixedWait(15000, env)).catch(failure => {
+      error ??= failure;
+      if (activeSignal.aborted) events.emit('notice', { code: 'cleanup_failed', message: failure.message });
+    });
+    mapper?.closeOpenCalls(activeSignal.aborted ? 'The tool call was interrupted by the caller.' : undefined);
     if (temporary) await rm(temporary, { recursive: true, force: true }).catch(failure => { error ??= failure; });
     events.output.off('error', outputClosed);
+    activeSignal.removeEventListener('abort', markStop);
   }
   if (request && plan && reservedId) {
     try { await events.flush(); } catch (failure) { error ??= failure; }

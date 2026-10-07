@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
+import { spawn } from 'node:child_process';
 import { Failure } from './errors.js';
 import { isObject } from './settings.js';
 
@@ -25,8 +26,9 @@ const fixtureModels = modelIds.map((id, index) => ({
 
 export async function runStandIn(directory: string, args: string[]): Promise<number> {
   const [scenario, part = 'plain', ...extra] = (await readFile(join(directory, 'scenario'), 'utf8')).trim().split(/\s+/);
-  const scenarios = ['C10', 'C11', 'C12', 'C13', 'C14', 'C18', 'C19', 'C20', 'C33', 'C40', 'C42', 'C43'];
-  const parts = ['supported', 'success', 'plain', 'hold', 'malformed', 'text', 'structure', 'dropped-effort', 'fail', 'refuse', 'refuse-stderr', 'inject-refused', 'resume-gone', 'delayed-usage'];
+  const scenarios = ['C10', 'C11', 'C12', 'C13', 'C14', 'C15', 'C16', 'C17', 'C18', 'C19', 'C20', 'C33', 'C38', 'C40', 'C42', 'C43'];
+  const parts = ['supported', 'success', 'plain', 'hold', 'malformed', 'text', 'structure', 'dropped-effort', 'fail', 'refuse', 'refuse-stderr', 'inject-refused', 'resume-gone', 'delayed-usage',
+    'tool', 'subagent', 'subagent-finished', 'subagent-late', 'subagent-nested', 'turn-start-race', 'stubborn', 'background', 'linger', 'stopping', 'other-call'];
   if (extra.length || !scenarios.includes(scenario!) || !parts.includes(part)) throw new Failure('invalid_input', 'This stand-in does not implement that run scenario.');
   const home = process.env.CODEX_HOME;
   const base = {
@@ -64,6 +66,38 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
   let historyItems: Record<string, unknown>[] = [];
   let savedPath: string | undefined;
   let resumed = false;
+  let turnActive = false;
+  let subagentActive = false;
+  let grandchildActive = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  const childContext = { threadId: 'fixture-subagent-thread', turnId: 'fixture-subagent-turn' };
+  const grandchildContext = { threadId: 'fixture-grandchild-thread', turnId: 'fixture-grandchild-turn' };
+  const savedScenario = scenario === 'C14' || scenario === 'C38';
+  // Stop envelopes and separate shell process groups are observed in the
+  // 6 October stop addendum. Commands, PIDs, delayed results and stubborn
+  // behavior are synthetic variants; this stand-in spends no vendor quota.
+  const shellWorker = async (): Promise<{ shellPid: number; backgroundPid: number }> => {
+    const marker = join(directory, 'worker-' + process.pid);
+    const worker = spawn(process.execPath, ['-e', `
+      const {spawn}=require('node:child_process');
+      const {writeFileSync}=require('node:fs');
+      const child=spawn(process.execPath,['-e','setInterval(()=>{},60000)'],{stdio:'ignore'});
+      writeFileSync(${JSON.stringify(marker)},String(child.pid));
+      setInterval(()=>{},60000);
+    `], { detached: true, stdio: 'ignore' });
+    worker.unref();
+    await new Promise<void>((resolve, reject) => { worker.once('spawn', resolve); worker.once('error', reject); });
+    let raw: string | undefined;
+    for (let n = 0; n < 200 && !raw; n++) {
+      raw = await readFile(marker, 'utf8').catch(() => undefined);
+      if (!raw) await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    if (!raw || !worker.pid) throw new Failure('internal', 'The stopping stand-in could not start its shell group.');
+    return { shellPid: worker.pid, backgroundPid: Number(raw) };
+  };
+  const completedTurn = (thread: string, id: string, status: string): void => notify('turn/completed', {
+    threadId: thread, turn: { id, items: [], itemsView: 'notLoaded', status, error: null },
+  });
   const savedFile = (id: string): string => join(home, 'sessions', '2026', '10', '07', `rollout-2026-10-07T00-00-00-${id}.jsonl`);
   const persist = async (): Promise<void> => {
     if (!savedPath) return;
@@ -134,7 +168,7 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
         error('Invalid fresh thread configuration'); continue;
       }
       threadParams = params;
-      if (scenario === 'C14') { threadId = randomUUID(); context.threadId = threadId; }
+      if (savedScenario) { threadId = randomUUID(); context.threadId = threadId; }
       savedPath = params.ephemeral === true ? undefined : savedFile(threadId);
       await persist();
       const result = threadResult(); answer(result); notify('thread/started', { thread: result.thread });
@@ -211,15 +245,66 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
         .filter(part => isObject(part) && part.type === 'input_image').map(part => {
           const [, mediaType, data] = /^data:([^;]+);base64,(.*)$/.exec(part.image_url)!; return { mediaType, data };
         });
+      const stopFixture = ['C15', 'C17'].includes(scenario!) || scenario === 'C38' && part === 'hold' || scenario === 'C33' && part === 'stopping';
+      const workers = stopFixture && ['tool', 'subagent', 'subagent-finished', 'subagent-late', 'subagent-nested', 'turn-start-race', 'stubborn', 'background', 'linger', 'hold'].includes(part)
+        ? await shellWorker() : undefined;
       await received({ stage: 'input', request, checks: { ...base.checks, input: request, configurationApplied: true, images,
+        toolPid: process.pid, backgroundPid: workers?.backgroundPid, shellPid: workers?.shellPid, backgroundWasAlive: !!workers,
         savedPath: savedPath ?? null, ephemeral: threadParams.ephemeral === true, resumed,
         nativeShellCall: !!shell, nativeShellResult: shellResult?.output, nativeShellFailed: typeof shellResult?.output === 'string' && shellResult.output.endsWith('\nhistory-error'),
         nativeForeignCall: !!foreign && historyItems.some(item => item.type === 'function_call_output' && item.call_id === foreign.call_id && item.output === '{"value":"foreign-value"}'),
         historyImages, systemPrompt: threadParams.developerInstructions ?? '', nativeHistory: historyItems.length > 0,
         labelledHistory: params.input[0].text.startsWith('Earlier conversation, for context:') } });
       const turn = { id: turnId, items: [], itemsView: 'notLoaded', status: 'inProgress', error: null, startedAt: null, completedAt: null, durationMs: null };
-      answer({ turn }); notify('turn/started', { threadId, turn });
+      if (part === 'turn-start-race') {
+        // The server can announce its accepted turn before the RPC reply.
+        notify('turn/started', { threadId, turn }); turnActive = true;
+        await received({ stage: 'accepted-turn', checks: { ...base.checks, threadId, turnId } });
+        setTimeout(() => answer({ turn }), 150);
+      } else { answer({ turn }); notify('turn/started', { threadId, turn }); turnActive = true; }
       const input = params.input[0].text;
+      if (stopFixture) {
+        notify('item/agentMessage/delta', { ...context, itemId: 'partial-answer', delta: 'partial' });
+        usage(3, 2);
+        if (workers) {
+          // processId is the vendor's command handle, not an OS process ID.
+          const shell = { ...command(false), processId: '48412', command: 'sleep 60', cwd: process.cwd() };
+          if (part.startsWith('subagent')) {
+            const activity = { type: 'subAgentActivity', id: 'subagent-started-fixture', kind: 'started',
+              agentThreadId: childContext.threadId, agentPath: '/root/fixture-worker' };
+            item('item/started', activity); item('item/completed', activity);
+            notify('turn/started', { threadId: childContext.threadId, turn: { ...turn, id: childContext.turnId } });
+            subagentActive = true;
+            notify('item/started', { ...childContext, item: { ...shell, id: 'fixture-subcall' } });
+            notify('item/agentMessage/delta', { ...childContext, itemId: 'subagent-answer', delta: 'child-only' });
+            if (part === 'subagent-nested') {
+              const nested = { ...activity, id: 'grandchild-started-fixture', agentThreadId: grandchildContext.threadId, agentPath: '/root/fixture-worker/nested' };
+              notify('item/started', { ...childContext, item: nested }); notify('item/completed', { ...childContext, item: nested });
+              notify('turn/started', { threadId: grandchildContext.threadId, turn: { ...turn, id: grandchildContext.turnId } }); grandchildActive = true;
+              notify('item/started', { ...grandchildContext, item: { ...shell, id: 'fixture-grandcall' } });
+              notify('item/agentMessage/delta', { ...grandchildContext, itemId: 'grandchild-answer', delta: 'grandchild-only' });
+            }
+            heartbeat = setInterval(() => { void received({ stage: 'subagent-tick', checks: { ...base.checks, active: true } }); }, 20);
+            if (part === 'subagent-finished') {
+              completedTurn(threadId, turnId, 'completed'); turnActive = false;
+            }
+            if (part === 'subagent-late') setTimeout(() => {
+              notify('item/completed', { ...childContext, item: { ...shell, id: 'fixture-subcall', status: 'completed', exitCode: 0, aggregatedOutput: 'child-result' } });
+              notify('item/completed', { ...childContext, item: message('subagent-answer', 'child-only') });
+              completedTurn(childContext.threadId, childContext.turnId, 'completed'); subagentActive = false; clearInterval(heartbeat);
+              const finished = { ...activity, id: 'subagent-completed-fixture', kind: 'completed' };
+              item('item/started', finished); item('item/completed', finished);
+            }, 250);
+          } else {
+            item('item/started', shell);
+            if (['background', 'linger'].includes(part)) item('item/completed', { ...shell, status: 'completed', exitCode: 0, aggregatedOutput: 'background-started' });
+          }
+        } else if (part === 'other-call') item('item/started', { type: 'webSearch', id: 'fixture-other-call', query: 'synthetic unfinished search' });
+        if (['background', 'linger', 'plain', 'other-call', 'subagent-late'].includes(part)) {
+          text('fixture-answer', 'answer'); completedTurn(threadId, turnId, 'completed'); turnActive = false;
+        }
+        continue;
+      }
       if (input === 'early-exit') { lines.close(); process.stdin.destroy(); return 1; }
       if (part === 'malformed') { process.stdout.write('{"method":\n'); continue; }
       if (input === 'unknown-request') output({ id: 'fixture-server-request', method: 'future/request', params: { ...context } });
@@ -238,16 +323,31 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
         text('fixture-after-tool', 'after-tool');
       }
       const failed = scenario === 'C12' || part === 'fail' || input === 'fail';
-      if (scenario === 'C14') {
+      if (savedScenario) {
         historyItems.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: input },
           ...images.map(image => ({ type: 'input_image', image_url: `data:image/${image.path.split('.').at(-1) === 'jpg' ? 'jpeg' : image.path.split('.').at(-1)};base64,${image.data}` }))] },
           { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] });
         await persist();
       }
-      const finish = (): void => notify('turn/completed', { threadId, turn: { ...turn, status: failed ? 'failed' : 'completed', itemsView: 'summary',
-        error: failed ? { message: 'Synthetic vendor failure.', codexErrorInfo: 'other', additionalDetails: null } : null } });
+      const finish = (): void => { turnActive = false; notify('turn/completed', { threadId, turn: { ...turn, status: failed ? 'failed' : 'completed', itemsView: 'summary',
+        error: failed ? { message: 'Synthetic vendor failure.', codexErrorInfo: 'other', additionalDetails: null } : null } }); };
       if (input === 'unknown-request') setTimeout(finish, 75); else finish();
+    } else if (request.method === 'turn/interrupt') {
+      await received({ stage: 'interrupt', request, checks: { ...base.checks, input: request } });
+      const main = params.threadId === threadId && params.turnId === turnId && turnActive;
+      const child = params.threadId === childContext.threadId && params.turnId === childContext.turnId && subagentActive;
+      const grandchild = params.threadId === grandchildContext.threadId && params.turnId === grandchildContext.turnId && grandchildActive;
+      // The installed tool does not answer interrupts for an ended turn.
+      if (!main && !child && !grandchild) continue;
+      if (part === 'stubborn') continue;
+      answer({});
+      completedTurn(String(params.threadId), String(params.turnId), 'interrupted');
+      if (main) turnActive = false;
+      if (child) { subagentActive = false; clearInterval(heartbeat); }
+      if (grandchild) grandchildActive = false;
     } else error('This stand-in implements only run app-server requests.', -32601);
   }
+  clearInterval(heartbeat);
+  if (part === 'linger') await new Promise<void>(() => { setInterval(() => {}, 60000); });
   return 0;
 }

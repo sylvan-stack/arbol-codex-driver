@@ -76,6 +76,7 @@ export class RunEvents {
   private readonly closed = new Set<string>();
   private readonly interrupted = new Set<string>();
   private readonly completedItems = new Set<string>();
+  private readonly agents = new Map<string, { path?: string; active: boolean; mapper?: RunEvents }>();
   outputProduced = false;
   outcome: 'completed' | 'failed' | 'interrupted' | undefined;
   error: DriverError | undefined;
@@ -86,9 +87,26 @@ export class RunEvents {
   }
   get usage(): RunUsage { return { ...this.totals }; }
   get openCalls(): ReadonlyMap<string, OpenCall> { return this.calls; }
-  get unfinishedCalls(): string[] { return [...this.interrupted, ...this.calls.keys()]; }
+  get unfinishedCalls(): string[] { return [...this.interrupted, ...this.calls.keys(),
+    ...[...this.agents.values()].flatMap(agent => agent.mapper?.unfinishedCalls ?? [])]; }
+  knowsThread(threadId: string): boolean {
+    return this.threadId === threadId || this.agents.has(threadId) ||
+      [...this.agents.values()].some(agent => agent.mapper?.knowsThread(threadId));
+  }
+  get activeTurns(): Array<{ threadId: string; turnId: string }> {
+    return [...(this.outcome === undefined ? [{ threadId: this.threadId, turnId: this.turnId }] : []),
+      ...[...this.agents.values()].flatMap(agent => agent.mapper?.activeTurns ?? [])];
+  }
+  get waitingForWork(): boolean {
+    return [...this.calls.values()].some(call => call.type === 'commandExecution') ||
+      [...this.agents.values()].some(agent => agent.active || agent.mapper?.waitingForWork);
+  }
+  get hasActiveAgents(): boolean {
+    return [...this.agents.values()].some(agent => agent.active || agent.mapper?.hasActiveAgents);
+  }
 
   closeOpenCalls(message = 'The run ended before the tool call finished.'): void {
+    for (const agent of this.agents.values()) agent.mapper?.closeOpenCalls(message);
     for (const callId of this.calls.keys()) {
       this.interrupted.add(callId); this.closed.add(callId);
       this.emit('tool_finished', { callId, ok: false, error: message, interrupted: true });
@@ -104,6 +122,22 @@ export class RunEvents {
     const params = value;
     // Check identity even for notifications whose content otherwise needs no event.
     if (typeof params.threadId === 'string' && params.threadId !== this.threadId) {
+      const ancestor = [...this.agents.values()].find(agent => agent.mapper?.knowsThread(params.threadId as string));
+      if (ancestor?.mapper && !this.agents.has(params.threadId)) { ancestor.mapper.consume(method, params); return; }
+      const agent = this.agents.get(params.threadId);
+      if (agent) {
+        const turnId = params.turnId ?? (isObject(params.turn) ? params.turn.id : undefined);
+        if (typeof turnId === 'string') {
+          if (!agent.mapper || method === 'turn/started' && agent.mapper.outcome !== undefined) {
+            agent.mapper = new RunEvents(params.threadId, turnId, this.totals.model ?? '',
+              (type, data) => this.emit(type, { parentCallId: params.threadId, ...data }));
+            agent.active = true;
+          }
+          agent.mapper.consume(method, params);
+          if (method === 'turn/completed') agent.active = false;
+        }
+        return;
+      }
       if (!this.foreignNotice) {
         this.foreignNotice = true;
         this.emit('notice', { code: 'foreign_thread', message: 'A notification for another codex thread was ignored.' });
@@ -127,6 +161,7 @@ export class RunEvents {
         this.identity(params);
         if (!isObject(params.item) || typeof params.item.type !== 'string' || typeof params.item.id !== 'string' || !params.item.id) throw protocolFailure();
         const item = params.item;
+        if (item.type === 'subAgentActivity') { this.agentActivity(item); break; }
         if (item.type === 'userMessage' || item.type === 'hookPrompt' || item.type === 'contextCompaction' || item.type === 'functionCallOutput') break;
         if (item.type === 'agentMessage' || item.type === 'reasoning') {
           if (method === 'item/started' || this.completedItems.has(item.id as string)) break;
@@ -218,6 +253,9 @@ export class RunEvents {
       if (typeof item.command !== 'string') throw protocolFailure();
       name = 'shell';
       input = { command: plainCommand(item.command), ...(typeof item.cwd === 'string' ? { cwd: item.cwd } : {}) };
+    } else if (type === 'collabAgentToolCall') {
+      if (typeof item.tool !== 'string') throw protocolFailure();
+      name = item.tool;
     } else if (type === 'fileChange') {
       if (!Array.isArray(item.changes)) throw protocolFailure();
       name = 'apply_patch';
@@ -229,6 +267,23 @@ export class RunEvents {
     this.calls.set(callId, { name, type, output: '', outputCut: false });
     this.outputProduced = true;
     this.emit('tool_started', { callId, name, input });
+  }
+  private agentActivity(item: Record<string, unknown>): void {
+    if (typeof item.agentThreadId !== 'string' || !['started', 'completed'].includes(String(item.kind))) throw protocolFailure();
+    const callId = item.agentThreadId;
+    if (item.kind === 'started') {
+      if (this.agents.has(callId) && this.calls.has(callId)) return;
+      this.closed.delete(callId);
+      this.agents.set(callId, { active: true, ...(typeof item.agentPath === 'string' ? { path: item.agentPath } : {}) });
+      this.calls.set(callId, { name: 'spawn_agent', type: 'subAgentActivity', output: '', outputCut: false });
+      this.outputProduced = true;
+      this.emit('tool_started', { callId, name: 'spawn_agent', input: { ...(typeof item.agentPath === 'string' ? { path: item.agentPath } : {}) } });
+    } else if (this.calls.has(callId)) {
+      this.calls.delete(callId); this.closed.add(callId);
+      const agent = this.agents.get(callId);
+      if (agent && !agent.mapper) agent.active = false;
+      this.emit('tool_finished', { callId, ok: true, result: { ...(agent?.path === undefined ? {} : { path: agent.path }) } });
+    }
   }
   private finishCall(item: Record<string, unknown>): void {
     const callId = item.id as string;

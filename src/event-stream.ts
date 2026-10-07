@@ -16,7 +16,7 @@ export class EventStream {
     const record = { runId: this.runId, seq: ++this.sequence, at: new Date().toISOString(),
       ...(this.labels === undefined ? {} : { labels: this.labels }), type, ...data };
     if (type === 'finished') this.finished = true;
-    const text = this.textOnly ? type === 'text' ? String(data.text) : '' : JSON.stringify(record) + '\n';
+    const text = this.textOnly ? type === 'text' && data.parentCallId === undefined ? String(data.text) : '' : JSON.stringify(record) + '\n';
     if (text) this.writes = this.writes.then(() => new Promise<void>((resolve, reject) =>
       this.output.write(text, error => error ? reject(error) : resolve())));
     // The runner observes errors through flush; attach a handler immediately.

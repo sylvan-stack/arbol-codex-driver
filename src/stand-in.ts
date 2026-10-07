@@ -36,7 +36,7 @@ const operation = (method: unknown): string => method === 'account/rateLimits/re
 
 export async function standIn(folder: string, args: string[]): Promise<number> {
   const [scenario, part = 'supported', ...extra] = (await readFile(join(folder, 'scenario'), 'utf8')).trim().split(/\s+/);
-  if (['C10', 'C11', 'C12', 'C13', 'C14', 'C18', 'C19', 'C20', 'C33', 'C42', 'C43'].includes(scenario!) || scenario === 'C40' && !subscriptionParts.includes(part)) return runStandIn(folder, args);
+  if (['C10', 'C11', 'C12', 'C13', 'C14', 'C15', 'C16', 'C17', 'C18', 'C19', 'C20', 'C33', 'C38', 'C42', 'C43'].includes(scenario!) || scenario === 'C40' && !subscriptionParts.includes(part)) return runStandIn(folder, args);
   const subscriptions = subscriptionScenarios.includes(scenario!);
   const known = scenario === 'C31' && ['supported', 'old', 'missing'].includes(part) || scenario === 'C32' && part === 'info' || subscriptions && subscriptionParts.includes(part);
   if (extra.length || !known) throw new Failure('invalid_input', 'This stand-in does not implement that scenario.');

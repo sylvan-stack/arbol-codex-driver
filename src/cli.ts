@@ -30,6 +30,10 @@ export async function main(args: string[]): Promise<number> {
     const { settings, notices } = await readSettings(file);
     const state = new State(typeof command.options['state-dir'] === 'string' ? command.options['state-dir'] : defaultStateDirectory(home));
     await state.initialize();
+    if (command.name === 'run' || ['subscriptions create', 'subscriptions update', 'subscriptions remove',
+      'subscriptions sign-in', 'subscriptions sign-out', 'subscriptions check', 'subscriptions usage', 'subscriptions models'].includes(command.name)) {
+      await new Runs(state).list();
+    }
     const identity = await buildIdentity();
     cancellation.signal.throwIfAborted();
     if (command.name === 'run') return await run(command, new Subscriptions(state, settings, notices, file, process.env, cancellation.signal), events!, process.env, identity.build, cancellation.signal);
