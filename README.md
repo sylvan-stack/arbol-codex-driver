@@ -4,8 +4,8 @@ Arbol Codex Driver: the Arbol 2 Driver for Codex.
 
 The base (SYL-79), Subscription operations (SYL-81), fresh inference runs
 (SYL-86), conversation continuity (SYL-88), stopping and recovery (SYL-89),
-tools, child agents and owner setup (SYL-90), and errors, retries, clocks and
-run-derived usage (SYL-91)
+tools, child agents and owner setup (SYL-90), errors, retries, clocks and
+run-derived usage (SYL-91), and packaged probes and conformance (SYL-92)
 are implemented. `run` validates its request and account, starts one
 private-home app-server, streams answer and reasoning blocks with gapless
 sequence numbers, reports token totals, and ends with one final event after
@@ -15,6 +15,37 @@ cleanup. Runs in progress are visible through `runs list`.
 |---|---|
 | Package | `@sylvan-stack/arbol-codex-driver` 1.0.0 |
 | Artifact corpus | `~/Artifacts/arbol-codex-driver` (GitHub `sylvan-stack/arbol-codex-driver-artifacts`) |
+
+## Numbered Builds
+
+`arbol-builds build arbol-codex-driver` packages the Driver into the next
+hexadecimal Build number under
+`~/Library/Application Support/Arbol/builds/arbol-codex-driver/` (SYL-94).
+The repository's `arbol-build.json` installs locked development dependencies,
+runs Ruff and strict mypy, and packages the pinned standalone CPython runtime.
+Its three checks run the packaged unit tests, all 38 shared conformance
+scenarios, and exactly one quota-checked ready message on `test-chatgpt`.
+All must pass before the Build becomes `working` and the default.
+
+The build tool writes the launcher to `~/.local/bin`; that folder and Node.js
+24 or later must be on PATH. With the build tool installed from the sibling
+`arbol` repository and `uv` available, run:
+
+```sh
+arbol-builds build arbol-codex-driver
+arbol-codex-driver info
+arbol-builds list arbol-codex-driver
+arbol-codex-driver -v 1 info
+```
+
+`info` reports both the selected Build number and package version `1.0.0`.
+Without `-v`, the launcher selects the newest working Build. The example
+selects Build `1` explicitly; select any available number shown by `list`.
+Failed checks retain their Build number, record and log, and leave the previous
+working default in place. Contract and state format remain `1`.
+`ARBOL_CONFORMANCE_REPO` can name another shared-suite checkout;
+`ARBOL_BUILD_TEST_STATE_DIR` can name an absolute Driver state directory with
+the signed-in `test-chatgpt` Subscription.
 
 ## Development
 
@@ -211,8 +242,8 @@ The candidate contains its interpreter, runtime, tests, and contract wrappers.
 Metadata checks validate the distribution and packaged file digests. The
 registry rehearsal validates relocation to a path with spaces, direct entry,
 selection, and failed-check refusal. The package gate runs the full shared suite,
-and its `live` gate invokes only
-`dev build-check`. The first numbered production Build remains SYL-94.
+and its `live` gate invokes only `dev build-check`. Development candidates
+report Build `0` and are separate from the numbered registry.
 
 The packaged development commands are part of the public executable:
 
@@ -241,8 +272,8 @@ remain dated; they do not run in the offline suite.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the
-job of the `arbol-builds` launcher. The first working numbered Codex Build is
-covered by SYL-94.
+job of the `arbol-builds` launcher. Package version `1.0.0` stays unchanged
+across Builds until the owner changes it.
 
 ## Sylvan Stack 2
 

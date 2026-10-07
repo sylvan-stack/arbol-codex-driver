@@ -1,0 +1,29 @@
+{
+  "component": "arbol-codex-driver",
+  "build": [
+    "uv sync --locked --group dev",
+    "uv run --no-sync ruff check src/arbol_codex_driver tests scripts bin/entry.py",
+    "uv run --no-sync mypy",
+    "uv run --no-sync python scripts/package_build.py"
+  ],
+  "entry": "bin/arbol-codex-driver",
+  "checks": [
+    {
+      "name": "build.unit",
+      "kind": "unit",
+      "command": "\"$ARBOL_BUILD_DIR/runtime/python/bin/python3.14\" -I \"$ARBOL_BUILD_DIR/scripts/check_build.py\" unit"
+    },
+    {
+      "name": "build.contract",
+      "kind": "contract",
+      "command": "\"$ARBOL_BUILD_DIR/runtime/python/bin/python3.14\" -I \"$ARBOL_BUILD_DIR/scripts/check_build.py\" contract"
+    },
+    {
+      "name": "dev.build-check",
+      "kind": "live",
+      "command": "\"$ARBOL_BUILD_DIR/runtime/python/bin/python3.14\" -I \"$ARBOL_BUILD_DIR/scripts/check_build.py\" live"
+    }
+  ],
+  "contract": 1,
+  "dataFormat": 1
+}
