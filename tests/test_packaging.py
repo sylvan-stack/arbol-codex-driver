@@ -23,14 +23,27 @@ class PackagingTests(unittest.TestCase):
             cache = Path(name)
             expected = hashlib.sha256(b"expected archive").hexdigest()
             (cache / f"{expected}.tar.gz").write_bytes(b"corrupt archive")
-            with patch.dict(os.environ, {"ARBOL_PYTHON_ARCHIVE_CACHE": name}), patch("urllib.request.urlopen") as download:
+            with (
+                patch.dict(os.environ, {"ARBOL_PYTHON_ARCHIVE_CACHE": name}),
+                patch("urllib.request.urlopen") as download,
+            ):
                 with self.assertRaisesRegex(ValueError, "wrong SHA-256"):
-                    package_build.archive({"url": "https://github.com/astral-sh/python-build-standalone/releases/download/test/python.tar.gz", "sha256": expected})
+                    package_build.archive(
+                        {
+                            "url": "https://github.com/astral-sh/python-build-standalone/releases/download/test/python.tar.gz",
+                            "sha256": expected,
+                        }
+                    )
                 download.assert_not_called()
 
     def test_archive_pin_rejects_nonhex_digests_and_untrusted_sources(self) -> None:
-        for distribution in ({"url": "https://example.invalid/python.tar.gz", "sha256": "f" * 64},
-                             {"url": "https://github.com/astral-sh/python-build-standalone/releases/download/test/python.tar.gz", "sha256": "/" * 64}):
+        for distribution in (
+            {"url": "https://example.invalid/python.tar.gz", "sha256": "f" * 64},
+            {
+                "url": "https://github.com/astral-sh/python-build-standalone/releases/download/test/python.tar.gz",
+                "sha256": "/" * 64,
+            },
+        ):
             with self.subTest(distribution=distribution), patch("urllib.request.urlopen") as download:
                 with self.assertRaisesRegex(ValueError, "pinned URL and SHA-256"):
                     package_build.archive(distribution)
@@ -39,7 +52,9 @@ class PackagingTests(unittest.TestCase):
     def test_package_metadata_must_agree(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
-            (root / "pyproject.toml").write_text(f'[project]\nname = "{build_support.COMPONENT}"\nversion = "1.0.0"\ndependencies = []\n')
+            (root / "pyproject.toml").write_text(
+                f'[project]\nname = "{build_support.COMPONENT}"\nversion = "1.0.0"\ndependencies = []\n'
+            )
             (root / "package.json").write_text('{"version":"9.0.0"}\n')
             with self.assertRaisesRegex(ValueError, "agree on the package version"):
                 build_support.metadata(root)
@@ -53,15 +68,26 @@ class PackagingTests(unittest.TestCase):
     def test_build_record_requires_matching_number_entry_and_version(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             folder = Path(name)
-            record = {"component": build_support.COMPONENT, "build": "a", "packageVersion": "1.0.0", "entry": build_support.ENTRY}
+            record = {
+                "component": build_support.COMPONENT,
+                "build": "a",
+                "packageVersion": "1.0.0",
+                "entry": build_support.ENTRY,
+            }
             (folder / "build.json").write_text(json.dumps(record))
-            with patch.dict(os.environ, {"ARBOL_BUILD_DIR": name, "ARBOL_BUILD_NUMBER": "b"}), patch.object(build_support, "metadata", return_value=("1.0.0", {})):
+            with (
+                patch.dict(os.environ, {"ARBOL_BUILD_DIR": name, "ARBOL_BUILD_NUMBER": "b"}),
+                patch.object(build_support, "metadata", return_value=("1.0.0", {})),
+            ):
                 with self.assertRaisesRegex(ValueError, "match this component, number and package version"):
                     build_support.build_folder()
             record["build"] = "b"
             record["entry"] = "bin/another-program"
             (folder / "build.json").write_text(json.dumps(record))
-            with patch.dict(os.environ, {"ARBOL_BUILD_DIR": name, "ARBOL_BUILD_NUMBER": "b"}), patch.object(build_support, "metadata", return_value=("1.0.0", {})):
+            with (
+                patch.dict(os.environ, {"ARBOL_BUILD_DIR": name, "ARBOL_BUILD_NUMBER": "b"}),
+                patch.object(build_support, "metadata", return_value=("1.0.0", {})),
+            ):
                 with self.assertRaisesRegex(ValueError, "executable entry"):
                     build_support.build_folder()
 

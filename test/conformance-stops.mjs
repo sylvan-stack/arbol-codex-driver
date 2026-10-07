@@ -7,7 +7,7 @@ const { runSuite } = await import(pathToFileURL(resolve(suite, 'dist/conformance
 const { c15, c16, c17, c38, waitFor } = await import(pathToFileURL(resolve(suite, 'dist/conformance/scenarios/stops.js')));
 const { c33, checkRunWithoutControl, stream } = await import(pathToFileURL(resolve(suite, 'dist/conformance/scenarios/runs.js')));
 const { check, equal } = await import(pathToFileURL(resolve(suite, 'dist/conformance/check.js')));
-const cli = resolve(import.meta.dirname, '../bin/arbol-codex-driver.mjs');
+const cli = process.env.ARBOL_DRIVER_ENTRY ?? resolve(import.meta.dirname, '../bin/arbol-codex-driver');
 const scopedC33 = { ...c33, scope: 'no control, stdin request, malformed control, active records and runs stop; caller questions excluded by CDX-3.13 (SYL-89)',
   covers: ['DRV-2.25', 'DRV-2.26', 'DRV-2.27', 'DRV-2.28', 'DRV-6.7', 'DRV-6.8'], async run(home) {
     const id = await checkRunWithoutControl(home);
@@ -26,4 +26,4 @@ const scopedC33 = { ...c33, scope: 'no control, stdin request, malformed control
       stream(await stopped.done, 'cancelled'); check('Final emitted before stop returns', stopped.lines.at(-1)?.type === 'finished', 'finished', stopped.lines.at(-1));
     } finally { await stopped.dispose(); }
   } };
-process.exitCode = await runSuite([process.execPath, cli], [c15, c16, c17, scopedC33, c38]);
+process.exitCode = await runSuite([cli], [c15, c16, c17, scopedC33, c38]);

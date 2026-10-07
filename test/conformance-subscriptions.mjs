@@ -11,8 +11,8 @@ const {
   checkSubscriptionRejection, checkSubscriptionRemoval, checkSubscriptionCredentials, checkSubscriptionEnvironments,
 } = await import(pathToFileURL(resolve(suite, 'dist/conformance/scenarios/subscriptions.js')));
 const { c40, checkSubscriptionRefusals } = await import(pathToFileURL(resolve(suite, 'dist/conformance/scenarios/c40.js')));
-const cli = resolve(import.meta.dirname, '../bin/arbol-codex-driver.mjs');
-process.exitCode = await runSuite([process.execPath, cli], [
+const cli = process.env.ARBOL_DRIVER_ENTRY ?? resolve(import.meta.dirname, '../bin/arbol-codex-driver');
+process.exitCode = await runSuite([cli], [
   c1, c2,
   { ...c4, scope: 'subscription check rejection and recovery only (SYL-81)', covers: ['DRV-1.7 (check)', 'DRV-1.11 (attention check)'], run: checkSubscriptionRejection },
   { ...c5, scope: 'sign-out, account clearing and home removal only (SYL-81)', covers: ['DRV-1.12 (without runs)', 'DRV-1.13'], run: checkSubscriptionRemoval },

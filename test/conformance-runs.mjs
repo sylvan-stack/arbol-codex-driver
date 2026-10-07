@@ -7,8 +7,8 @@ const { runSuite } = await import(pathToFileURL(resolve(suite, 'dist/conformance
 const { c10, c11, c12, c13, c18, c19, c20, c33, c42, c43, checkRunWithoutControl, runRefusals } =
   await import(pathToFileURL(resolve(suite, 'dist/conformance/scenarios/runs.js')));
 const { c40, checkSubscriptionRefusals } = await import(pathToFileURL(resolve(suite, 'dist/conformance/scenarios/c40.js')));
-const cli = resolve(import.meta.dirname, '../bin/arbol-codex-driver.mjs');
-process.exitCode = await runSuite([process.execPath, cli], [
+const cli = process.env.ARBOL_DRIVER_ENTRY ?? resolve(import.meta.dirname, '../bin/arbol-codex-driver');
+process.exitCode = await runSuite([cli], [
   c10, c11, c12, c13, c18, c19, c20,
   { ...c33, scope: 'no control input and JSON request from stdin only (SYL-86)', covers: ['DRV-2.25', 'DRV-6.7 (request stdin)'], run: checkRunWithoutControl },
   { ...c40, scope: 'unsigned runs and fresh-run directory, duplicate ID, model, effort and tier refusals (SYL-86)',
