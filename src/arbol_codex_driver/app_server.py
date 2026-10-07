@@ -1,5 +1,6 @@
 import asyncio
 import codecs
+import json
 import math
 import re
 import time
@@ -13,6 +14,7 @@ from .cancellation import Cancellation, interruptible
 from .environment import clean_environment
 from .errors import Failure, safe_text
 from .json_types import Json, Object, dumps, loads, object_value, string
+from .owner_setup import DiagnosticScrubber, sanitize_diagnostic
 from .process_groups import collect_process_groups, end_process_groups, force_process_groups
 from .state import Owner, atomic_write, fixed_wait, owner_json, private_directory, process_owner
 
@@ -37,7 +39,7 @@ def validate_driver_config(value: Json) -> Object:
     return config
 
 
-def rpc_failure(error: Object) -> Failure:
+def rpc_failure(error: Object, private_values: tuple[str, ...] = ()) -> Failure:
     message = str(error["message"])
     data = object_value(error.get("data"))
     status = data.get("httpStatusCode")
@@ -62,8 +64,12 @@ def rpc_failure(error: Object) -> Failure:
         detail["vendorCode"] = str(error["code"])
     return Failure(
         "credential_rejected" if structured or wording else "tool_failed",
-        message,
-        {"detail": detail, **({"remedy": "Sign in again."} if structured or wording else {})},
+        safe_text(message, private_values, None),
+        object_value(
+            sanitize_diagnostic(
+                {"detail": detail, **({"remedy": "Sign in again."} if structured or wording else {})}, private_values
+            )
+        ),
     )
 
 
@@ -86,9 +92,11 @@ class AppServer:
         timeout: float,
         cleanup_grace: float,
         on_server_request: Callable[[str, Json], Json] | None,
+        private_values: tuple[str, ...] = (),
     ) -> None:
         self.child, self.owner, self.timeout, self.cleanup_grace = child, owner, timeout, cleanup_grace
         self.on_server_request = on_server_request
+        self.private_values = private_values
         self.next_id = 1
         self.pending: dict[int, asyncio.Future[Json]] = {}
         self.notifications: list[Notification] = []
@@ -123,6 +131,7 @@ class AppServer:
         on_spawn: Callable[[Owner], Awaitable[None]] | None = None,
         on_server_request: Callable[[str, Json], Json] | None = None,
         launch_identity_path: Path | None = None,
+        private_values: tuple[str, ...] = (),
     ) -> AppServer:
         if cancellation is not None:
             cancellation.check()
@@ -156,7 +165,12 @@ class AppServer:
         from .json_types import now
 
         server = cls(
-            child, {"pid": child.pid, "startedAt": now()}, request_timeout, fixed_wait(500, env), on_server_request
+            child,
+            {"pid": child.pid, "startedAt": now()},
+            request_timeout,
+            fixed_wait(500, env),
+            on_server_request,
+            private_values,
         )
         try:
             owner = await process_owner(child.pid)
@@ -205,7 +219,15 @@ class AppServer:
             raise self.failure
         assert self.child.stdin is not None
         try:
-            self.child.stdin.write((dumps(value) + "\n").encode())
+            owner_config = (
+                isinstance(value, dict)
+                and value.get("method") in ("thread/start", "thread/resume")
+                and "mcp_servers" in object_value(object_value(value.get("params")).get("config"))
+            )
+            # TOML has exact 64-bit integers. This private vendor payload must
+            # not use the contract serializer's ECMAScript number rounding.
+            encoded = json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":")) if owner_config else dumps(value)
+            self.child.stdin.write((encoded + "\n").encode())
             await self.child.stdin.drain()
         except (OSError, ConnectionError):
             self.fail(Failure("tool_failed", "Cannot send a request to codex."))
@@ -402,7 +424,7 @@ class AppServer:
                 if "error" in message:
                     error = message["error"]
                     future.set_exception(
-                        rpc_failure(error)
+                        rpc_failure(error, self.private_values)
                         if isinstance(error, dict) and isinstance(error.get("message"), str)
                         else Failure("tool_failed", "codex returned a malformed error.")
                     )
@@ -459,9 +481,12 @@ class AppServer:
     async def read_stderr(self) -> None:
         assert self.child.stderr is not None
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        scrubber = DiagnosticScrubber(self.private_values)
         while chunk := await self.child.stderr.read(65536):
-            self.log_tail = safe_text(self.log_tail + decoder.decode(chunk), limit=64 * 1024)
-        self.log_tail = safe_text(self.log_tail + decoder.decode(b"", final=True), limit=64 * 1024)
+            self.log_tail = safe_text(self.log_tail + scrubber.feed(decoder.decode(chunk)), limit=64 * 1024)
+        self.log_tail = safe_text(
+            self.log_tail + scrubber.feed(decoder.decode(b"", final=True), final=True), limit=64 * 1024
+        )
 
     async def monitor(self) -> None:
         while self.child.returncode is None:

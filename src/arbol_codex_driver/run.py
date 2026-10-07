@@ -15,6 +15,7 @@ from .event_stream import EventStream
 from .history import history_items, labelled_history_input, prepare_turn_input
 from .input_stream import Input
 from .json_types import Json, Object, loads, object_value, string
+from .owner_setup import diagnostic_values, owner_mcp_config, sanitize_diagnostic
 from .run_events import RunEvents
 from .run_request import RunRequest, read_run_request
 from .runs import Runs
@@ -77,6 +78,16 @@ async def run(
     fingerprint = MessageDigest()
     chats = Chats(subscriptions.state)
     pending_notices: list[Object] = []
+    pending_request_notices: list[Object] = []
+    private_values: tuple[str, ...] = ()
+
+    def emit(type_: str, data: Object) -> None:
+        if type_ == "notice":
+            data = {**data, "message": sanitize_diagnostic(data.get("message"), private_values)}
+        if type_ == "text" and "parentCallId" not in data:
+            fingerprint.add({"type": "message", "role": "assistant", "text": data["text"]})
+        events.emit(type_, data)
+
     events.output.on_error = cancellation.abort
     runs = Runs(subscriptions.state, env)
     end_stop: asyncio.Task[None] | None = None
@@ -136,6 +147,8 @@ async def run(
             private_directory(work)
         cwd = work.resolve(strict=True)
         child_env = env.copy()
+        owner_config = owner_mcp_config(env) if request.tools == "all" else {}
+        private_values = diagnostic_values(owner_config)
         if request.search_path:
             child_env["PATH"] = child_env.get("PATH", "") + os.pathsep + os.pathsep.join(request.search_path)
         if request.control:
@@ -182,19 +195,20 @@ async def run(
             runs.save(record)
 
         def server_request(method: str, params: Json) -> Json:
+            approval = method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
+            identity = object_value(params)
             notice: Object = {
                 "code": "unexpected_request",
-                "message": f"codex sent {method}; there is nobody to answer a question in this run.",
+                "message": f"codex sent {method}; the Driver approved it automatically."
+                if approval
+                else f"codex sent {method}; this request is unsupported and was answered with an error.",
+                **{key: identity[key] for key in ("threadId", "turnId") if isinstance(identity.get(key), str)},
             }
-            if started:
-                events.emit("notice", notice)
+            if server is not None:
+                server.notify("driver/notice", notice)
             else:
-                pending_notices.append(notice)
-            return (
-                {"decision": "accept"}
-                if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
-                else None
-            )
+                pending_request_notices.append(notice)
+            return {"decision": "accept"} if approval else None
 
         server = await AppServer.start(
             tool_path=require_tool(tool),
@@ -206,6 +220,7 @@ async def run(
             launch_identity_path=temporary / "tool-owner.txt",
             on_spawn=spawned,
             on_server_request=server_request,
+            private_values=private_values,
         )
         account = normalize_account(await server.request("account/read", {}, cancellation=cancellation))
         if account is None:
@@ -262,7 +277,11 @@ async def run(
         thread: Json = None
         if plan["continuity"] == "resumed":
             try:
-                thread = await rpc("thread/resume", {"threadId": plan["conversation"], "model": model["id"]})
+                thread = await rpc(
+                    "thread/resume",
+                    {"threadId": plan["conversation"], "model": model["id"],
+                     **({"config": owner_config} if owner_config else {})},
+                )
             except Failure as failure:
                 if "vendorCode" not in object_value(failure.result.get("detail")) or cancellation.aborted:
                     raise
@@ -280,6 +299,7 @@ async def run(
                     "model": model["id"],
                     "approvalPolicy": "never",
                     "sandbox": "read-only" if request.tools == "none" else "danger-full-access",
+                    **({"config": owner_config} if owner_config else {}),
                     **({"serviceTier": request.service_tier} if request.service_tier is not None else {}),
                     **({"developerInstructions": request.system_prompt} if request.system_prompt is not None else {}),
                     **({"ephemeral": True} if request.tools == "none" and request.working_directory is None else {}),
@@ -314,7 +334,8 @@ async def run(
                 )
         message = prepare_turn_input(turn_input, temporary)
         startup = [
-            notice for notice in server.take_notifications() if notice.method in ("warning", "deprecationNotice")
+            notice for notice in server.take_notifications()
+            if notice.method in ("warning", "deprecationNotice", "driver/notice")
         ]
         turn = object_value(
             await rpc(
@@ -337,11 +358,6 @@ async def run(
         if turn_id is None:
             raise Failure("tool_failed", "Codex returned a malformed turn.")
 
-        def emit(type_: str, data: Object) -> None:
-            if type_ == "text" and "parentCallId" not in data:
-                fingerprint.add({"type": "message", "role": "assistant", "text": data["text"]})
-            events.emit(type_, data)
-
         mapper = RunEvents(conversation, turn_id, current_model, emit)
         write_json(
             temporary / "shell-owners.json", [owner_json(owner) for owner in await server.capture_process_groups()]
@@ -363,9 +379,11 @@ async def run(
             mapper.consume(notice.method, notice.params)
         for request_notice in [*pending_notices, *subscriptions.notices]:
             events.emit("notice", request_notice)
+        for request_notice in pending_request_notices:
+            mapper.consume("driver/notice", request_notice)
         await events.flush(cancellation)
         remaining_calls_deadline: float | None = None
-        while mapper.outcome is None or mapper.calls or mapper.waiting_for_work:
+        while mapper.outcome is None or mapper.has_open_calls or mapper.waiting_for_work:
             waiting_for_other = mapper.outcome is not None and not mapper.waiting_for_work
             if waiting_for_other and remaining_calls_deadline is None:
                 remaining_calls_deadline = time.monotonic() + fixed_wait(2000, env)
@@ -398,8 +416,9 @@ async def run(
         if mapper.outcome == "failed":
             error = Failure(
                 str((mapper.error or {}).get("code", "vendor_error")),
-                str((mapper.error or {}).get("message", "Codex failed the turn.")),
-                mapper.error,
+                str(sanitize_diagnostic((mapper.error or {}).get("message", "Codex failed the turn."), private_values)),
+                {**(mapper.error or {}),
+                 "message": sanitize_diagnostic((mapper.error or {}).get("message"), private_values)},
             )
         elif mapper.outcome == "interrupted":
             error = Failure("tool_failed", "Codex interrupted the turn without a caller stop.")
@@ -424,7 +443,7 @@ async def run(
                         conversation,
                         str(object_value(object_value(announced.params).get("turn"))["id"]),
                         current_model or "",
-                        events.emit,
+                        emit,
                     )
                     if not started and request is not None and plan is not None:
                         events.emit(
@@ -440,6 +459,8 @@ async def run(
                         )
                     for notice in queued:
                         mapper.consume(notice.method, notice.params)
+                    for request_notice in pending_request_notices:
+                        mapper.consume("driver/notice", request_notice)
             if mapper is not None:
                 try:
                     await interrupt_turns(

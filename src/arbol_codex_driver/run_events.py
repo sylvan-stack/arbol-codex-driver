@@ -70,6 +70,35 @@ def vendor_failure(error: Json) -> Object:
     return Failure("vendor_error", string(object_value(error).get("message")) or "codex failed the turn.").result
 
 
+def notice_data(method: str, params: Object) -> Object:
+    field = "summary" if method == "deprecationNotice" else "message"
+    if not isinstance(params.get(field), str):
+        raise protocol_failure()
+    code = (
+        string(params.get("code"))
+        if method == "driver/notice"
+        else "deprecation"
+        if method == "deprecationNotice"
+        else "warning"
+    )
+    if code is None:
+        raise protocol_failure()
+    details = string(params.get("details"))
+    return {
+        "code": code,
+        "message": str(params[field]) + ("\n" + details if method == "deprecationNotice" and details else ""),
+    }
+
+
+def call_failure(item: Object) -> str | None:
+    for field in ("error", "failure"):
+        value = item.get(field)
+        message = string(value) if isinstance(value, str) else string(object_value(value).get("message"))
+        if message:
+            return message
+    return None
+
+
 @dataclass
 class Call:
     name: str
@@ -135,6 +164,12 @@ class RunEvents:
             if agent.mapper is not None:
                 result.extend(agent.mapper.active_turns)
         return result
+
+    @property
+    def has_open_calls(self) -> bool:
+        return bool(self.calls) or any(
+            agent.mapper is not None and agent.mapper.has_open_calls for agent in self.agents.values()
+        )
 
     @property
     def waiting_for_work(self) -> bool:
@@ -204,6 +239,7 @@ class RunEvents:
                 "warning",
                 "model/rerouted",
                 "deprecationNotice",
+                "driver/notice",
             ):
                 raise protocol_failure()
             return
@@ -225,6 +261,12 @@ class RunEvents:
             agent = self.agents.get(foreign_thread)
             if agent is not None:
                 turn_id = string(params.get("turnId")) or string(object_value(params.get("turn")).get("id"))
+                if turn_id is None and method in ("warning", "deprecationNotice", "driver/notice"):
+                    # MCP elicitation can name a child thread without identifying
+                    # a turn, including before that child's first turn starts.
+                    self.emit("notice", {"parentCallId": agent.parent_call_id, **notice_data(method, params)})
+                    self.replay_foreign()
+                    return
                 if turn_id is not None:
                     if agent.mapper is None or method == "turn/started" and agent.mapper.outcome is not None:
 
@@ -342,18 +384,8 @@ class RunEvents:
                 },
             )
             self.emit("usage", {"usage": self.usage})
-        elif method in ("warning", "deprecationNotice"):
-            field = "message" if method == "warning" else "summary"
-            if not isinstance(params.get(field), str):
-                raise protocol_failure()
-            details = string(params.get("details"))
-            self.emit(
-                "notice",
-                {
-                    "code": "warning" if method == "warning" else "deprecation",
-                    "message": str(params[field]) + ("\n" + details if method != "warning" and details else ""),
-                },
-            )
+        elif method in ("warning", "deprecationNotice", "driver/notice"):
+            self.emit("notice", notice_data(method, params))
         elif method == "error":
             self.identity(params)
             error = object_value(params.get("error"))
@@ -469,8 +501,11 @@ class RunEvents:
             }
             output_cut = not isinstance(item.get("aggregatedOutput"), str) and call.output_cut
             if not ok:
-                error = (
-                    "declined"
+                reported_output = string(object_value(result).get("output"))
+                error = call_failure(item) or (
+                    reported_output
+                    if item["status"] in ("declined", "failed") and reported_output
+                    else "declined"
                     if item["status"] == "declined"
                     else "failed"
                     if item["status"] == "failed"
@@ -482,7 +517,9 @@ class RunEvents:
                 ok = False
             result = item.get("result") if item.get("result") is not None else item
             if not ok:
-                error = string(object_value(item.get("error")).get("message")) or str(item.get("status", "failed"))
+                error = call_failure(item) or (
+                    str(item["status"]) if item.get("status") not in (None, "completed") else "failed"
+                )
         del self.calls[id_]
         self.closed.add(id_)
         self.emit(
