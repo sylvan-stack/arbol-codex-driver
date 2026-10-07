@@ -16,14 +16,36 @@ cleanup. Runs in progress are visible through `runs list`.
 
 ## Development
 
-Use Node.js 24 or later. Run `npm ci`, then `npm run build`. Start the program with
-`node bin/arbol-codex-driver.mjs info`; `--state-dir <folder>` selects its state.
+The runtime is stdlib-only Python. Development and packaged artifacts pin
+CPython 3.14.8; the standalone interpreter comes from Python Build Standalone
+release 20261003, with an archive SHA-256 in `scripts/python-distribution.json`.
+Run `uv sync --locked --group dev`, then start `bin/arbol-codex-driver info`.
+`--state-dir <folder>` selects state. The source entry directly executes its
+private `.venv` interpreter; the packaged entry directly executes its own
+interpreter, preserving arguments, signals, and the caller's working folder.
+Normal invocation installs nothing and needs no Python, uv, npm, or Node on PATH.
+
+Run the Python checks with:
+
+```sh
+uv run --locked python -m ruff check src/arbol_codex_driver tests scripts bin/entry.py
+uv run --locked python -m mypy
+PYTHONPATH=src uv run --locked python -m unittest discover -s tests -v
+```
+
+The pinned Ruff and strict mypy versions are development dependencies only.
+The unit suite uses `unittest`; its synthetic vendor and worker processes also
+use Python. The five `.mjs` files under `test/` are minimal glue to the shared
+TypeScript conformance suite in the sibling `arbol` repository. They require
+Node.js 24, retain their existing scopes and assertions, and can select a
+packaged executable through `ARBOL_DRIVER_ENTRY`.
+
 Settings are read from `~/.arbol/arbol-codex-driver.json` on every invocation.
 `toolPath` names a Codex executable, otherwise it is found on `PATH`. The oldest
 supported version is `codex-cli 0.159.2`. The version probe uses a temporary home
 and a clean environment; it sends no prompt.
 
-`npm test` runs the unit checks. With the sibling `arbol` repository compiled,
+With the sibling `arbol` repository compiled,
 `node test/conformance-base.mjs ../arbol` runs shared C31 and C32's `info` check.
 `node test/conformance-subscriptions.mjs ../arbol` runs ten account scenarios,
 with explicit subscription scopes for C4, C5, C7, C8 and C40. Full inference
@@ -39,7 +61,7 @@ stdout closure, account rechecks, and run-record cleanup.
 For example:
 
 ```sh
-node bin/arbol-codex-driver.mjs run --subscription test-chatgpt \
+bin/arbol-codex-driver run --subscription test-chatgpt \
   --model gpt-5.6-luna --effort low "Reply with hello."
 ```
 
@@ -111,41 +133,32 @@ Status checks renew through Codex, usage caches the last good report, and model
 catalogs include the tool's efforts and service tiers, with a marked built-in
 fallback. The Driver never reads or copies a credential file.
 
-The opt-in `test/probe-subscriptions.mjs <codex-path> <test-chatgpt-home>
-<record-path>` sends no prompts. It checks configuration, both login methods,
-local replacement and cleanup in fresh homes, then account status, usage and
-models in the pre-authorized test home. It creates a local account record from
-Codex's confirmed account details when that home has no record yet. It preserves
-the test login and omits the account's email from its saved evidence. The latest
-record is `research/subscriptions-2026-10-07.json` in the Artifact Corpus.
+Recorded vendor evidence remains in the Artifact Corpus:
+`research/base-info-2026-10-07.json`, `research/subscriptions-2026-10-07.json`,
+`research/run-protocol-2026-10-07.json`, `research/run-2026-10-07.json`,
+`research/continuity-protocol-2026-10-07.json`, `research/continuity-2026-10-07.json`,
+and the stopping protocol, stopping, and stopping-subagent records from the
+same date. These historical records preserve their original vendor shapes,
+synthetic variations, failures, and subsequent corrections. Migration tests
+include independent Node-generated format-1 history and JSON vectors; mixed
+TypeScript/Python checks exercise the retained pre-migration program in both
+directions. The former active TypeScript runtime, tests, and probe runners are
+retained in Git history.
 
-The opt-in `test/probe-run-protocol.mjs <codex-path> <record-path>` sends no
-prompt: it checks the installed stable schema, local image form, configuration,
-handshake and cleanup. `test/probe-run.mjs <codex-path> <state-dir> <record-path>`
-sends two short low-effort Luna messages on `test-chatgpt`, checks events and
-usage, and verifies temporary-folder and record cleanup. Their evidence is in
-`research/run-protocol-2026-10-07.json` and `research/run-2026-10-07.json`.
+To rehearse a standalone development candidate without allocating a numbered
+Build, create an empty folder and run:
 
-`test/probe-continuity.mjs <codex-path> <record-path>` sends no prompt and checks
-the stable resume/injection schema, tool-created history, pictures, tool names
-and resume notifications in a fresh private home. The opt-in
-`test/probe-continuity-live.mjs <codex-path> <state-dir> <record-path>` sends four
-short Luna turns at the lowest offered effort on `test-chatgpt`: a tool turn,
-a resumed follow-up, an edited-history rebuild and a changed-system-prompt
-rebuild. Records are `research/continuity-protocol-2026-10-07.json` and
-`research/continuity-2026-10-07.json`.
+```sh
+uv run --locked python scripts/package_build.py --candidate /absolute/empty/folder
+/absolute/empty/folder/runtime/python/bin/python3.14 /absolute/empty/folder/scripts/check_build.py metadata --candidate /absolute/empty/folder
+/absolute/empty/folder/runtime/python/bin/python3.14 /absolute/empty/folder/scripts/check_build.py unit --candidate /absolute/empty/folder
+```
 
-`test/probe-stop.mjs <codex-path> <record-path>` sends no prompt or account
-request. It checks the stable interrupt and sub-agent notification schemas, an
-idle interrupt, continued transport use and EOF cleanup in a fresh home. The
-opt-in `test/probe-stop-live.mjs <codex-path> <state-dir> <record-path>` checks
-answer cancellation, stopping a sub-agent's long command and recovery after a
-killed Driver on `test-chatgpt`, after checking available usage. `--case
-subagent` runs only the child check. Evidence is saved as
-`research/stopping-protocol-2026-10-07.json`, `research/stopping-2026-10-07.json`
-and `research/stopping-subagent-2026-10-07.json` in the Artifact Corpus. The
-initial live record retains two passes and the child-announcement failure that
-led to support for the second observed spawn form; the focused follow-up passes.
+The candidate contains its interpreter, runtime, tests, and contract wrappers.
+Metadata checks validate the distribution and packaged file digests. The
+registry rehearsal validates relocation to a path with spaces, direct entry,
+selection, and failed-check refusal. `live` and production Build delivery stay
+pending SYL-92 and SYL-94; SYL-95 adds no new inference features.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the
