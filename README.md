@@ -76,7 +76,9 @@ events already sent, closes running calls as interrupted, and ends as
 The Driver interrupts the main turn and active sub-agent turns concurrently
 under one two-second deadline. It then closes app-server input and ends any
 remaining verified process groups within the fifteen-second stop bound. Run
-records and temporary files go after cleanup. If the Driver is killed outright,
+records and temporary files go after cleanup. A reader that accepts no output
+within the remaining stop budget cannot receive the final event; the Driver
+still exits after cleanup. If the Driver is killed outright,
 the next `run`, `runs list`, `runs stop` or Subscription change recovers the
 orphaned tool and its command groups, removes its temporary folder and record,
 and invalidates the matching conversation entry. A program that makes itself a
@@ -138,9 +140,12 @@ request. It checks the stable interrupt and sub-agent notification schemas, an
 idle interrupt, continued transport use and EOF cleanup in a fresh home. The
 opt-in `test/probe-stop-live.mjs <codex-path> <state-dir> <record-path>` checks
 answer cancellation, stopping a sub-agent's long command and recovery after a
-killed Driver on `test-chatgpt`, after checking available usage. Evidence is
-saved as `research/stopping-protocol-2026-10-07.json` and
-`research/stopping-2026-10-07.json` in the Artifact Corpus.
+killed Driver on `test-chatgpt`, after checking available usage. `--case
+subagent` runs only the child check. Evidence is saved as
+`research/stopping-protocol-2026-10-07.json`, `research/stopping-2026-10-07.json`
+and `research/stopping-subagent-2026-10-07.json` in the Artifact Corpus. The
+initial live record retains two passes and the child-announcement failure that
+led to support for the second observed spawn form; the focused follow-up passes.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the
