@@ -166,13 +166,13 @@ export function builtinCatalog(fetchedAt = new Date().toISOString()): ModelCatal
 }
 export const builtinModelCatalog = builtinCatalog;
 
-export async function readModelCatalog(server: RpcClient, fetchedAt = new Date().toISOString()): Promise<ModelCatalog> {
+export async function readModelCatalog(server: RpcClient, fetchedAt = new Date().toISOString(), fallback = true): Promise<ModelCatalog> {
   try {
     const raw: unknown[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
     do {
-      const page = await server.request('model/list', cursor === undefined ? { includeHidden: false } : { includeHidden: false, cursor });
+      const page = await server.request('model/list', { ...(fallback ? { includeHidden: false } : {}), ...(cursor === undefined ? {} : { cursor }) });
       if (!isObject(page) || !Array.isArray(page.data)) malformed('model list page');
       raw.push(...page.data);
       if (page.nextCursor === undefined || page.nextCursor === null) cursor = undefined;
@@ -184,6 +184,7 @@ export async function readModelCatalog(server: RpcClient, fetchedAt = new Date()
     } while (cursor !== undefined);
     return normalizeModels(raw, 'tool', fetchedAt);
   } catch (error) {
+    if (!fallback) throw error;
     if (error instanceof Failure && error.result.code === 'credential_rejected') throw error;
     return builtinCatalog(fetchedAt);
   }

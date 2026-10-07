@@ -142,6 +142,10 @@ export class Subscriptions {
     if (item.state !== 'signed_in') throw new Failure('not_signed_in', 'Sign in to this Subscription first.', { remedy: 'Sign in again.' });
     return item;
   }
+  async runReport(initial: Subscription, error: DriverError): Promise<void> {
+    if (error.code !== 'credential_rejected') return;
+    await this.merge(initial, { state: 'needs_attention', problem: error, checkedAt: now() });
+  }
   private async start(id: string, onSpawn?: (owner: Owner) => Promise<void>, signal = this.signal): Promise<AppServer> {
     const tool = await inspectTool(this.state, this.settings.toolPath, this.env, signal); requireTool(tool);
     return AppServer.start({ toolPath: tool.path!, home: this.file(id, 'home'), env: this.env,
@@ -379,6 +383,9 @@ export class Subscriptions {
     await this.get(id); await this.activeRuns(id, force);
     const progress = await this.reserve(id, 'sign_out'); let server: AppServer | undefined;
     try {
+      // Reservation prevents new runs. Check again for a run published between
+      // the first scan and this reservation, outside the short record lock.
+      await this.activeRuns(id, force);
       server = await this.start(id, tool => this.setTool(id, progress, tool));
       await server.request('account/logout', {}, this.waitOptions());
       this.signal?.throwIfAborted();
@@ -390,6 +397,7 @@ export class Subscriptions {
     await this.get(id); await this.activeRuns(id, force);
     const progress = await this.reserve(id, 'remove');
     try {
+      await this.activeRuns(id, force);
       await this.state.withSubscriptionLock(id, async () => {
         await rm(this.file(id, 'home'), { recursive: true, force: true });
         await rm(this.file(id, 'chats'), { recursive: true, force: true });

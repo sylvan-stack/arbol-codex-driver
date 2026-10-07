@@ -47,6 +47,13 @@ createInterface({input:process.stdin}).on('line',line=>{
     const split=bytes.indexOf(Buffer.from('🌲'))+1;
     process.stdout.write(bytes.subarray(0,split)); setTimeout(()=>process.stdout.write(bytes.subarray(split)),5); return;
   }
+  if(value.method==='burst'){
+    for(let seq=0;seq<600;seq++)send({method:'fixture/delta',params:{seq}});
+    send({id:value.id,result:{ok:true}});return;
+  }
+  if(value.method==='exit-with-log'){
+    process.stderr.write('🌲'.repeat(20000)+'diagnostic-sentinel',()=>process.exit(3));return;
+  }
   if(value.method==='unknown'){
     unknownRequest=value.id; send({id:'server-id',method:'future/request',params:{}}); return;
   }
@@ -109,6 +116,22 @@ test('app-server.unknown-request answers unknown tool requests with a JSON-RPC e
   const server = await AppServer.start(f.options);
   t.after(() => server.close());
   assert.deepEqual(await server.request('unknown', {}), { code: -32601, message: 'Method not supported by the Driver.' });
+});
+
+test('app-server.run-stream retains every notification arriving before a request answer and includes a bounded failure log', async t => {
+  const f = await fake(t);
+  const server = await AppServer.start(f.options);
+  t.after(() => server.close());
+  await server.request('burst', {});
+  for (let seq = 0; seq < 600; seq++) assert.deepEqual(await server.nextNotification(), { method: 'fixture/delta', params: { seq } });
+  await assert.rejects(server.request('exit-with-log', {}), error => {
+    assert.ok(error instanceof Failure);
+    const excerpt = error.result.detail?.excerpt;
+    assert.ok(excerpt);
+    assert.ok(excerpt?.endsWith('diagnostic-sentinel'));
+    assert.ok(Buffer.byteLength(excerpt) <= 1024); assert.equal(excerpt.includes('�'), false);
+    return true;
+  });
 });
 
 test('app-server.validation stops children with mismatched homes or ignored configuration', async t => {

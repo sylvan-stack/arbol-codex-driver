@@ -6,7 +6,7 @@ import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { buildIdentity } from './build.js';
 import { cleanEnvironment } from './environment.js';
-import { Failure, errno } from './errors.js';
+import { Failure, errno, safeText } from './errors.js';
 import { isObject } from './settings.js';
 import { atomicWrite, fixedWait, privateDirectory, processOwner } from './state.js';
 import type { Owner } from './state.js';
@@ -38,13 +38,14 @@ export interface AppServerOptions {
   signal?: AbortSignal;
   requestTimeoutMs?: number;
   onSpawn?: (owner: Owner) => Promise<void> | void;
+  onServerRequest?: (method: string, params: unknown) => unknown;
 }
 interface Pending {
   resolve(value: unknown): void;
   reject(error: Error): void;
   dispose(): void;
 }
-interface Notification { method: string; params: unknown }
+export interface Notification { method: string; params: unknown }
 interface Watcher extends Pending { method: string; predicate: (params: unknown) => boolean }
 
 function aborted(): Failure { return new Failure('tool_failed', 'The codex operation was cancelled.'); }
@@ -71,6 +72,10 @@ export class AppServer {
   private readonly pending = new Map<number, Pending>();
   private readonly notifications: Notification[] = [];
   private readonly watchers = new Set<Watcher>();
+  private notificationWaiter: Pending | undefined;
+  private logTail = '';
+  effectiveConfig: Record<string, unknown> = {};
+  toolVersion: string | undefined;
   private failure: Error | undefined;
   private closing: Promise<void> | undefined;
   private closeResolve!: () => void;
@@ -79,21 +84,23 @@ export class AppServer {
   private buffer = '';
   private removeAbort: (() => void) | undefined;
 
-  private constructor(private readonly child: ChildProcessWithoutNullStreams, owner: Owner, private readonly timeoutMs: number, private readonly cleanupGraceMs: number) {
+  private constructor(private readonly child: ChildProcessWithoutNullStreams, owner: Owner, private readonly timeoutMs: number, private readonly cleanupGraceMs: number,
+    private readonly onServerRequest?: AppServerOptions['onServerRequest']) {
     this.ownerRecord = owner;
     this.closed = new Promise<void>(resolve => { this.closeResolve = resolve; });
     child.stdout.on('data', (chunk: Buffer) => this.consume(this.decoder.write(chunk)));
     child.stdout.once('end', () => {
       this.consume(this.decoder.end());
       if (this.buffer.trim()) this.fail(new Failure('tool_failed', 'codex returned an incomplete app-server message.'));
+      this.fail(new Failure('tool_failed', 'The codex app-server output ended.', { detail: { basis: 'fields', excerpt: this.logTail } }));
     });
-    // Drain stderr but never persist or print arbitrary tool output: it may
-    // contain private configuration or authentication diagnostics.
-    child.stderr.resume();
+    // Keep only the bounded in-memory tail for a failed run's diagnostic.
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { this.logTail = safeText(this.logTail + chunk, [], 64 * 1024); });
     child.stdin.on('error', () => this.fail(new Failure('tool_failed', 'Cannot send a request to codex.')));
     child.once('error', () => this.fail(new Failure('tool_failed', 'Cannot start the codex app-server.')));
     child.once('exit', code => {
-      this.fail(new Failure('tool_failed', 'The codex app-server exited.', code === null ? {} : { detail: { basis: 'fields', toolExit: code } }));
+      this.fail(new Failure('tool_failed', 'The codex app-server exited.', { detail: { basis: 'fields', ...(code === null ? {} : { toolExit: code }), excerpt: this.logTail } }));
       // Wrappers may leave descendants holding pipes open after the parent exits.
       this.killGroup('SIGKILL');
     });
@@ -123,7 +130,7 @@ export class AppServer {
     }
     // Install listeners before the asynchronous owner lookup: even a wrapper
     // that exits immediately must be drained and its process group stopped.
-    const server = new AppServer(child, { pid: child.pid, startedAt: new Date().toISOString() }, requestTimeoutMs, cleanupGraceMs);
+    const server = new AppServer(child, { pid: child.pid, startedAt: new Date().toISOString() }, requestTimeoutMs, cleanupGraceMs, options.onServerRequest);
     const abort = (): void => { server.fail(aborted()); void server.close(); };
     if (options.signal) {
       options.signal.addEventListener('abort', abort, { once: true });
@@ -143,8 +150,11 @@ export class AppServer {
       if (!sameHome) {
         throw new Failure('tool_failed', 'codex opened a different Subscription home.');
       }
+      if (isObject(answer) && typeof answer.userAgent === 'string') server.toolVersion = answer.userAgent.match(/^[^/]+\/([^ ]+)/)?.[1];
       server.send({ method: 'initialized' });
-      validateDriverConfig(await server.request('config/read', {}));
+      const configuration = await server.request('config/read', {});
+      validateDriverConfig(configuration);
+      server.effectiveConfig = (configuration as { config: Record<string, unknown> }).config;
       // The caller owns the lifecycle after startup. In particular, sign-in
       // cancellation must send account/login/cancel before stopping the tool.
       server.removeAbort?.();
@@ -154,6 +164,24 @@ export class AppServer {
       await server.close();
       throw error;
     }
+  }
+
+  /** Lossless ordered inference notifications, including those before turn/start answers. */
+  nextNotification(options: WaitOptions = {}): Promise<Notification> {
+    if (options.signal?.aborted) return Promise.reject(aborted());
+    const early = this.notifications.shift();
+    if (early) return Promise.resolve(early);
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.notificationWaiter) return Promise.reject(new Failure('internal', 'An app-server notification reader is already waiting.'));
+    return new Promise<Notification>((resolve, reject) => {
+      const abort = (): void => { this.notificationWaiter = undefined; dispose(); reject(aborted()); };
+      const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => {
+        this.notificationWaiter = undefined; dispose(); reject(new Failure('tool_failed', 'Timed out waiting for codex output.'));
+      }, options.timeoutMs);
+      const dispose = (): void => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); };
+      this.notificationWaiter = { resolve: value => resolve(value as Notification), reject, dispose };
+      options.signal?.addEventListener('abort', abort, { once: true });
+    });
   }
 
   request<T = unknown>(method: string, params: unknown, options: WaitOptions = {}): Promise<T> {
@@ -208,15 +236,11 @@ export class AppServer {
   private consume(chunk: string): void {
     if (this.failure) return;
     this.buffer += chunk;
-    if (Buffer.byteLength(this.buffer) > 4 * 1024 * 1024) {
-      this.fail(new Failure('tool_failed', 'codex returned an oversized app-server message.'));
-      void this.close();
-      return;
-    }
     let newline: number;
     while ((newline = this.buffer.indexOf('\n')) >= 0) {
       const line = this.buffer.slice(0, newline);
       this.buffer = this.buffer.slice(newline + 1);
+      if (Buffer.byteLength(line) > 4 * 1024 * 1024) { this.oversized(); return; }
       if (!line.trim()) continue;
       let message: unknown;
       try { message = JSON.parse(line) as unknown; }
@@ -226,7 +250,8 @@ export class AppServer {
         if (message.id !== undefined) {
           // Account operations have no supported server requests. Always answer
           // an unknown request so it cannot strand the vendor tool.
-          this.send({ id: message.id, error: { code: -32601, message: 'Method not supported by the Driver.' } });
+          const result = this.onServerRequest?.(message.method, message.params);
+          this.send(result === undefined ? { id: message.id, error: { code: -32601, message: 'Method not supported by the Driver.' } } : { id: message.id, result });
         } else this.notify(message.method, message.params);
       } else if (typeof message.id === 'number' && (('result' in message) !== ('error' in message))) {
         const pending = this.pending.get(message.id);
@@ -240,9 +265,14 @@ export class AppServer {
         } else pending.resolve(message.result);
       } else { this.malformed(); return; }
     }
+    if (Buffer.byteLength(this.buffer) > 4 * 1024 * 1024) this.oversized();
   }
 
   private notify(method: string, params: unknown): void {
+    if (this.notificationWaiter) {
+      const waiter = this.notificationWaiter; this.notificationWaiter = undefined;
+      waiter.dispose(); waiter.resolve({ method, params }); return;
+    }
     for (const watcher of this.watchers) {
       if (watcher.method !== method) continue;
       let matches: boolean;
@@ -251,11 +281,14 @@ export class AppServer {
       if (matches) { this.watchers.delete(watcher); watcher.dispose(); watcher.resolve(params); return; }
     }
     this.notifications.push({ method, params });
-    if (this.notifications.length > 256) this.notifications.shift();
   }
 
   private malformed(): void {
     this.fail(new Failure('tool_failed', 'codex returned a malformed app-server message.'));
+    void this.close();
+  }
+  private oversized(): void {
+    this.fail(new Failure('tool_failed', 'codex returned an oversized app-server message.'));
     void this.close();
   }
   private fail(error: Error): void {
@@ -264,6 +297,9 @@ export class AppServer {
     this.pending.clear();
     for (const watcher of this.watchers) { watcher.dispose(); watcher.reject(this.failure); }
     this.watchers.clear();
+    if (this.notificationWaiter) {
+      const waiter = this.notificationWaiter; this.notificationWaiter = undefined; waiter.dispose(); waiter.reject(this.failure);
+    }
   }
   private killGroup(signal: NodeJS.Signals): void {
     try {
@@ -289,5 +325,15 @@ export class AppServer {
       if (finalTimer) clearTimeout(finalTimer);
     })();
     return this.closing;
+  }
+
+  /** Normal run completion lets the app-server clean up its commands on stdin EOF. */
+  async end(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.child.stdin.end();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([this.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, fixedWait(2000)); })]);
+    clearTimeout(timer);
+    await this.close();
   }
 }
