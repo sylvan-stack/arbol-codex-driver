@@ -15,6 +15,7 @@ from .cancellation import Cancellation
 from .catalog import builtin_catalog, normalize_account, normalize_usage, read_model_catalog
 from .errors import Failure, safe_failure
 from .json_types import Json, Object, iso, now, object_value, string, timestamp
+from .run_limits import merge_usage_reports
 from .runs import Runs
 from .state import (
     Owner,
@@ -295,6 +296,33 @@ class Subscriptions:
     async def run_report(self, initial: Object, error: Object) -> None:
         if error["code"] == "credential_rejected":
             await self.merge(initial, {"state": "needs_attention", "problem": error, "checkedAt": now()})
+
+    async def store_run_usage(self, initial: Object, usage: Object) -> None:
+        """Save a run snapshot without restoring a replaced or signed-out login."""
+        id_ = str(initial["id"])
+
+        async def change() -> None:
+            try:
+                current = self.record(id_)
+            except Failure as error:
+                if error.result["code"] == "not_found":
+                    return
+                raise
+            if (
+                current["state"] == "signed_out"
+                or any(current.get(key) != initial.get(key) for key in ("state", "checkedAt", "createdAt", "account"))
+                or self.progress(id_) is not None
+            ):
+                return
+            previous = object_value(current.get("lastUsage"))
+            observed = timestamp(usage.get("fetchedAt"))
+            stored = timestamp(previous.get("fetchedAt"))
+            if observed is None or stored is not None and stored > observed:
+                return
+            report = merge_usage_reports(previous, usage, object_value(initial.get("lastUsage")))
+            write_json(self.file(id_, "record.json"), {**current, "lastUsage": report, "updatedAt": now()})
+
+        await self.state.with_subscription_lock(id_, change, self.env)
 
     async def start(
         self,

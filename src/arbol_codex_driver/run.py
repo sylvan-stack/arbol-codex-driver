@@ -16,7 +16,10 @@ from .history import history_items, labelled_history_input, prepare_turn_input
 from .input_stream import Input
 from .json_types import Json, Object, loads, object_value, string
 from .owner_setup import diagnostic_values, owner_mcp_config, sanitize_diagnostic
+from .run_clocks import RunClocks
+from .run_errors import classify_error
 from .run_events import RunEvents
+from .run_limits import RunLimits
 from .run_request import RunRequest, read_run_request
 from .runs import Runs
 from .state import Owner, fixed_wait, owner_json, private_directory, read_json, write_json
@@ -80,6 +83,10 @@ async def run(
     pending_notices: list[Object] = []
     pending_request_notices: list[Object] = []
     private_values: tuple[str, ...] = ()
+    stop_error: Failure | None = None
+    clock_task: asyncio.Task[None] | None = None
+    subscription: Object | None = None
+    limits: RunLimits | None = None
 
     def emit(type_: str, data: Object) -> None:
         if type_ == "notice":
@@ -121,6 +128,7 @@ async def run(
         if not request.control and input_ is not None:
             input_.close()
         subscription = await subscriptions.require_signed_in(request.subscription_id)
+        limits = RunLimits(object_value(subscription.get("lastUsage")))
         parsed = request
 
         async def reserve() -> Object:
@@ -194,6 +202,39 @@ async def run(
             record["tool"] = owner_json(owner)
             runs.save(record)
 
+        def notification(method: str, value: Json) -> None:
+            nonlocal stop_error
+            assert limits is not None
+            if method == "account/rateLimits/updated":
+                limits.observe(value)
+            params = object_value(value)
+            thread_id = string(params.get("threadId"))
+            if method == "error" and thread_id is not None and (
+                thread_id == conversation or mapper is not None and mapper.knows_thread(thread_id)
+            ):
+                classified = classify_error(params.get("error"),
+                                           tool_version=server.tool_version if server is not None else None,
+                                           secrets=private_values)
+                if classified["code"] == "credential_rejected" and stop_error is None and not cancellation.aborted:
+                    stop_error = Failure("credential_rejected", str(classified["message"]), classified)
+
+        clocks = RunClocks(time.monotonic(), fixed_wait(60000, env), request.limits)
+
+        async def watch_clocks() -> None:
+            nonlocal stop_error
+            while not events.finished and not cancellation.aborted:
+                failure = clocks.check(
+                    time.monotonic(), server.last_notification_at if server is not None else clocks.started_at,
+                    mapper is not None and (mapper.has_open_calls or mapper.waiting_for_work),
+                )
+                stop_error = stop_error or failure
+                if stop_error is not None:
+                    cancellation.abort()
+                    return
+                await asyncio.sleep(0.005)
+
+        clock_task = asyncio.create_task(watch_clocks())
+
         def server_request(method: str, params: Json) -> Json:
             approval = method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
             identity = object_value(params)
@@ -221,6 +262,7 @@ async def run(
             on_spawn=spawned,
             on_server_request=server_request,
             private_values=private_values,
+            on_notification=notification,
         )
         account = normalize_account(await server.request("account/read", {}, cancellation=cancellation))
         if account is None:
@@ -357,8 +399,10 @@ async def run(
         turn_id = string(object_value(turn.get("turn")).get("id"))
         if turn_id is None:
             raise Failure("tool_failed", "Codex returned a malformed turn.")
+        clocks.acknowledge(time.monotonic())
 
-        mapper = RunEvents(conversation, turn_id, current_model, emit)
+        mapper = RunEvents(conversation, turn_id, current_model, emit,
+                           tool_version=server.tool_version, secrets=private_values)
         write_json(
             temporary / "shell-owners.json", [owner_json(owner) for owner in await server.capture_process_groups()]
         )
@@ -412,6 +456,10 @@ async def run(
                     [owner_json(owner) for owner in await server.capture_process_groups()],
                 )
             mapper.consume(notice.method, notice.params)
+            if mapper.credential_rejection is not None and not cancellation.aborted:
+                rejection = mapper.credential_rejection
+                stop_error = stop_error or Failure("credential_rejected", str(rejection["message"]), rejection)
+                cancellation.abort()
             await events.flush(cancellation)
         if mapper.outcome == "failed":
             error = Failure(
@@ -420,10 +468,20 @@ async def run(
                 {**(mapper.error or {}),
                  "message": sanitize_diagnostic((mapper.error or {}).get("message"), private_values)},
             )
+            if error.result["code"] == "rate_limited":
+                try:
+                    limits.observe_read(await server.request("account/rateLimits/read", {}, cancellation=cancellation))
+                    wait = limits.wait_seconds(time.time())
+                    if wait is not None:
+                        error.result["retryAfterSeconds"] = wait
+                except Failure:
+                    # The original vendor failure remains actionable even if its
+                    # optional, quota-free limits request is unavailable.
+                    pass
         elif mapper.outcome == "interrupted":
             error = Failure("tool_failed", "Codex interrupted the turn without a caller stop.")
     except Exception as failure:
-        error = failure
+        error = stop_error or failure
     finally:
         if cancellation.aborted and server is not None:
             if mapper is None and conversation is not None:
@@ -444,6 +502,8 @@ async def run(
                         str(object_value(object_value(announced.params).get("turn"))["id"]),
                         current_model or "",
                         emit,
+                        tool_version=server.tool_version,
+                        secrets=private_values,
                     )
                     if not started and request is not None and plan is not None:
                         events.emit(
@@ -468,6 +528,8 @@ async def run(
                     )
                 except Exception:
                     pass
+        if stop_error is not None:
+            error = stop_error
         if server is not None:
 
             async def stop_during_end() -> None:
@@ -490,6 +552,14 @@ async def run(
             finally:
                 end_stop.cancel()
                 await asyncio.gather(end_stop, return_exceptions=True)
+            if isinstance(error, Failure):
+                detail = object_value(error.result.get("detail"))
+                detail.setdefault("basis", "fields")
+                if server.child.returncode is not None:
+                    detail.setdefault("toolExit", server.child.returncode)
+                if server.tool_version is not None:
+                    detail.setdefault("toolVersion", server.tool_version)
+                error.result["detail"] = detail
         settled = True
         if input_ is not None:
             input_.close()
@@ -498,7 +568,7 @@ async def run(
             await asyncio.gather(control_task, return_exceptions=True)
         if mapper is not None:
             mapper.close_open_calls(
-                "The tool call was interrupted by the caller."
+                str(stop_error) if stop_error is not None else "The tool call was interrupted by the caller."
                 if cancellation.aborted
                 else "The run ended before the tool call finished."
             )
@@ -507,6 +577,16 @@ async def run(
                 shutil.rmtree(temporary)
             except OSError as failure:
                 error = error or failure
+        if subscription is not None:
+            try:
+                if limits is not None and limits.report is not None:
+                    await subscriptions.store_run_usage(subscription, limits.report)
+                if isinstance(error, Failure):
+                    await subscriptions.run_report(subscription, error.result)
+            except Failure as failure:
+                # A newer sign-in or sign-out owns its account state.
+                if failure.result["code"] != "in_use":
+                    error = error or failure
     if request is not None and plan is not None and reserved_id is not None:
         try:
             await events.flush(cancellation)
@@ -525,8 +605,8 @@ async def run(
     try:
         finish = asyncio.create_task(
             events.finish(
-                error,
-                cancellation.aborted,
+                stop_error or error,
+                cancellation.aborted and stop_error is None,
                 {
                     "producedOutput": mapper.output_produced if mapper is not None else False,
                     "unfinishedCalls": mapper.unfinished_calls if mapper is not None else [],
@@ -541,7 +621,7 @@ async def run(
                 max(0.001, (cancellation.stopped_at or time.monotonic()) + fixed_wait(15000, env) - time.monotonic())
             )
             events.abandon()
-            return 2
+            return 1 if stop_error is not None else 2
 
         deadline_task = asyncio.create_task(output_deadline())
         try:
@@ -568,8 +648,11 @@ async def run(
             await chats.settle(
                 request, {**plan, "continuedConversation": conversation}, conversation, fingerprint.snapshot(), False
             )
-        return 2 if cancellation.aborted else 1
+        return 2 if cancellation.aborted and stop_error is None else 1
     finally:
         events.output.on_error = None
+        if clock_task is not None:
+            clock_task.cancel()
+            await asyncio.gather(clock_task, return_exceptions=True)
         if reserved_id is not None:
             runs.remove(reserved_id)

@@ -33,7 +33,8 @@ for line in sys.stdin:
     if id_=='server-id': send({'id':unknown,'result':value.get('error')}); continue
     if method=='initialize':
         if scenario.startswith('hang-initialize'): continue
-        send({'id':id_,'result':{'codexHome':'/wrong/home' if scenario=='wrong-home' else os.environ['CODEX_HOME']}}); continue
+        version = '0.158.0' if scenario=='old-handshake' else 'bad-version' if scenario=='bad-handshake' else '0.159.2'
+        send({'id':id_,'result':{'codexHome':'/wrong/home' if scenario=='wrong-home' else os.environ['CODEX_HOME'], 'userAgent':'codex/'+version+' (Mac OS)'}}); continue
     if method=='config/read':
         if scenario.startswith('hang-config'): continue
         send({'id':id_,'result':{'config':{}} if scenario=='wrong-config' else config}); continue
@@ -137,6 +138,16 @@ class AppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.home / "config.toml").stat().st_mode & 0o777, 0o600)
         await server.close()
         self.assertFalse(await owner_alive(server.owner))
+
+    async def test_handshake_version_and_effective_configuration_are_enforced(self) -> None:
+        for scenario, code in (("old-handshake", "tool_unsupported"), ("bad-handshake", "tool_failed"),
+                               ("wrong-config", "tool_unsupported")):
+            with self.subTest(scenario=scenario), self.assertRaises(Failure) as caught:
+                await self.start(scenario)
+            self.assertEqual(caught.exception.result["code"], code)
+            if scenario == "old-handshake":
+                self.assertEqual(object_value(caught.exception.result["detail"])["toolVersion"], "0.158.0")
+                self.assertEqual(object_value(caught.exception.result["detail"])["neededVersion"], "0.159.2")
 
     async def test_fragmented_utf8_early_notifications_burst_and_unknown_request(self) -> None:
         server = await self.start()

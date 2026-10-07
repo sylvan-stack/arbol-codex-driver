@@ -17,6 +17,7 @@ from .json_types import Json, Object, dumps, loads, object_value, string
 from .owner_setup import DiagnosticScrubber, sanitize_diagnostic
 from .process_groups import collect_process_groups, end_process_groups, force_process_groups
 from .state import Owner, atomic_write, fixed_wait, owner_json, private_directory, process_owner
+from .tool import OLDEST_SUPPORTED, supported_version
 
 DRIVER_CONFIG = 'check_for_update_on_startup = false\nweb_search = "live"\ncli_auth_credentials_store = "file"\n\n[analytics]\nenabled = false\n\n[features]\nmemories = false\n'
 
@@ -35,7 +36,8 @@ def validate_driver_config(value: Json) -> Object:
         or object_value(config.get("analytics")).get("enabled") is not False
         or object_value(config.get("features")).get("memories") is not False
     ):
-        raise Failure("tool_failed", "codex did not apply the Driver configuration.")
+        raise Failure("tool_unsupported", "codex did not apply the Driver configuration.",
+                      {"remedy": "Update codex."})
     return config
 
 
@@ -93,10 +95,13 @@ class AppServer:
         cleanup_grace: float,
         on_server_request: Callable[[str, Json], Json] | None,
         private_values: tuple[str, ...] = (),
+        on_notification: Callable[[str, Json], None] | None = None,
     ) -> None:
         self.child, self.owner, self.timeout, self.cleanup_grace = child, owner, timeout, cleanup_grace
         self.on_server_request = on_server_request
         self.private_values = private_values
+        self.on_notification = on_notification
+        self.last_notification_at = time.monotonic()
         self.next_id = 1
         self.pending: dict[int, asyncio.Future[Json]] = {}
         self.notifications: list[Notification] = []
@@ -132,6 +137,7 @@ class AppServer:
         on_server_request: Callable[[str, Json], Json] | None = None,
         launch_identity_path: Path | None = None,
         private_values: tuple[str, ...] = (),
+        on_notification: Callable[[str, Json], None] | None = None,
     ) -> AppServer:
         if cancellation is not None:
             cancellation.check()
@@ -171,6 +177,7 @@ class AppServer:
             fixed_wait(500, env),
             on_server_request,
             private_values,
+            on_notification,
         )
         try:
             owner = await process_owner(child.pid)
@@ -201,6 +208,13 @@ class AppServer:
             agent = string(answer.get("userAgent"))
             match = re.match(r"^[^/]+/([^ ]+)", agent or "")
             server.tool_version = match[1] if match is not None else None
+            if server.tool_version is None or re.fullmatch(r"\d+\.\d+\.\d+", server.tool_version) is None:
+                raise Failure("tool_failed", "codex returned an unrecognised handshake version.")
+            if not supported_version(server.tool_version):
+                raise Failure("tool_unsupported",
+                              f"codex {server.tool_version} is unsupported; needed {OLDEST_SUPPORTED} or newer.",
+                              {"detail": {"basis": "fields", "toolVersion": server.tool_version,
+                                          "neededVersion": OLDEST_SUPPORTED}, "remedy": "Update codex."})
             await server.send({"method": "initialized"})
             server.effective_config = validate_driver_config(
                 await server.request("config/read", {}, cancellation=cancellation)
@@ -349,6 +363,9 @@ class AppServer:
         task.add_done_callback(done)
 
     def notify(self, method: str, params: Json) -> None:
+        self.last_notification_at = time.monotonic()
+        if self.on_notification is not None:
+            self.on_notification(method, params)
         waiter = self.notification_waiter
         if waiter is not None and not waiter.done():
             self.notification_waiter = None

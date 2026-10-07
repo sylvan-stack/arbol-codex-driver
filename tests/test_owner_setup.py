@@ -170,7 +170,7 @@ for line in sys.stdin:
     if method == 'initialized':
         continue
     if method == 'initialize':
-        result = {'codexHome': os.environ['CODEX_HOME']}
+        result = {'codexHome': os.environ['CODEX_HOME'], 'userAgent': 'codex/0.159.2 (Mac OS)'}
     elif method == 'config/read':
         result = {'config': {'check_for_update_on_startup': False, 'web_search': 'live', 'cli_auth_credentials_store': 'file', 'analytics': {'enabled': False}, 'features': {'memories': False}}}
     elif method in ('thread/start', 'thread/resume'):
