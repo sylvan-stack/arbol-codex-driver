@@ -17,11 +17,12 @@ from typing import Any
 from .errors import Failure
 from .event_stream import Output
 from .input_stream import Input
-from .json_types import dumps, loads
+from .json_types import Object, dumps, loads
 from .stand_in import ACCOUNT, CONFIG, SOURCE, VERSION, append_record, environment_checks, fixture_models
 
 type Record = dict[str, Any]
 SCENARIOS = {
+    "C4",
     "C9",
     "C10",
     "C11",
@@ -35,6 +36,11 @@ SCENARIOS = {
     "C19",
     "C20",
     "C25",
+    "C26",
+    "C27",
+    "C28",
+    "C29",
+    "C30",
     "C33",
     "C35",
     "C37",
@@ -78,7 +84,44 @@ PARTS = {
     "nested",
     "unexpected-tool",
     "child-late-tool",
+    "model",
+    "effort",
+    "tool-newer",
+    "wording-rate",
+    "wording-auth",
+    "missing-class-rate",
+    "missing-class-auth",
+    "unknown-class",
+    "unknown",
+    "bare-fragments",
+    "exit",
+    "old-handshake",
+    "seconds",
+    "minutes",
+    "none",
+    "reset",
+    "start",
+    "idle",
+    "call",
+    "heartbeat",
+    "idle-off",
+    "total",
+    "auth-start-race",
+    "auth-child-replay",
+    "blocked-output",
 }
+ERROR_CLASSES = {
+    "unauthorized", "usageLimitExceeded", "rateLimitExceeded", "contextWindowExceeded",
+    "serverOverloaded", "internalServerError", "flexUnavailable", "cyberPolicy",
+    "misalignmentPolicyViolation", "tooManyDenials", "badRequest", "sessionBudgetExceeded",
+    "sandboxError", "threadRollbackFailed", "activeTurnNotSteerable",
+}
+CONNECTION_CLASSES = {
+    "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected",
+    "responseTooManyFailedAttempts",
+}
+PARTS.update(ERROR_CLASSES)
+PARTS.update(f"{class_}-{status}" for class_ in CONNECTION_CLASSES for status in ("401", "403", "500", "none", "400"))
 WORKER_PARTS = {
     "tool",
     "subagent",
@@ -425,6 +468,11 @@ class RunFixture:
         async def error(message: str, code: int = -32602) -> None:
             await self.write({"id": request["id"], "error": {"code": code, "message": message}})
 
+        # Each response arrives inside its own 30-second request limit while
+        # their combined delay exceeds the 60-second whole startup limit.
+        if self.scenario == "C29" and self.part == "start" and method in ("initialize", "config/read", "account/read"):
+            await asyncio.sleep(0.23)
+
         if method == "initialize" and not self.initialized:
             client = params.get("clientInfo")
             if (
@@ -437,7 +485,7 @@ class RunFixture:
             self.initialized = True
             await answer(
                 {
-                    "userAgent": f"arbol-codex-driver/{VERSION} (Mac OS 27.0.1; arm64) unknown (arbol-codex-driver; 1.0.0)",
+                    "userAgent": f"arbol-codex-driver/{'0.159.1' if self.part == 'old-handshake' else VERSION} (Mac OS 27.0.1; arm64) unknown (arbol-codex-driver; 1.0.0)",
                     "codexHome": str(self.home),
                     "platformFamily": "unix",
                     "platformOs": "macos",
@@ -474,6 +522,19 @@ class RunFixture:
                 await error("Invalid model list request")
             else:
                 await answer({"data": fixture_models(), "nextCursor": None})
+        elif method == "account/rateLimits/read":
+            limits = self.rate_limits(75, 100) if self.scenario == "C30" else self.rate_limits(25, 100 if self.part == "reset" else 40)
+            if self.part == "reset":
+                limits["secondary"]["resetsAt"] = int(time.time()) + 120
+            limits.update(rateLimitReachedType="rate_limit_reached", spendControlReached=False)
+            await answer({
+                "ordinaryUsageAllowed": False,
+                "rateLimits": limits,
+                "rateLimitsByLimitId": {"codex": limits},
+                "rateLimitResetCredits": {"availableCount": 0, "credits": []},
+                "accountId": "00000000-0000-0000-0000-000000000000",
+                "rateLimitUpsell": None,
+            })
         elif method == "thread/start":
             try:
                 same_directory = isinstance(params.get("cwd"), str) and Path(params["cwd"]).resolve(
@@ -740,6 +801,10 @@ class RunFixture:
                 else {}
             ),
         }
+        if self.scenario == "C28":
+            checks["retryBoundSupported"] = False
+            # The protocol has no option to bound Codex's own reconnect count.
+            # This ledger field describes that vendor limitation, not a setting.
         self.received({"stage": "input", "request": request, "checks": checks})
         turn: Record = {
             "id": self.turn_id,
@@ -751,7 +816,7 @@ class RunFixture:
             "completedAt": None,
             "durationMs": None,
         }
-        if self.part == "turn-start-race":
+        if self.part in ("turn-start-race", "auth-start-race"):
             await self.notify("turn/started", {"threadId": self.thread_id, "turn": turn})
             self.turn_active = True
             self.received(
@@ -762,14 +827,23 @@ class RunFixture:
             )
 
             async def delayed_answer() -> None:
+                if self.part == "auth-start-race":
+                    self.received({"stage": "turn-start-reply"})
                 await answer({"turn": turn})
 
+            if self.part == "auth-start-race":
+                await self.failed_turn({"responseStreamDisconnected": {"httpStatusCode": 401}}, "Reconnecting... 2/5", retry=True)
+                self.later(0.45, delayed_answer)
+                return
             self.later(0.15, delayed_answer)
         else:
             await answer({"turn": turn})
             await self.notify("turn/started", {"threadId": self.thread_id, "turn": turn})
             self.turn_active = True
         input_text = inputs[0]["text"]
+        if self.scenario in ("C4", "C26", "C27", "C28", "C29", "C30"):
+            await self.errors_fixture(turn)
+            return
         if self.scenario == "C25" and self.part not in ("no-requests", "malformed"):
             await self.unexpected_requests()
             return
@@ -905,6 +979,139 @@ class RunFixture:
             self.later(0.075, finish)
         else:
             await finish()
+
+    @staticmethod
+    def rate_limits(primary: float, secondary: float) -> Record:
+        # Shape retained in live/codex-all.json; values and two windows are
+        # synthetic. Reached-limit and overload failures were never observed.
+        return {
+            "limitId": "codex", "limitName": None, "normalModelSlug": None,
+            "primary": {"usedPercent": primary, "windowDurationMins": 300, "resetsAt": None},
+            "secondary": {"usedPercent": secondary, "windowDurationMins": 10080, "resetsAt": None},
+            "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+            "individualLimit": None, "spendControlReached": None,
+            "planType": "fixture", "rateLimitReachedType": None,
+        }
+
+    async def failed_turn(self, info: Any, message: str, *, retry: bool = False) -> None:
+        error = {"message": message, "codexErrorInfo": info, "additionalDetails": None, "misalignment": None}
+        await self.notify("error", {**self.context, "error": error, "willRetry": retry})
+        if not retry:
+            await self.notify("turn/completed", {
+                "threadId": self.thread_id,
+                "turn": {"id": self.turn_id, "items": [], "itemsView": "notLoaded", "status": "failed", "error": error},
+            })
+            self.turn_active = False
+
+    async def errors_fixture(self, turn: Record) -> None:
+        """Synthetic variants of the recorded 5/6 October vendor envelopes."""
+        part = self.part
+        if self.scenario == "C4":
+            await self.failed_turn({"httpConnectionFailed": {"httpStatusCode": 401}}, "The credential was rejected.")
+        elif self.scenario == "C26":
+            info: Any = "other"
+            message = "Synthetic vendor refusal."
+            if part in ERROR_CLASSES:
+                info = {"activeTurnNotSteerable": {"turnKind": "review"}} if part == "activeTurnNotSteerable" else part
+                # Wording conflicts deliberately exercise structured precedence.
+                message = "Rate limit mentioned in an unrelated refusal."
+            elif part.rsplit("-", 1)[0] in CONNECTION_CLASSES:
+                class_, status = part.rsplit("-", 1)
+                info = {class_: {"httpStatusCode": None if status == "none" else int(status)}}
+                message = "Rate limit mentioned in an unrelated refusal."
+            elif part in ("model", "effort"):
+                vendor_error: Object = {
+                    "type": "invalid_request_error",
+                    "message": "The 'no-such-model' model is not supported when using Codex with a ChatGPT account."
+                    if part == "model" else "Unsupported value: 'ultra' is not supported with the 'gpt-6.1-sol' model.",
+                    **({"code": "unsupported_value", "param": "reasoning.effort"} if part == "effort" else {}),
+                }
+                message = dumps({"type": "error", "status": 400, "error": vendor_error})
+            elif part == "tool-newer":
+                message = "This model requires a newer version of Codex."
+            elif part in ("wording-rate", "missing-class-rate"):
+                message = "Usage limit; retry in 5 minutes."
+            elif part in ("wording-auth", "missing-class-auth"):
+                message = "Missing credentials; please login."
+            elif part == "unknown-class":
+                info, message = "futureVendorClass", "Rate limit mentioned in an unrelated refusal."
+            elif part == "bare-fragments":
+                message = "Output quoted identifiers: 429 401 quota unauthorized."
+            elif part == "exit":
+                sys.stderr.write("x" * 2048 + " Synthetic tool failure 😀\n")
+                sys.stderr.flush()
+                self.exit_code = 1
+                self.input.close()
+                return
+            if part.startswith("missing-class") or part == "unknown":
+                info = None
+            await self.failed_turn(info, message)
+        elif self.scenario == "C27":
+            message = "Try again in 8 seconds" if part == "seconds" else "Retry in 5 minutes" if part == "minutes" else "Account limit reached"
+            await self.failed_turn("usageLimitExceeded", message)
+        elif self.scenario == "C28":
+            if part == "auth-child-replay":
+                spawn = {
+                    "type": "collabAgentToolCall", "id": "fixture-auth-spawn", "tool": "spawnAgent",
+                    "status": "inProgress", "senderThreadId": self.thread_id, "receiverThreadIds": [],
+                    "prompt": "Synthetic child job", "model": "", "reasoningEffort": "low", "agentsStates": {},
+                }
+                await self.item("item/started", spawn)
+                await self.notify("turn/started", {"threadId": self.child_context["threadId"], "turn": {**turn, "id": self.child_context["turnId"]}})
+                self.subagent_active = True
+                await self.notify("error", {
+                    **self.child_context,
+                    "willRetry": True,
+                    "error": {"message": "Reconnecting... 2/5", "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 401}}, "additionalDetails": None, "misalignment": None},
+                })
+                await self.item("item/completed", {
+                    **spawn, "status": "completed", "receiverThreadIds": [self.child_context["threadId"]],
+                    "agentsStates": {self.child_context["threadId"]: {"status": "pendingInit", "message": None}},
+                })
+                return
+            await self.failed_turn({"responseStreamDisconnected": {"httpStatusCode": 401}}, "Reconnecting... 2/5", retry=True)
+
+            async def second() -> None:
+                self.received({"stage": "second-retry"})
+                await self.failed_turn({"responseStreamDisconnected": {"httpStatusCode": 401}}, "Reconnecting... 3/5", retry=True)
+
+            self.later(0.45, second)
+        elif self.scenario == "C29":
+            if part == "blocked-output":
+                await self.item("item/started", self.command(False))
+                for number in range(32):
+                    await self.text(f"blocked-{number}", "x" * (64 * 1024))
+                return
+            async def done() -> None:
+                if part in ("call", "background", "total"):
+                    await self.item("item/completed", self.command(True, "done"))
+                if part != "background":
+                    await self.completed_turn(self.thread_id, self.turn_id, "completed")
+                    self.turn_active = False
+
+            if part in ("call", "background", "total"):
+                await self.item("item/started", self.command(False))
+                if part == "background":
+                    await self.completed_turn(self.thread_id, self.turn_id, "completed")
+                    self.turn_active = False
+                self.later(0.45, done)
+            elif part == "heartbeat":
+                async def beats() -> None:
+                    for _ in range(7):
+                        await asyncio.sleep(0.06)
+                        # This unrelated vendor notification still signals life.
+                        await self.notify("remoteControl/status/changed", {"status": "disabled", "serverName": "fixture", "installationId": "fixture", "environmentId": None})
+                    await done()
+
+                self.later(0, beats)
+            elif part == "idle-off":
+                self.later(0.45, done)
+            # idle remains silent; start expired before reaching turn/start.
+        elif self.scenario == "C30":
+            for primary, secondary in ((10, 40), (25, 100)):
+                await self.notify("account/rateLimits/updated", {"rateLimits": self.rate_limits(primary, secondary)})
+            await self.completed_turn(self.thread_id, self.turn_id, "completed")
+            self.turn_active = False
 
     def owner_checks(self, readonly: bool) -> Record:
         assert self.thread_params is not None

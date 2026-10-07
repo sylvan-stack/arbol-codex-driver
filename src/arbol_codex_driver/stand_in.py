@@ -43,6 +43,11 @@ RUN_SCENARIOS = {
     "C19",
     "C20",
     "C25",
+    "C26",
+    "C27",
+    "C28",
+    "C29",
+    "C30",
     "C33",
     "C35",
     "C37",
@@ -132,7 +137,11 @@ def operation(method: object) -> str:
 async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     words = (folder / "scenario").read_text().strip().split()
     scenario, part = words[0] if words else "", words[1] if len(words) > 1 else "supported"
-    if scenario in RUN_SCENARIOS or scenario == "C40" and part not in SUBSCRIPTION_PARTS:
+    if (
+        scenario in RUN_SCENARIOS
+        or scenario == "C40" and part not in SUBSCRIPTION_PARTS
+        or scenario == "C4" and part == "success"
+    ):
         from .run_stand_in import run_stand_in
 
         return await run_stand_in(folder, args, output)

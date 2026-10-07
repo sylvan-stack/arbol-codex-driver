@@ -4,7 +4,8 @@ Arbol Codex Driver: the Arbol 2 Driver for Codex.
 
 The base (SYL-79), Subscription operations (SYL-81), fresh inference runs
 (SYL-86), conversation continuity (SYL-88), stopping and recovery (SYL-89),
-and tools, child agents and owner setup (SYL-90)
+tools, child agents and owner setup (SYL-90), and errors, retries, clocks and
+run-derived usage (SYL-91)
 are implemented. `run` validates its request and account, starts one
 private-home app-server, streams answer and reasoning blocks with gapless
 sequence numbers, reports token totals, and ends with one final event after
@@ -36,7 +37,7 @@ PYTHONPATH=src uv run --locked python -m unittest discover -s tests -v
 
 The pinned Ruff and strict mypy versions are development dependencies only.
 The unit suite uses `unittest`; its synthetic vendor and worker processes also
-use Python. The six `.mjs` files under `test/` are minimal glue to the shared
+use Python. The seven `.mjs` files under `test/` are minimal glue to the shared
 TypeScript conformance suite in the sibling `arbol` repository. They require
 Node.js 24, retain their existing scopes and assertions, and can select a
 packaged executable through `ARBOL_DRIVER_ENTRY`.
@@ -112,8 +113,8 @@ C33's active-record and peer-stop checks. Caller questions remain excluded from
 Codex's C33 scope. Focused tests cover control and signal stops, event-pipe loss,
 ignored interrupts, active child and descendant turns, process identities,
 simultaneous recovery and conditional conversation invalidation. Full owner
-tools and sub-agent routing are checked by the tools suite below. Vendor error
-classification and inference time limits (SYL-91) remain later tasks.
+tools and sub-agent routing are checked by the tools suite below. Error
+classification and inference time limits are checked by the errors suite.
 
 `node test/conformance-tools.mjs ../arbol` runs shared C9, C25, C35 and C37.
 Commands keep their plain shell input and vendor refusal reason; patches, web
@@ -141,6 +142,25 @@ effort, and one short request for file/network access, a child agent and a
 background command. Neither command runs in the offline unit suite.
 Current evidence, including unsuccessful attempts, is in the Artifact Corpus's
 `research/tools-2026-10-07/`.
+
+`node test/conformance-errors.mjs ../arbol` runs shared C4 and C26–C30.
+Failures use Codex's structured class and status before the permitted text
+fallback. Every retry emits a notice; the first credential refusal interrupts
+the run and marks its account `needs_attention`. A rate-limited failure makes
+one quota-free limits read and reports a wait only when the vendor states one.
+Runs apply the sixty-second startup budget, a fifteen-minute default idle
+budget (zero disables it), and caller-specified total limits. Every notification
+is a heartbeat; tool calls and background work suspend idle. Reached limits
+use normal cleanup and finish `failed` with `limit_reached`.
+
+The latest sparse account-limit notification is stored on completion, preserving
+fields from fuller reports and protecting newer account changes and usage
+reads. `scripts/check_errors.py probe --output <file>` checks unreachable-vendor
+retries followed by caller cancellation with a loopback proxy. Its `live` mode
+uses only `test-chatgpt`, `gpt-5.6-luna`, low effort and one tiny no-tools prompt
+to check the saved report. Both require explicit invocation and use a clean
+environment. Evidence is in `research/errors-2026-10-07/`; synthetic reached-limit
+and overload fixtures remain distinct from live observations.
 
 `dev stand-in <folder> -- <arguments>` plays C31's supported, old and missing
 variants, C32's `info` variant, and the account scenarios selected by
