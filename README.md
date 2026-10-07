@@ -37,10 +37,11 @@ PYTHONPATH=src uv run --locked python -m unittest discover -s tests -v
 
 The pinned Ruff and strict mypy versions are development dependencies only.
 The unit suite uses `unittest`; its synthetic vendor and worker processes also
-use Python. The seven `.mjs` files under `test/` are minimal glue to the shared
-TypeScript conformance suite in the sibling `arbol` repository. They require
-Node.js 24, retain their existing scopes and assertions, and can select a
-packaged executable through `ARBOL_DRIVER_ENTRY`.
+use Python. The `.mjs` files under `test/` are minimal glue to the shared TypeScript
+conformance suite in the sibling `arbol` repository. They require Node.js 24.
+`node test/conformance-full.mjs ../arbol` runs the complete registry without
+filters; the older focused wrappers retain their scopes for debugging.
+`ARBOL_DRIVER_ENTRY` selects a packaged executable.
 
 Settings are read from `~/.arbol/arbol-codex-driver.json` on every invocation.
 `toolPath` names a Codex executable, otherwise it is found on `PATH`. The oldest
@@ -50,8 +51,9 @@ and a clean environment; it sends no prompt.
 With the sibling `arbol` repository compiled,
 `node test/conformance-base.mjs ../arbol` runs shared C31 and C32's `info` check.
 `node test/conformance-subscriptions.mjs ../arbol` runs ten account scenarios,
-with explicit subscription scopes for C4, C5, C7, C8 and C40. Full inference
-scenarios belong to later tasks. Synthetic active-run tests verify account
+with explicit subscription scopes for C4, C5, C7, C8 and C40. The full wrapper
+includes inference and every applicable shared scenario. Synthetic active-run
+tests verify account
 refusal and forced removal; real fresh-run checks are separate.
 
 `node test/conformance-runs.mjs ../arbol` runs eleven fresh-run scenarios, with
@@ -128,8 +130,11 @@ A tools-enabled run reads only the MCP tables from the owner's
 `~/.codex/config.toml` and forwards them in memory with `thread/start` or
 `thread/resume`. It neither imports the owner's login and other settings nor
 writes the tables to private state. Missing setup is empty; invalid setup gives
-a fixed error without file contents. Owner table strings are scrubbed from
-vendor diagnostics. Codex discovers the owner's `~/.agents/skills` using the
+a fixed error without file contents. Known owner table strings are scrubbed from
+every event and plain text output,
+including values split across streamed chunks. Assistant fingerprints use the
+redacted answer the caller receives. Codex discovers the owner's
+`~/.agents/skills` using the
 real HOME; no skill links or copies are written. An MCP server needing its own
 sign-in can report that; its sign-in workflow remains unspecified.
 
@@ -205,8 +210,34 @@ uv run --locked python scripts/package_build.py --candidate /absolute/empty/fold
 The candidate contains its interpreter, runtime, tests, and contract wrappers.
 Metadata checks validate the distribution and packaged file digests. The
 registry rehearsal validates relocation to a path with spaces, direct entry,
-selection, and failed-check refusal. `live` and production Build delivery stay
-pending SYL-92 and SYL-94; SYL-95 adds no new inference features.
+selection, and failed-check refusal. The package gate runs the full shared suite,
+and its `live` gate invokes only
+`dev build-check`. The first numbered production Build remains SYL-94.
+
+The packaged development commands are part of the public executable:
+
+```sh
+bin/arbol-codex-driver dev probe
+bin/arbol-codex-driver dev build-check
+bin/arbol-codex-driver dev live-check
+```
+
+`dev probe` sends no inference request. It checks stable generated schemas,
+private configuration, account/model response shapes, device-login cancellation,
+skill/MCP discovery, history injection, saved-thread resume and stop refusal.
+It uses disposable homes and optionally reads account/usage shapes from the
+existing signed-in `test-chatgpt` home. Local browser-login parameters are checked
+by schema, since starting its shared callback listener could replace another
+pending login.
+
+Both live commands use only `test-chatgpt`, refuse missing, unsigned or exhausted
+accounts before inference, and refresh usage before every attempt. The build
+check sends exactly one no-tools ready message. The extended live check includes
+tools, a child and background work, continuity and stopping; run it only when
+requested. Reports include attempted turns, observed starts, token usage and
+usage changes, plus source/runtime/tool provenance, and are written under the
+selected state directory's `research/`. Historical task scripts and evidence
+remain dated; they do not run in the offline suite.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the

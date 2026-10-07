@@ -86,6 +86,17 @@ async def main(args: list[str]) -> int:
         if command.name == "runs stop":
             await Runs(state).stop(command.positionals[0])
             return 0
+        if command.name in ("dev probe", "dev live-check", "dev build-check"):
+            from .dev import live_check, probe
+
+            subscriptions = Subscriptions(state, settings, notices, file, env, cancellation)
+            status, report = (
+                await probe(subscriptions, env, cancellation)
+                if command.name == "dev probe"
+                else await live_check(command.name == "dev build-check", subscriptions, env, cancellation)
+            )
+            await write_json(output, report)
+            return status
         if command.name == "info":
             tool = await inspect_tool(state, string(settings.get("toolPath")), env, cancellation)
             cancellation.check()
