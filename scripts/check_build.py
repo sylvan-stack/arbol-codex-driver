@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -84,16 +86,18 @@ def contract(folder: Path) -> int:
         code = run(arguments, cwd=repo, env=env)
         if code:
             return code
-    env["ARBOL_DRIVER_ENTRY"] = str(folder / ENTRY)
-    for scope in ("base", "subscriptions", "runs", "continuity", "stops", "tools", "errors"):
-        code = run([node, str(folder / f"test/conformance-{scope}.mjs"), str(repo)], cwd=folder, env=env)
-        if code:
-            return code
-    return 0
+    return run([node, str(repo / "conformance/bin/arbol-conformance.mjs"), "--driver", shlex.quote(str(folder / ENTRY))],
+               cwd=folder, env=env)
 
 
 def live(folder: Path) -> int:
-    raise ValueError("Codex remains a development candidate: SYL-92 and SYL-94 must supply its complete checks and first working Build.")
+    state = os.environ.get("ARBOL_BUILD_TEST_STATE_DIR")
+    if state is not None and (not state or not Path(state).is_absolute()):
+        raise ValueError("ARBOL_BUILD_TEST_STATE_DIR must be an absolute test state directory.")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    env = {"HOME": str(home), "PATH": f"{home / '.local/bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+           "LANG": os.environ.get("LANG", "C")}
+    return run([str(folder / ENTRY), "dev", "build-check", *(["--state-dir", state] if state else [])], cwd=folder, env=env)
 
 
 def main() -> int:

@@ -102,6 +102,34 @@ class PackagingTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_live_gate_uses_direct_packaged_entry_and_clean_environment(self) -> None:
+        with (
+            patch.dict(os.environ, {"ARBOL_BUILD_TEST_STATE_DIR": "/tmp/test state", "HOME": "/tmp/caller-home",
+                                    "OPENAI_API_KEY": "fictional-secret", "CODEX_HOME": "/tmp/caller-codex"}),
+            patch.object(check_build, "run", return_value=0) as execute,
+        ):
+            folder = Path("/tmp/packaged candidate")
+            self.assertEqual(check_build.live(folder), 0)
+            execute.assert_called_once()
+            arguments = execute.call_args.args[0]
+            self.assertEqual(arguments, [str(folder / build_support.ENTRY), "dev", "build-check",
+                                         "--state-dir", "/tmp/test state"])
+            environment = execute.call_args.kwargs["env"]
+            self.assertEqual(set(environment), {"HOME", "PATH", "LANG"})
+            self.assertNotEqual(environment["HOME"], "/tmp/caller-home")
+            self.assertEqual(execute.call_args.kwargs["cwd"], folder)
+
+    def test_live_gate_refuses_relative_or_empty_test_state_before_start(self) -> None:
+        for directory in ("", "relative/state"):
+            with (
+                self.subTest(directory=directory),
+                patch.dict(os.environ, {"ARBOL_BUILD_TEST_STATE_DIR": directory}),
+                patch.object(check_build, "run") as execute,
+            ):
+                with self.assertRaisesRegex(ValueError, "absolute test state"):
+                    check_build.live(Path("/tmp/candidate"))
+                execute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
