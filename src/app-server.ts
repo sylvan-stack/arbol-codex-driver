@@ -167,6 +167,8 @@ export class AppServer {
   }
 
   /** Lossless ordered inference notifications, including those before turn/start answers. */
+  takeNotifications(): Notification[] { return this.notifications.splice(0); }
+
   nextNotification(options: WaitOptions = {}): Promise<Notification> {
     if (options.signal?.aborted) return Promise.reject(aborted());
     const early = this.notifications.shift();

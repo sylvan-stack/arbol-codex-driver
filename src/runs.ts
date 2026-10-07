@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto';
 import { link, readdir, rm, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Chats } from './continuity.js';
 import { Failure, errno } from './errors.js';
 import { isObject } from './settings.js';
 import { fixedWait, ownerAlive, parseOwner, prepareFile, processOwner, readJson, writeJson } from './state.js';
 import type { Owner, State } from './state.js';
 export interface RunRecord {
   runId: string; subscriptionId: string; owner: Owner; startedAt: string;
-  labels?: Record<string, string>; chatKey?: string; conversation?: string; tool?: Owner;
+  labels?: Record<string, string>; chatKey?: string; conversation?: string; continuedConversation?: string; tool?: Owner;
 }
 export class Runs {
   constructor(readonly state: State) {}
@@ -34,6 +35,12 @@ export class Runs {
           catch (error) { if (!errno(error, 'ESRCH')) throw error; }
         }
         await rm(join(this.state.directory, 'tmp', record.runId), { recursive: true, force: true });
+        if (record.chatKey !== undefined && record.continuedConversation !== undefined) {
+          const chats = new Chats(this.state);
+          if ((await chats.entry(record.subscriptionId, record.chatKey))?.conversation === record.continuedConversation) {
+            await rm(chats.path(record.subscriptionId, record.chatKey), { force: true });
+          }
+        }
         await this.remove(record.runId);
       });
     }

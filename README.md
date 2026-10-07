@@ -2,8 +2,8 @@
 
 Arbol Codex Driver: the Arbol 2 Driver for Codex.
 
-The base (SYL-79), Subscription operations (SYL-81), and fresh inference runs
-(SYL-86) are implemented. `run` validates its request and account, starts one
+The base (SYL-79), Subscription operations (SYL-81), fresh inference runs
+(SYL-86), and conversation continuity (SYL-88) are implemented. `run` validates its request and account, starts one
 private-home app-server, streams answer and reasoning blocks with gapless
 sequence numbers, reports token totals, and ends with one final event after
 cleanup. Runs in progress are visible through `runs list`.
@@ -50,10 +50,24 @@ unrestricted tools. A run whose tools are `none` uses Codex's read-only sandbox
 with network access off; Codex may still use a tool, whose calls are reported
 normally. Only Codex memories are switched off in its feature configuration.
 
-Conversation continuity (SYL-88), full cancellation and recovery (SYL-89), owner
+With a chat identifier and working folder, a completed run maps the caller's
+conversation to Codex's saved thread. The map stores identifiers, message counts
+and SHA-256 digests. Matching history resumes that thread in the new app-server;
+changed history, folder or system prompt rebuilds it with one native
+`thread/inject_items` request, including tool results and pictures. `started`
+reports the continuity and rebuild reason. If Codex refuses native history, a
+notice reports the labelled text fallback. Failed and cancelled resumed runs
+invalidate their map entry while preserving a newer concurrent completion.
+Runs without a working folder use ephemeral threads and leave no map entry.
+
+`node test/conformance-continuity.mjs ../arbol` runs shared C14 against the Codex
+stand-in. Focused unit and integration checks cover digests, all rebuild reasons,
+native and text histories, private image files, model overrides, concurrent
+resumes and map invalidation.
+
+Full cancellation and recovery (SYL-89), owner
 tools/sub-agent routing (SYL-90), and vendor error classification and inference
-time limits (SYL-91) remain later tasks. Nonempty history is refused until
-continuity is implemented. Current signal/control cancellation closes the
+time limits (SYL-91) remain later tasks. Current signal/control cancellation closes the
 app-server and cleans its process group; the full interrupt/sub-agent protocol
 belongs to SYL-89.
 
@@ -90,6 +104,15 @@ handshake and cleanup. `test/probe-run.mjs <codex-path> <state-dir> <record-path
 sends two short low-effort Luna messages on `test-chatgpt`, checks events and
 usage, and verifies temporary-folder and record cleanup. Their evidence is in
 `research/run-protocol-2026-10-07.json` and `research/run-2026-10-07.json`.
+
+`test/probe-continuity.mjs <codex-path> <record-path>` sends no prompt and checks
+the stable resume/injection schema, tool-created history, pictures, tool names
+and resume notifications in a fresh private home. The opt-in
+`test/probe-continuity-live.mjs <codex-path> <state-dir> <record-path>` sends four
+short Luna turns at the lowest offered effort on `test-chatgpt`: a tool turn,
+a resumed follow-up, an edited-history rebuild and a changed-system-prompt
+rebuild. Records are `research/continuity-protocol-2026-10-07.json` and
+`research/continuity-2026-10-07.json`.
 
 Package version and build number are separate. A source checkout reports build
 `0`; a copied Build reads `build.json` beside its package. Build selection is the

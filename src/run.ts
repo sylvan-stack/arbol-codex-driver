@@ -1,12 +1,16 @@
 import { createInterface } from 'node:readline';
-import { realpath, rm, writeFile } from 'node:fs/promises';
+import { realpath, rm } from 'node:fs/promises';
 import { delimiter, join } from 'node:path';
 import { AppServer } from './app-server.js';
 import { normalizeAccount, readModelCatalog } from './catalog.js';
+import { Chats, MessageDigest } from './continuity.js';
+import type { ContinuityPlan } from './continuity.js';
 import { Failure } from './errors.js';
 import { EventStream } from './event-stream.js';
+import { historyItems, labelledHistoryInput, prepareTurnInput } from './history.js';
 import { RunEvents } from './run-events.js';
 import { readRunRequest } from './run-request.js';
+import type { RunRequest } from './run-request.js';
 import { Runs } from './runs.js';
 import { isObject } from './settings.js';
 import { fixedWait, privateDirectory, readJson } from './state.js';
@@ -27,6 +31,11 @@ export async function run(command: Command, subscriptions: Subscriptions, events
   let controlTask: Promise<void> | undefined;
   let settled = false;
   let started = false;
+  let request: RunRequest | undefined;
+  let plan: ContinuityPlan | undefined;
+  let conversation: string | undefined;
+  const fingerprint = new MessageDigest();
+  const chats = new Chats(subscriptions.state);
   const pendingNotices: Array<Record<string, unknown>> = [];
   const localStop = new AbortController();
   const activeSignal = AbortSignal.any([signal, localStop.signal]);
@@ -34,24 +43,32 @@ export async function run(command: Command, subscriptions: Subscriptions, events
   events.output.on('error', outputClosed);
   const runs = new Runs(subscriptions.state);
   try {
-    const request = await readRunRequest(command.options, { settings: subscriptions.settings,
+    const parsed = await readRunRequest(command.options, { settings: subscriptions.settings,
       ...(command.positionals[0] === undefined ? {} : { message: command.positionals[0] }),
       firstLine: async () => {
         const line = await lines!.next();
         if (line.done) throw new Failure('invalid_input', 'The request line is missing.'); return line.value;
       }, identity: (runId, labels) => { events.runId = runId; events.labels = labels; } });
+    request = parsed;
+    for (const item of request.history) fingerprint.add(item);
+    fingerprint.add({ ...request.input, type: 'message' });
     events.textOnly = request.output === 'text';
     if (!request.control) input?.close();
-    if (request.history.length) throw new Failure('unsupported', 'Continuing a conversation is not implemented yet (SYL-88).');
     const subscription = await subscriptions.requireSignedIn(request.subscriptionId);
     await runs.list(); await subscriptions.state.clearUnfinishedWrites();
     const record = await subscriptions.state.withSubscriptionLock(subscription.id, async () => {
       const current = await subscriptions.record(subscription.id);
       if (current.state !== 'signed_in') throw new Failure('not_signed_in', 'Sign in to this Subscription first.');
       if (await readJson(join(subscriptions.state.subscription(subscription.id), 'sign-in.json')) !== undefined) throw new Failure('in_use', 'An account operation is still in progress.');
-      return runs.reserve({ runId: request.runId, subscriptionId: request.subscriptionId,
-        ...(request.labels === undefined ? {} : { labels: request.labels }),
-        ...(request.chatSessionId === undefined ? {} : { chatSessionId: request.chatSessionId }) });
+      const record = await runs.reserve({ runId: parsed.runId, subscriptionId: parsed.subscriptionId,
+        ...(parsed.labels === undefined ? {} : { labels: parsed.labels }),
+        ...(parsed.chatSessionId === undefined ? {} : { chatSessionId: parsed.chatSessionId }) });
+      reservedId = parsed.runId;
+      plan = await chats.select(parsed, join(subscriptions.state.subscription(subscription.id), 'home'));
+      if (plan.conversation !== undefined) record.conversation = plan.conversation;
+      if (plan.continuedConversation !== undefined) record.continuedConversation = plan.continuedConversation;
+      await runs.save(record);
+      return record;
     }, env);
     reservedId = request.runId;
     temporary = join(subscriptions.state.directory, 'tmp', request.runId);
@@ -90,7 +107,7 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     }
     const catalog = await readModelCatalog({ request: (method, params) => server!.request(method, params, { signal: activeSignal }) }, undefined, false);
     const configuredModel = typeof server.effectiveConfig.model === 'string' ? server.effectiveConfig.model : undefined;
-    const model = catalog.models.find(item => item.id === (request.model ?? configuredModel)) ??
+    const model = catalog.models.find(item => item.id === (parsed.model ?? configuredModel)) ??
       (request.model || configuredModel ? undefined : catalog.models.find(item => item.isDefault));
     if (!model) throw new Failure(request.model ? 'invalid_input' : 'tool_failed', request.model ? 'The requested model is not in the tool catalog.' : 'Codex did not identify its default model in the catalog.');
     const configuredEffort = typeof server.effectiveConfig.model_reasoning_effort === 'string' ? server.effectiveConfig.model_reasoning_effort : undefined;
@@ -101,27 +118,49 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     }
     if (effort && !model.efforts?.includes(effort)) throw new Failure('invalid_input', 'The requested effort is not supported by the model.');
     if (request.serviceTier && !model.serviceTiers?.includes(request.serviceTier)) throw new Failure('invalid_input', 'The requested service tier is not supported by the model.');
-    const thread = await server.request('thread/start', { cwd, model: model.id, approvalPolicy: 'never',
+    let thread: unknown;
+    if (plan!.continuity === 'resumed') {
+      try { thread = await server.request('thread/resume', { threadId: plan!.conversation, model: model.id }, { signal: activeSignal }); }
+      catch (failure) {
+        if (!(failure instanceof Failure) || failure.result.detail?.vendorCode === undefined || activeSignal.aborted) throw failure;
+        plan = { ...plan!, continuity: 'rebuilt', rebuildReason: /no rollout found|thread not found|unknown thread|does not exist/i.test(failure.message) ? 'conversation_gone' : 'resume_refused' };
+      }
+    }
+    if (plan!.continuity !== 'resumed') thread = await server.request('thread/start', { cwd, model: model.id, approvalPolicy: 'never',
       sandbox: request.tools === 'none' ? 'read-only' : 'danger-full-access',
       ...(request.serviceTier === undefined ? {} : { serviceTier: request.serviceTier }),
       ...(request.systemPrompt === undefined ? {} : { developerInstructions: request.systemPrompt }),
       ...(request.tools === 'none' && request.workingDirectory === undefined ? { ephemeral: true } : {}) }, { signal: activeSignal });
     if (!isObject(thread) || !isObject(thread.thread) || typeof thread.thread.id !== 'string' || typeof thread.model !== 'string') throw new Failure('tool_failed', 'Codex returned a malformed thread.');
-    record.conversation = thread.thread.id; await runs.save(record);
-    const message: Record<string, unknown>[] = [{ type: 'text', text: request.input.text }];
-    const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
-    for (const [index, picture] of (request.input.images ?? []).entries()) {
-      const path = join(temporary, `image-${index}.${extension[picture.mediaType]}`);
-      await writeFile(path, Buffer.from(picture.data, 'base64'), { mode: 0o600 }); message.push({ type: 'localImage', path });
+    const restoredTurns = new Set(Array.isArray(thread.thread.turns) ? thread.thread.turns.flatMap(turn =>
+      isObject(turn) && typeof turn.id === 'string' ? [turn.id] : []) : []);
+    conversation = thread.thread.id;
+    record.conversation = conversation; await runs.save(record);
+    let turnInput: Pick<RunRequest['input'], 'text' | 'images'> = request.input;
+    if (plan!.continuity === 'rebuilt' && request.history.length) {
+      try { await server.request('thread/inject_items', { threadId: conversation, items: historyItems(request.history) }, { signal: activeSignal }); }
+      catch (failure) {
+        if (!(failure instanceof Failure) || failure.result.detail?.vendorCode === undefined || activeSignal.aborted) throw failure;
+        turnInput = labelledHistoryInput(request.history, request.input);
+        pendingNotices.push({ code: 'history_as_text', message: 'Codex refused the native history; the earlier conversation was sent as labelled text.' });
+      }
     }
+    const message = await prepareTurnInput(turnInput, temporary);
+    // A resume restores the previous turn's usage and status. Only the new
+    // turn's notifications count as events or token expenditure for this run.
+    const startup = server.takeNotifications().filter(notification => ['warning', 'deprecationNotice'].includes(notification.method));
     const turn = await server.request('turn/start', { threadId: thread.thread.id, input: message, model: model.id, effort: effort ?? null,
       summary: 'detailed', approvalPolicy: 'never', sandboxPolicy: request.tools === 'none' ? { type: 'readOnly', networkAccess: false } : { type: 'dangerFullAccess' },
       ...(request.serviceTier === undefined ? {} : { serviceTier: request.serviceTier }) }, { signal: activeSignal });
     if (!isObject(turn) || !isObject(turn.turn) || typeof turn.turn.id !== 'string') throw new Failure('tool_failed', 'Codex returned a malformed turn.');
-    mapper = new RunEvents(thread.thread.id, turn.turn.id, thread.model, (type, data) => events.emit(type, data));
-    events.emit('started', { continuity: 'fresh', subscriptionId: request.subscriptionId, model: thread.model,
+    mapper = new RunEvents(thread.thread.id, turn.turn.id, thread.model, (type, data) => {
+      if (type === 'text') fingerprint.add({ type: 'message', role: 'assistant', text: data.text as string });
+      events.emit(type, data);
+    });
+    events.emit('started', { continuity: plan!.continuity, ...(plan!.rebuildReason === undefined ? {} : { rebuildReason: plan!.rebuildReason }), subscriptionId: request.subscriptionId, model: thread.model,
       ...(effort === undefined ? {} : { effort }), toolVersion: server.toolVersion ?? tool.version!, driverBuild: build });
     started = true;
+    for (const notification of startup) mapper.consume(notification.method, notification.params);
     for (const notice of pendingNotices) events.emit('notice', notice);
     for (const notice of subscriptions.notices) events.emit('notice', { ...notice });
     await events.flush();
@@ -134,6 +173,9 @@ export async function run(command: Command, subscriptions: Subscriptions, events
       let notification;
       try { notification = await server.nextNotification({ signal: activeSignal, ...(waitingForOtherCalls ? { timeoutMs: remaining! } : {}) }); }
       catch (failure) { if (waitingForOtherCalls && failure instanceof Failure && /Timed out/.test(failure.message)) break; throw failure; }
+      if (plan!.continuity === 'resumed' && notification.method === 'thread/tokenUsage/updated' &&
+        isObject(notification.params) && notification.params.threadId === conversation &&
+        (notification.params.turnId === undefined || typeof notification.params.turnId === 'string' && restoredTurns.has(notification.params.turnId))) continue;
       mapper.consume(notification.method, notification.params); await events.flush();
     }
     if (mapper.outcome === 'failed') error = new Failure(mapper.error?.code ?? 'vendor_error', mapper.error?.message ?? 'Codex failed the turn.', mapper.error ?? {});
@@ -148,8 +190,19 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     if (temporary) await rm(temporary, { recursive: true, force: true }).catch(failure => { error ??= failure; });
     events.output.off('error', outputClosed);
   }
+  if (request && plan && reservedId) {
+    try { await events.flush(); } catch (failure) { error ??= failure; }
+    try {
+      await chats.settle(request, plan, conversation, fingerprint.snapshot(), error === undefined && !activeSignal.aborted && mapper?.outcome === 'completed');
+    } catch (failure) { error ??= failure; }
+  }
   try {
-    return await events.finish(error, activeSignal.aborted, { producedOutput: mapper?.outputProduced ?? false,
+    const code = await events.finish(error, activeSignal.aborted, { producedOutput: mapper?.outputProduced ?? false,
       unfinishedCalls: mapper?.unfinishedCalls ?? [], ...(mapper?.usage === undefined ? {} : { usage: mapper.usage }) });
+    if (code !== 0 && request && plan && reservedId && conversation) await chats.settle(request, { ...plan, continuedConversation: conversation }, conversation, fingerprint.snapshot(), false);
+    return code;
+  } catch (failure) {
+    if (request && plan && reservedId && conversation) await chats.settle(request, { ...plan, continuedConversation: conversation }, conversation, fingerprint.snapshot(), false).catch(() => {});
+    throw failure;
   } finally { if (reservedId) await runs.remove(reservedId); }
 }
