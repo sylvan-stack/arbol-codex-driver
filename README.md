@@ -3,7 +3,8 @@
 Arbol Codex Driver: the Arbol 2 Driver for Codex.
 
 The base (SYL-79), Subscription operations (SYL-81), fresh inference runs
-(SYL-86), conversation continuity (SYL-88), and stopping and recovery (SYL-89)
+(SYL-86), conversation continuity (SYL-88), stopping and recovery (SYL-89),
+and tools, child agents and owner setup (SYL-90)
 are implemented. `run` validates its request and account, starts one
 private-home app-server, streams answer and reasoning blocks with gapless
 sequence numbers, reports token totals, and ends with one final event after
@@ -35,7 +36,7 @@ PYTHONPATH=src uv run --locked python -m unittest discover -s tests -v
 
 The pinned Ruff and strict mypy versions are development dependencies only.
 The unit suite uses `unittest`; its synthetic vendor and worker processes also
-use Python. The five `.mjs` files under `test/` are minimal glue to the shared
+use Python. The six `.mjs` files under `test/` are minimal glue to the shared
 TypeScript conformance suite in the sibling `arbol` repository. They require
 Node.js 24, retain their existing scopes and assertions, and can select a
 packaged executable through `ARBOL_DRIVER_ENTRY`.
@@ -111,8 +112,35 @@ C33's active-record and peer-stop checks. Caller questions remain excluded from
 Codex's C33 scope. Focused tests cover control and signal stops, event-pipe loss,
 ignored interrupts, active child and descendant turns, process identities,
 simultaneous recovery and conditional conversation invalidation. Full owner
-tools and sub-agent routing (SYL-90), and vendor error classification and
-inference time limits (SYL-91), remain later tasks.
+tools and sub-agent routing are checked by the tools suite below. Vendor error
+classification and inference time limits (SYL-91) remain later tasks.
+
+`node test/conformance-tools.mjs ../arbol` runs shared C9, C25, C35 and C37.
+Commands keep their plain shell input and vendor refusal reason; patches, web
+search and MCP results retain their specified shapes. Child text, tool output,
+usage and notices carry the call that started the child, including notifications
+that arrive before its receiver thread is announced. The run waits for child
+turns and background commands, and gives other open calls, including child
+calls, their two-second completion grace.
+
+A tools-enabled run reads only the MCP tables from the owner's
+`~/.codex/config.toml` and forwards them in memory with `thread/start` or
+`thread/resume`. It neither imports the owner's login and other settings nor
+writes the tables to private state. Missing setup is empty; invalid setup gives
+a fixed error without file contents. Owner table strings are scrubbed from
+vendor diagnostics. Codex discovers the owner's `~/.agents/skills` using the
+real HOME; no skill links or copies are written. An MCP server needing its own
+sign-in can report that; its sign-in workflow remains unspecified.
+
+The explicit checks `scripts/check_tools.py probe --output <file>` and
+`scripts/check_tools.py live --output <file>` use the checkout's Python.
+The probe sends no inference request and verifies skills, thread-local MCP
+startup, private configuration and owner-tree metadata. The live check uses
+only `test-chatgpt` in the existing test state folder, `gpt-5.6-luna` at low
+effort, and one short request for file/network access, a child agent and a
+background command. Neither command runs in the offline unit suite.
+Current evidence, including unsuccessful attempts, is in the Artifact Corpus's
+`research/tools-2026-10-07/`.
 
 `dev stand-in <folder> -- <arguments>` plays C31's supported, old and missing
 variants, C32's `info` variant, and the account scenarios selected by
