@@ -7,6 +7,7 @@ import { buildIdentity } from './build.js';
 import { State, defaultStateDirectory, fixedWait } from './state.js';
 import { inspectTool, requireTool } from './tool.js';
 import { standIn } from './stand-in.js';
+import { Subscriptions, families } from './subscriptions.js';
 
 export async function main(args: string[]): Promise<number> {
   const cancellation = new AbortController();
@@ -32,6 +33,27 @@ export async function main(args: string[]): Promise<number> {
       process.stdout.write(JSON.stringify({ driver: 'codex', ...identity, contract: 1, stateDirectory: state.directory, settingsFile: file, tool,
         ...(notices.length ? { notices } : {}) }) + '\n');
       return 0;
+    }
+    if (command.name.startsWith('subscriptions ')) {
+      const subscriptions = new Subscriptions(state, settings, notices, file, process.env, cancellation.signal);
+      const id = command.positionals[0]!;
+      let result: unknown;
+      switch (command.name) {
+        case 'subscriptions families': result = families; break;
+        case 'subscriptions list': result = await subscriptions.list(); break;
+        case 'subscriptions create': result = await subscriptions.create(command.options.family, command.options.label, command.options.id as string | undefined); break;
+        case 'subscriptions update': result = await subscriptions.update(id, command.options.label as string | undefined); break;
+        case 'subscriptions remove': await subscriptions.remove(id, command.options.force === true); return 0;
+        case 'subscriptions sign-in': return await subscriptions.signIn(id, command.options['by-code'] === true, step => process.stdout.write(JSON.stringify(step) + '\n'));
+        case 'subscriptions sign-out': result = await subscriptions.signOut(id, command.options.force === true); break;
+        case 'subscriptions check': result = await subscriptions.check(id); break;
+        case 'subscriptions usage': result = await subscriptions.usage(id); break;
+        case 'subscriptions models': result = await subscriptions.models(id); break;
+        default: throw new Failure('unsupported', 'This Subscription command is not supported by the Codex Driver.');
+      }
+      cancellation.signal.throwIfAborted();
+      if (notices.length && result !== null && typeof result === 'object' && !Array.isArray(result)) result = { ...result, notices };
+      process.stdout.write(JSON.stringify(result) + '\n'); return 0;
     }
     if (command.toolRequired) requireTool(await inspectTool(state, settings.toolPath, process.env, cancellation.signal));
     throw new Failure('unsupported', `Command ${command.name} is not implemented in this Driver yet.`);

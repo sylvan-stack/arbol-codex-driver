@@ -218,7 +218,7 @@ test('base.cli returns one typed refusal without echoing caller secrets', async 
     assert.equal(result.stdout.includes('secret-sentinel'), false);
     assert.equal(result.stderr, '');
   }
-  const later = await invoke(['subscriptions', 'list'], f.env);
+  const later = await invoke(['subscriptions', 'import', 'chatgpt', '--from', 'vendor'], f.env);
   assert.equal(later.code, 1);
   assert.equal(later.result.error.code, 'unsupported');
 });
