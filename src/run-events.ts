@@ -76,7 +76,8 @@ export class RunEvents {
   private readonly closed = new Set<string>();
   private readonly interrupted = new Set<string>();
   private readonly completedItems = new Set<string>();
-  private readonly agents = new Map<string, { path?: string; active: boolean; mapper?: RunEvents }>();
+  private readonly agents = new Map<string, { parentCallId: string; path?: string; active: boolean; mapper?: RunEvents }>();
+  private foreignPending: Array<{ method: string; params: Record<string, unknown> }> = [];
   outputProduced = false;
   outcome: 'completed' | 'failed' | 'interrupted' | undefined;
   error: DriverError | undefined;
@@ -102,7 +103,11 @@ export class RunEvents {
       [...this.agents.values()].some(agent => agent.active || agent.mapper?.waitingForWork);
   }
   get hasActiveAgents(): boolean {
-    return [...this.agents.values()].some(agent => agent.active || agent.mapper?.hasActiveAgents);
+    return this.hasPendingSpawns || [...this.agents.values()].some(agent => agent.active || agent.mapper?.hasActiveAgents);
+  }
+  private get hasPendingSpawns(): boolean {
+    return [...this.calls.values()].some(call => call.type === 'collabAgentToolCall' && call.name === 'spawnAgent') ||
+      [...this.agents.values()].some(agent => agent.mapper?.hasPendingSpawns);
   }
 
   closeOpenCalls(message = 'The run ended before the tool call finished.'): void {
@@ -123,25 +128,26 @@ export class RunEvents {
     // Check identity even for notifications whose content otherwise needs no event.
     if (typeof params.threadId === 'string' && params.threadId !== this.threadId) {
       const ancestor = [...this.agents.values()].find(agent => agent.mapper?.knowsThread(params.threadId as string));
-      if (ancestor?.mapper && !this.agents.has(params.threadId)) { ancestor.mapper.consume(method, params); return; }
+      if (ancestor?.mapper && !this.agents.has(params.threadId)) {
+        ancestor.mapper.consume(method, params); this.replayForeign(); return;
+      }
       const agent = this.agents.get(params.threadId);
       if (agent) {
         const turnId = params.turnId ?? (isObject(params.turn) ? params.turn.id : undefined);
         if (typeof turnId === 'string') {
           if (!agent.mapper || method === 'turn/started' && agent.mapper.outcome !== undefined) {
             agent.mapper = new RunEvents(params.threadId, turnId, this.totals.model ?? '',
-              (type, data) => this.emit(type, { parentCallId: params.threadId, ...data }));
+              (type, data) => this.emit(type, { parentCallId: agent.parentCallId, ...data }));
             agent.active = true;
           }
           agent.mapper.consume(method, params);
           if (method === 'turn/completed') agent.active = false;
         }
+        this.replayForeign();
         return;
       }
-      if (!this.foreignNotice) {
-        this.foreignNotice = true;
-        this.emit('notice', { code: 'foreign_thread', message: 'A notification for another codex thread was ignored.' });
-      }
+      if (this.hasPendingSpawns) this.foreignPending.push({ method, params });
+      else this.ignoreForeign();
       return;
     }
     const turn = isObject(params.turn) ? params.turn : undefined;
@@ -241,6 +247,21 @@ export class RunEvents {
   private identity(params: Record<string, unknown>, turnId: unknown = params.turnId): void {
     if (params.threadId !== this.threadId || turnId !== this.turnId) throw protocolFailure();
   }
+  private ignoreForeign(): void {
+    if (this.foreignNotice) return;
+    this.foreignNotice = true;
+    this.emit('notice', { code: 'foreign_thread', message: 'A notification for another codex thread was ignored.' });
+  }
+  private replayForeign(): void {
+    const pending = this.foreignPending;
+    this.foreignPending = [];
+    for (const notification of pending) {
+      if (typeof notification.params.threadId === 'string' && this.knowsThread(notification.params.threadId)) {
+        this.consume(notification.method, notification.params);
+      } else if (this.hasPendingSpawns) this.foreignPending.push(notification);
+      else this.ignoreForeign();
+    }
+  }
   private text(type: string, text: string): void {
     if (!text) return;
     this.outputProduced = true; this.emit(type, { text });
@@ -274,7 +295,7 @@ export class RunEvents {
     if (item.kind === 'started') {
       if (this.agents.has(callId) && this.calls.has(callId)) return;
       this.closed.delete(callId);
-      this.agents.set(callId, { active: true, ...(typeof item.agentPath === 'string' ? { path: item.agentPath } : {}) });
+      this.agents.set(callId, { parentCallId: callId, active: true, ...(typeof item.agentPath === 'string' ? { path: item.agentPath } : {}) });
       this.calls.set(callId, { name: 'spawn_agent', type: 'subAgentActivity', output: '', outputCut: false });
       this.outputProduced = true;
       this.emit('tool_started', { callId, name: 'spawn_agent', input: { ...(typeof item.agentPath === 'string' ? { path: item.agentPath } : {}) } });
@@ -309,5 +330,15 @@ export class RunEvents {
     const bounded = truncateResult(result);
     this.calls.delete(callId); this.closed.add(callId);
     this.emit('tool_finished', { callId, ok, ...bounded, ...(outputCut ? { truncated: true } : {}), ...(error ? { error } : {}) });
+    if (call.type === 'collabAgentToolCall' && call.name === 'spawnAgent') {
+      if (ok) {
+        if (!Array.isArray(item.receiverThreadIds) || !item.receiverThreadIds.every(id => typeof id === 'string' && id)) throw protocolFailure();
+        for (const threadId of item.receiverThreadIds as string[]) {
+          if (threadId === this.threadId || this.agents.has(threadId)) continue;
+          this.agents.set(threadId, { parentCallId: callId, active: true });
+        }
+      }
+      this.replayForeign();
+    }
   }
 }

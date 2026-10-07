@@ -28,7 +28,7 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
   const [scenario, part = 'plain', ...extra] = (await readFile(join(directory, 'scenario'), 'utf8')).trim().split(/\s+/);
   const scenarios = ['C10', 'C11', 'C12', 'C13', 'C14', 'C15', 'C16', 'C17', 'C18', 'C19', 'C20', 'C33', 'C38', 'C40', 'C42', 'C43'];
   const parts = ['supported', 'success', 'plain', 'hold', 'malformed', 'text', 'structure', 'dropped-effort', 'fail', 'refuse', 'refuse-stderr', 'inject-refused', 'resume-gone', 'delayed-usage',
-    'tool', 'subagent', 'subagent-finished', 'subagent-late', 'subagent-nested', 'turn-start-race', 'stubborn', 'background', 'linger', 'stopping', 'other-call'];
+    'tool', 'subagent', 'subagent-finished', 'subagent-late', 'subagent-nested', 'subagent-discovery', 'subagent-collab', 'subagent-collab-discovery', 'turn-start-race', 'stubborn', 'background', 'linger', 'stopping', 'other-call'];
   if (extra.length || !scenarios.includes(scenario!) || !parts.includes(part)) throw new Failure('invalid_input', 'This stand-in does not implement that run scenario.');
   const home = process.env.CODEX_HOME;
   const base = {
@@ -70,6 +70,7 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
   let subagentActive = false;
   let grandchildActive = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let startDiscoveredChild: (() => void) | undefined;
   const childContext = { threadId: 'fixture-subagent-thread', turnId: 'fixture-subagent-turn' };
   const grandchildContext = { threadId: 'fixture-grandchild-thread', turnId: 'fixture-grandchild-turn' };
   const savedScenario = scenario === 'C14' || scenario === 'C38';
@@ -246,7 +247,7 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
           const [, mediaType, data] = /^data:([^;]+);base64,(.*)$/.exec(part.image_url)!; return { mediaType, data };
         });
       const stopFixture = ['C15', 'C17'].includes(scenario!) || scenario === 'C38' && part === 'hold' || scenario === 'C33' && part === 'stopping';
-      const workers = stopFixture && ['tool', 'subagent', 'subagent-finished', 'subagent-late', 'subagent-nested', 'turn-start-race', 'stubborn', 'background', 'linger', 'hold'].includes(part)
+      const workers = stopFixture && ['tool', 'subagent', 'subagent-finished', 'subagent-late', 'subagent-nested', 'subagent-discovery', 'subagent-collab', 'subagent-collab-discovery', 'turn-start-race', 'stubborn', 'background', 'linger', 'hold'].includes(part)
         ? await shellWorker() : undefined;
       await received({ stage: 'input', request, checks: { ...base.checks, input: request, configurationApplied: true, images,
         toolPid: process.pid, backgroundPid: workers?.backgroundPid, shellPid: workers?.shellPid, backgroundWasAlive: !!workers,
@@ -272,11 +273,28 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
           if (part.startsWith('subagent')) {
             const activity = { type: 'subAgentActivity', id: 'subagent-started-fixture', kind: 'started',
               agentThreadId: childContext.threadId, agentPath: '/root/fixture-worker' };
-            item('item/started', activity); item('item/completed', activity);
-            notify('turn/started', { threadId: childContext.threadId, turn: { ...turn, id: childContext.turnId } });
-            subagentActive = true;
-            notify('item/started', { ...childContext, item: { ...shell, id: 'fixture-subcall' } });
-            notify('item/agentMessage/delta', { ...childContext, itemId: 'subagent-answer', delta: 'child-only' });
+            let completeSpawn: (() => void) | undefined;
+            if (part.startsWith('subagent-collab')) {
+              // Installed 7 October live.stopping: spawnAgent announces its
+              // child on the completed collaboration call, without activity.
+              const spawnCall = { type: 'collabAgentToolCall', id: 'fixture-spawn-call', tool: 'spawnAgent', status: 'inProgress',
+                senderThreadId: threadId, receiverThreadIds: [], prompt: 'Synthetic child job', model: '', reasoningEffort: 'low', agentsStates: {} };
+              item('item/started', spawnCall);
+              completeSpawn = (): void => {
+                notify('turn/started', { threadId: childContext.threadId, turn: { ...turn, id: childContext.turnId } });
+                item('item/completed', { ...spawnCall, status: 'completed', receiverThreadIds: [childContext.threadId], model: modelIds[0],
+                  agentsStates: { [childContext.threadId]: { status: 'pendingInit', message: null } } });
+              };
+              if (part === 'subagent-collab') completeSpawn();
+            } else { item('item/started', activity); item('item/completed', activity); }
+            const startChild = (): void => {
+              if (!part.startsWith('subagent-collab')) notify('turn/started', { threadId: childContext.threadId, turn: { ...turn, id: childContext.turnId } });
+              subagentActive = true;
+              notify('item/started', { ...childContext, item: { ...shell, id: 'fixture-subcall' } });
+              notify('item/agentMessage/delta', { ...childContext, itemId: 'subagent-answer', delta: 'child-only' });
+            };
+            if (part === 'subagent-collab-discovery') startDiscoveredChild = (): void => { completeSpawn!(); startChild(); };
+            else if (part === 'subagent-discovery') startDiscoveredChild = startChild; else startChild();
             if (part === 'subagent-nested') {
               const nested = { ...activity, id: 'grandchild-started-fixture', agentThreadId: grandchildContext.threadId, agentPath: '/root/fixture-worker/nested' };
               notify('item/started', { ...childContext, item: nested }); notify('item/completed', { ...childContext, item: nested });
@@ -343,11 +361,13 @@ export async function runStandIn(directory: string, args: string[]): Promise<num
       answer({});
       completedTurn(String(params.threadId), String(params.turnId), 'interrupted');
       if (main) turnActive = false;
+      if (main && startDiscoveredChild) { setTimeout(startDiscoveredChild, 10); startDiscoveredChild = undefined; }
       if (child) { subagentActive = false; clearInterval(heartbeat); }
       if (grandchild) grandchildActive = false;
     } else error('This stand-in implements only run app-server requests.', -32601);
   }
   clearInterval(heartbeat);
-  if (part === 'linger') await new Promise<void>(() => { setInterval(() => {}, 60000); });
+  if (part === 'linger') await received({ stage: 'stdinEOF' });
+  if (part === 'linger' || part === 'stubborn') await new Promise<void>(() => { setInterval(() => {}, 60000); });
   return 0;
 }

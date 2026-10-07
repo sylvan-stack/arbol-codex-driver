@@ -7,6 +7,7 @@ export class EventStream {
   runId: string = randomUUID();
   labels: Record<string, string> | undefined;
   textOnly = false;
+  outputAbandoned = false;
   private sequence = 0;
   private finished = false;
   private writes: Promise<void> = Promise.resolve();
@@ -22,7 +23,17 @@ export class EventStream {
     // The runner observes errors through flush; attach a handler immediately.
     void this.writes.catch(() => {});
   }
-  flush(): Promise<void> { return this.writes; }
+  flush(signal?: AbortSignal): Promise<void> {
+    if (!signal) return this.writes;
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise<void>((resolve, reject) => {
+      const abort = (): void => { dispose(); reject(signal.reason); };
+      const dispose = (): void => signal.removeEventListener('abort', abort);
+      signal.addEventListener('abort', abort, { once: true });
+      this.writes.then(() => { dispose(); resolve(); }, error => { dispose(); reject(error); });
+    });
+  }
+  abandonOutput(): void { this.outputAbandoned = true; this.output.destroy(); }
   async finish(error?: unknown, cancelled = false, data: Record<string, unknown> = {}): Promise<number> {
     const status = cancelled ? 2 : error === undefined ? 0 : 1;
     this.emit('finished', { outcome: cancelled ? 'cancelled' : error === undefined ? 'completed' : 'failed',

@@ -5,6 +5,7 @@ import { AppServer } from './app-server.js';
 import { normalizeAccount, normalizeUsage, readModelCatalog, builtinModelCatalog } from './catalog.js';
 import type { UsageReport, ModelCatalog } from './catalog.js';
 import { Failure, errno, safeFailure } from './errors.js';
+import { Runs } from './runs.js';
 import type { DriverError } from './errors.js';
 import { isObject } from './settings.js';
 import type { DriverSettings, Notice } from './settings.js';
@@ -356,28 +357,10 @@ export class Subscriptions {
     }
   }
   private async activeRuns(id: string, force: boolean): Promise<void> {
-    const directory = join(this.state.directory, 'runs');
-    const entries = await readdir(directory).catch((error: unknown) => { if (errno(error, 'ENOENT')) return []; throw error; });
-    for (const entry of entries) {
-      if (!entry.endsWith('.json')) continue;
-      const file = join(directory, entry); const run = await readJson(file);
-      if (!isObject(run) || run.subscriptionId !== id) continue;
-      const owner = parseOwner(run.owner); const live = await ownerAlive(owner);
-      if (live && !force) throw new Failure('in_use', 'A run uses this Subscription. Stop it first or use --force.');
-      if (live) {
-        try { process.kill(owner.pid, 'SIGTERM'); } catch (error) { if (!errno(error, 'ESRCH')) throw error; }
-        const deadline = performance.now() + fixedWait(20000, this.env);
-        while (await readJson(file) !== undefined && await ownerAlive(owner)) {
-          if (performance.now() > deadline) throw new Failure('in_use', 'The active run did not stop.');
-          await delay(fixedWait(50, this.env));
-        }
-      }
-      if (!(await ownerAlive(owner))) {
-        await this.killTool(run.tool === undefined ? undefined : parseOwner(run.tool));
-        await rm(join(this.state.directory, 'tmp', entry.slice(0, -5)), { recursive: true, force: true });
-        await missing(file);
-      }
-    }
+    const runs = new Runs(this.state, this.env);
+    const active = (await runs.list()).filter(run => run.subscriptionId === id);
+    if (active.length && !force) throw new Failure('in_use', 'A run uses this Subscription. Stop it first or use --force.');
+    for (const run of active) await runs.stop(run.runId);
   }
   async signOut(id: string, force = false): Promise<Subscription> {
     await this.get(id); await this.activeRuns(id, force);

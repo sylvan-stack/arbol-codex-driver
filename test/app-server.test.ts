@@ -29,14 +29,20 @@ appendFileSync(log, JSON.stringify({env:process.env,cwd:process.cwd()})+'\\n');
 const config = ${JSON.stringify(config)};
 const send = value => process.stdout.write(JSON.stringify(value)+'\\n');
 let unknownRequest;
-createInterface({input:process.stdin}).on('line',line=>{
+if(scenario.endsWith('-linger'))process.on('SIGTERM',()=>{});
+const input=createInterface({input:process.stdin});
+input.once('close',()=>{
+  appendFileSync(log,JSON.stringify({stage:'stdinEOF'})+'\\n');
+  if(scenario.endsWith('-linger'))setInterval(()=>{},1000);
+});
+input.on('line',line=>{
   const value=JSON.parse(line); appendFileSync(log,JSON.stringify(value)+'\\n');
   if (value.id==='server-id') { send({id:unknownRequest,result:value.error}); return; }
   if (value.method==='initialize') {
-    if(scenario==='hang-initialize')return;
+    if(scenario==='hang-initialize'||scenario==='hang-initialize-linger')return;
     send({id:value.id,result:{codexHome:scenario==='wrong-home'?'${'/wrong/home'}':process.env.CODEX_HOME}}); return;
   }
-  if(value.method==='config/read'){ send({id:value.id,result:scenario==='wrong-config'?{config:{}}:config}); return; }
+  if(value.method==='config/read'){ if(scenario==='hang-config-linger')return; send({id:value.id,result:scenario==='wrong-config'?{config:{}}:config}); return; }
   if(value.method==='early'){
     send({method:'account/login/completed',params:{loginId:'other',success:false}});
     send({method:'account/login/completed',params:{loginId:'wanted',success:true}});
@@ -181,6 +187,33 @@ test('app-server.start-cancel stops the spawned child on startup timeout or canc
     await assert.rejects(opening, Failure);
     assert.ok(owner);
     assert.equal(await ownerAlive(owner), false);
+    const records = (await readFile(join(f.directory, 'received.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(records.filter(record => record.stage === 'stdinEOF').length, 1);
+  }
+});
+
+test('app-server.startup-eof gives cancelled initialize and configuration reads EOF before the same two-second forced cleanup', { timeout: 10000 }, async t => {
+  for (const method of ['initialize', 'config/read']) {
+    const f = await fake(t, method === 'initialize' ? 'hang-initialize-linger' : 'hang-config-linger');
+    const abort = new AbortController();
+    let owner: Owner | undefined;
+    const opening = AppServer.start({ ...f.options, requestTimeoutMs: 5000, signal: abort.signal, onSpawn: value => { owner = value; } });
+    void opening.catch(() => {});
+    const deadline = performance.now() + 3000;
+    while (true) {
+      const text = await readFile(join(f.directory, 'received.jsonl'), 'utf8').catch(() => '');
+      const records = text.split('\n').slice(0, -1).filter(Boolean).map(line => JSON.parse(line));
+      if (records.some(record => record.method === method)) break;
+      assert.ok(performance.now() < deadline, 'The startup request must reach the fixture.');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const stoppedAt = performance.now(); abort.abort();
+    await assert.rejects(opening, Failure);
+    const elapsed = performance.now() - stoppedAt;
+    assert.ok(elapsed >= 1900 && elapsed < 3500, `Startup cleanup must use the stop deadline: ${elapsed} ms.`);
+    const records = (await readFile(join(f.directory, 'received.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(records.filter(record => record.stage === 'stdinEOF').length, 1);
+    assert.ok(owner); assert.equal(await ownerAlive(owner), false);
   }
 });
 

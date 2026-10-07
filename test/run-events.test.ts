@@ -94,6 +94,36 @@ test('run.protocol passes over foreign threads once and rejects another turn of 
   assert.throws(() => mapper.consume('turn/completed', { threadId: 'thread', turn: { id: 'other-turn', status: 'completed' } }), Failure);
 });
 
+test('stop.collaboration-spawn buffers concurrent receivers and ignores unrelated threads after discovery', () => {
+  const { mapper, events, item } = fixture();
+  const spawn = (id: string) => ({ type: 'collabAgentToolCall', id, tool: 'spawnAgent', status: 'inProgress', receiverThreadIds: [] });
+  item('item/started', spawn('spawn-a')); item('item/started', spawn('spawn-b'));
+  for (const threadId of ['child-a', 'unrelated', 'child-b']) mapper.consume('item/agentMessage/delta', { threadId, turnId: threadId + '-turn', delta: threadId });
+  item('item/completed', { ...spawn('spawn-a'), status: 'completed', receiverThreadIds: ['child-a'] });
+  assert.ok(events.some(event => event.type === 'text_delta' && event.text === 'child-a' && event.parentCallId === 'spawn-a'));
+  assert.equal(events.some(event => event.code === 'foreign_thread'), false);
+  item('item/completed', { ...spawn('spawn-b'), status: 'completed', receiverThreadIds: ['child-b'] });
+  assert.ok(events.some(event => event.type === 'text_delta' && event.text === 'child-b' && event.parentCallId === 'spawn-b'));
+  assert.equal(events.filter(event => event.code === 'foreign_thread').length, 1);
+  assert.equal(events.some(event => event.text === 'unrelated'), false);
+  assert.deepEqual(mapper.activeTurns, [{ threadId: 'thread', turnId: 'turn' },
+    { threadId: 'child-a', turnId: 'child-a-turn' }, { threadId: 'child-b', turnId: 'child-b-turn' }]);
+});
+
+test('stop.collaboration-spawn discovers a grandchild announced by an active child spawn', () => {
+  const { mapper, events, item } = fixture();
+  item('item/started', { type: 'subAgentActivity', id: 'activity', kind: 'started', agentThreadId: 'child' });
+  mapper.consume('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  const spawn = { type: 'collabAgentToolCall', id: 'nested-spawn', tool: 'spawnAgent', status: 'inProgress', receiverThreadIds: [] };
+  mapper.consume('item/started', { threadId: 'child', turnId: 'child-turn', item: spawn });
+  mapper.consume('turn/started', { threadId: 'grandchild', turn: { id: 'grandchild-turn' } });
+  mapper.consume('item/completed', { threadId: 'child', turnId: 'child-turn', item: { ...spawn, status: 'completed', receiverThreadIds: ['grandchild'] } });
+  mapper.consume('item/agentMessage/delta', { threadId: 'grandchild', turnId: 'grandchild-turn', delta: 'nested output' });
+  assert.ok(events.some(event => event.type === 'text_delta' && event.text === 'nested output' && event.parentCallId === 'nested-spawn'));
+  assert.ok(mapper.activeTurns.some(turn => turn.threadId === 'grandchild' && turn.turnId === 'grandchild-turn'));
+  assert.equal(events.some(event => event.code === 'foreign_thread'), false);
+});
+
 test('run.outcomes never emit a final event before cleanup', () => {
   for (const status of ['completed', 'failed', 'interrupted'] as const) {
     const { mapper, events, completed } = fixture();

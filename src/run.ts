@@ -66,7 +66,7 @@ export async function run(command: Command, subscriptions: Subscriptions, events
   const pendingNotices: Array<Record<string, unknown>> = [];
   const localStop = new AbortController();
   const activeSignal = AbortSignal.any([signal, localStop.signal]);
-  const markStop = (): void => { stopAt ??= performance.now(); };
+  const markStop = (): void => { stopAt ??= performance.now(); input?.close(); };
   activeSignal.addEventListener('abort', markStop, { once: true });
   if (activeSignal.aborted) markStop();
   const outputClosed = (): void => localStop.abort();
@@ -76,16 +76,22 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     const parsed = await readRunRequest(command.options, { settings: subscriptions.settings,
       ...(command.positionals[0] === undefined ? {} : { message: command.positionals[0] }),
       firstLine: async () => {
+        activeSignal.throwIfAborted();
         const line = await lines!.next();
-        if (line.done) throw new Failure('invalid_input', 'The request line is missing.'); return line.value;
+        activeSignal.throwIfAborted();
+        if (line.done) {
+          if (command.options.control) localStop.abort();
+          throw new Failure('invalid_input', 'The request line is missing.');
+        }
+        return line.value;
       }, identity: (runId, labels) => { events.runId = runId; events.labels = labels; } });
     request = parsed;
+    events.textOnly = request.output === 'text';
+    await runs.list();
     for (const item of request.history) fingerprint.add(item);
     fingerprint.add({ ...request.input, type: 'message' });
-    events.textOnly = request.output === 'text';
     if (!request.control) input?.close();
     const subscription = await subscriptions.requireSignedIn(request.subscriptionId);
-    await runs.list(); await subscriptions.state.clearUnfinishedWrites();
     const record = await subscriptions.state.withSubscriptionLock(subscription.id, async () => {
       const current = await subscriptions.record(subscription.id);
       if (current.state !== 'signed_in') throw new Failure('not_signed_in', 'Sign in to this Subscription first.');
@@ -116,7 +122,6 @@ export async function run(command: Command, subscriptions: Subscriptions, events
         events.emit('control_refused', { error: new Failure(isObject(value) && value.type === 'answer' ? 'not_found' : 'invalid_input',
           isObject(value) && value.type === 'answer' ? 'That question is not open.' : 'This control line is not accepted.').result,
           ...(isObject(value) && typeof value.askId === 'string' ? { askId: value.askId } : {}) });
-        await events.flush();
       }
       if (!settled) localStop.abort();
     })().catch(() => { if (!settled) localStop.abort(); });
@@ -196,7 +201,7 @@ export async function run(command: Command, subscriptions: Subscriptions, events
     for (const notification of startup) mapper.consume(notification.method, notification.params);
     for (const notice of pendingNotices) events.emit('notice', notice);
     for (const notice of subscriptions.notices) events.emit('notice', { ...notice });
-    await events.flush();
+    await events.flush(activeSignal);
     let remainingCallsDeadline: number | undefined;
     while (!mapper.outcome || mapper.openCalls.size || mapper.waitingForWork) {
       const waitingForOtherCalls = !!mapper.outcome && !mapper.waitingForWork;
@@ -214,15 +219,12 @@ export async function run(command: Command, subscriptions: Subscriptions, events
         // The vendor processId is a terminal identifier, never an OS PID.
         await writeJson(join(temporary, 'shell-owners.json'), await server.captureProcessGroups());
       }
-      mapper.consume(notification.method, notification.params); await events.flush();
+      mapper.consume(notification.method, notification.params); await events.flush(activeSignal);
     }
     if (mapper.outcome === 'failed') error = new Failure(mapper.error?.code ?? 'vendor_error', mapper.error?.message ?? 'Codex failed the turn.', mapper.error ?? {});
     else if (mapper.outcome === 'interrupted') error = new Failure('tool_failed', 'Codex interrupted the turn without a caller stop.');
-    settled = true;
   } catch (failure) { error = failure; }
   finally {
-    settled = true; input?.close();
-    if (controlTask) await controlTask;
     if (activeSignal.aborted && server) {
       if (!mapper && conversation) {
         const queued = server.takeNotifications();
@@ -238,28 +240,57 @@ export async function run(command: Command, subscriptions: Subscriptions, events
       }
       if (mapper) await interruptTurns(server, mapper, stopAt! + fixedWait(2000, env)).catch(() => {});
     }
-    await server?.end(stopAt === undefined ? undefined : stopAt + fixedWait(15000, env)).catch(failure => {
-      error ??= failure;
-      if (activeSignal.aborted) events.emit('notice', { code: 'cleanup_failed', message: failure.message });
-    });
+    // A caller may stop after the turn completed, while stdin EOF cleanup is
+    // still waiting. Give that stop its own deadline and keep control readable.
+    const stopDuringEnd = (): void => {
+      void server?.close(stopAt! + fixedWait(15000, env), stopAt! + fixedWait(2000, env)).catch(() => {});
+    };
+    activeSignal.addEventListener('abort', stopDuringEnd, { once: true });
+    try {
+      await server?.end(stopAt === undefined ? undefined : stopAt + fixedWait(15000, env),
+        stopAt === undefined ? undefined : stopAt + fixedWait(2000, env)).catch(failure => {
+        error ??= failure;
+        if (activeSignal.aborted) events.emit('notice', { code: 'cleanup_failed', message: failure.message });
+      });
+    } finally {
+      activeSignal.removeEventListener('abort', stopDuringEnd);
+      settled = true;
+      input?.close();
+      if (controlTask) await controlTask;
+    }
     mapper?.closeOpenCalls(activeSignal.aborted ? 'The tool call was interrupted by the caller.' : undefined);
     if (temporary) await rm(temporary, { recursive: true, force: true }).catch(failure => { error ??= failure; });
-    events.output.off('error', outputClosed);
-    activeSignal.removeEventListener('abort', markStop);
   }
   if (request && plan && reservedId) {
-    try { await events.flush(); } catch (failure) { error ??= failure; }
+    try { await events.flush(activeSignal); } catch (failure) { error ??= failure; }
     try {
       await chats.settle(request, plan, conversation, fingerprint.snapshot(), error === undefined && !activeSignal.aborted && mapper?.outcome === 'completed');
     } catch (failure) { error ??= failure; }
   }
   try {
-    const code = await events.finish(error, activeSignal.aborted, { producedOutput: mapper?.outputProduced ?? false,
-      unfinishedCalls: mapper?.unfinishedCalls ?? [], ...(mapper?.usage === undefined ? {} : { usage: mapper.usage }) });
+    let outputTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopOutput!: () => void;
+    const outputDeadline = new Promise<number>(resolve => {
+      stopOutput = (): void => {
+        if (outputTimer) return;
+        outputTimer = setTimeout(() => { events.abandonOutput(); resolve(2); },
+          Math.max(1, stopAt! + fixedWait(15000, env) - performance.now()));
+      };
+      activeSignal.addEventListener('abort', stopOutput, { once: true });
+      if (activeSignal.aborted) stopOutput();
+    });
+    let code: number;
+    try {
+      code = await Promise.race([events.finish(error, activeSignal.aborted, { producedOutput: mapper?.outputProduced ?? false,
+        unfinishedCalls: mapper?.unfinishedCalls ?? [], ...(mapper?.usage === undefined ? {} : { usage: mapper.usage }) }), outputDeadline]);
+    } finally { clearTimeout(outputTimer); activeSignal.removeEventListener('abort', stopOutput); }
     if (code !== 0 && request && plan && reservedId && conversation) await chats.settle(request, { ...plan, continuedConversation: conversation }, conversation, fingerprint.snapshot(), false);
     return code;
   } catch (failure) {
     if (request && plan && reservedId && conversation) await chats.settle(request, { ...plan, continuedConversation: conversation }, conversation, fingerprint.snapshot(), false).catch(() => {});
     throw failure;
-  } finally { if (reservedId) await runs.remove(reservedId); }
+  } finally {
+    events.output.off('error', outputClosed); activeSignal.removeEventListener('abort', markStop);
+    if (reservedId) await runs.remove(reservedId);
+  }
 }

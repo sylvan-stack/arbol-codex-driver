@@ -85,7 +85,8 @@ export class Runs {
         await new Promise<void>(resolve => setTimeout(resolve, fixedWait(50, this.env))); continue;
       }
       try {
-        const remaining = await endProcessGroups(await this.orphanGroups(claimed), Math.min(deadline, performance.now() + fixedWait(10000, this.env)));
+        const remaining = await endProcessGroups(await this.orphanGroups(claimed), Math.min(deadline, performance.now() + fixedWait(10000, this.env)),
+          performance.now() + fixedWait(2000, this.env));
         if (remaining.length) throw new Failure('internal', 'Cannot end orphaned run process groups: ' + remaining.map(group => group.pid).join(', ') + '.');
         // The reservation stays present until scratch and its matching map entry
         // are gone. Re-check before each deletion so a replacement is untouched.

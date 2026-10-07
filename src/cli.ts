@@ -12,7 +12,10 @@ import { EventStream } from './event-stream.js';
 import { run } from './run.js';
 import { Runs } from './runs.js';
 
+export let outputWasAbandoned = false;
+
 export async function main(args: string[]): Promise<number> {
+  outputWasAbandoned = false;
   const operation = args.filter((arg, index) => arg !== '--state-dir' && args[index - 1] !== '--state-dir' && !arg.startsWith('--state-dir='))[0];
   const events = operation === 'run' ? new EventStream() : undefined;
   const cancellation = new AbortController();
@@ -30,7 +33,7 @@ export async function main(args: string[]): Promise<number> {
     const { settings, notices } = await readSettings(file);
     const state = new State(typeof command.options['state-dir'] === 'string' ? command.options['state-dir'] : defaultStateDirectory(home));
     await state.initialize();
-    if (command.name === 'run' || ['subscriptions create', 'subscriptions update', 'subscriptions remove',
+    if (['subscriptions create', 'subscriptions update', 'subscriptions remove',
       'subscriptions sign-in', 'subscriptions sign-out', 'subscriptions check', 'subscriptions usage', 'subscriptions models'].includes(command.name)) {
       await new Runs(state).list();
     }
@@ -78,6 +81,7 @@ export async function main(args: string[]): Promise<number> {
     process.stdout.write(JSON.stringify({ error: safeFailure(error) }) + '\n');
     return 1;
   } finally {
+    outputWasAbandoned = events?.outputAbandoned ?? false;
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
   }

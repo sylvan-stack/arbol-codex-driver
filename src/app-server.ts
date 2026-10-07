@@ -80,6 +80,7 @@ export class AppServer {
   toolVersion: string | undefined;
   private failure: Error | undefined;
   private closing: Promise<void> | undefined;
+  private ending: Promise<void> | undefined;
   private closeResolve!: () => void;
   private readonly closed: Promise<void>;
   private readonly decoder = new StringDecoder('utf8');
@@ -138,7 +139,11 @@ export class AppServer {
     // Install listeners before the asynchronous owner lookup: even a wrapper
     // that exits immediately must be drained and its process group stopped.
     const server = new AppServer(child, { pid: child.pid, startedAt: new Date().toISOString() }, requestTimeoutMs, cleanupGraceMs, options.onServerRequest);
-    const abort = (): void => { server.fail(aborted()); void server.close().catch(() => {}); };
+    const abort = (): void => {
+      const stoppedAt = performance.now();
+      server.fail(aborted());
+      void server.end(stoppedAt + fixedWait(15000, options.env), stoppedAt + fixedWait(2000, options.env)).catch(() => {});
+    };
     if (options.signal) {
       options.signal.addEventListener('abort', abort, { once: true });
       server.removeAbort = () => options.signal?.removeEventListener('abort', abort);
@@ -169,7 +174,7 @@ export class AppServer {
       server.removeAbort = undefined;
       return server;
     } catch (error) {
-      await server.close();
+      await server.end();
       throw error;
     }
   }
@@ -203,7 +208,7 @@ export class AppServer {
       const timer = setTimeout(() => {
         const error = new Failure('tool_failed', `codex did not answer ${method} within the request timeout.`);
         this.fail(error);
-        void this.close().catch(() => {});
+        void this.end().catch(() => {});
       }, options.timeoutMs ?? this.timeoutMs);
       const dispose = (): void => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); };
       const finish = (error: Error): void => { this.pending.delete(id); dispose(); reject(error); };
@@ -321,14 +326,15 @@ export class AppServer {
     for (const owner of await collectProcessGroups(this.owner)) this.groups.set(owner.pid, owner);
     return [...this.groups.values()];
   }
-  close(deadline = performance.now() + fixedWait(10000)): Promise<void> {
+  close(deadline = performance.now() + fixedWait(10000), forceAt?: number): Promise<void> {
     if (this.closing) return this.closing;
     this.fail(new Failure('tool_failed', 'The codex app-server was stopped.'));
     this.removeAbort?.();
     this.closing = (async () => {
       let cleanupError: unknown;
       await this.captureProcessGroups().catch(error => { cleanupError = error; });
-      const survivors = await endProcessGroups([...this.groups.values()], deadline).catch(error => {
+      if (!this.child.stdin.writableEnded) this.child.stdin.end();
+      const survivors = await endProcessGroups([...this.groups.values()], deadline, forceAt).catch(error => {
         cleanupError ??= error; this.killGroup('SIGKILL'); return [...this.groups.values()];
       });
       // Detaching does not detach the pipe handles. Bound cleanup even when a
@@ -344,15 +350,20 @@ export class AppServer {
   }
 
   /** Normal run completion lets the app-server clean up its commands on stdin EOF. */
-  async end(deadline = performance.now() + fixedWait(15000)): Promise<void> {
+  end(deadline = performance.now() + fixedWait(15000), forceAt?: number): Promise<void> {
     if (this.closing) return this.closing;
-    let captureError: unknown;
-    await this.captureProcessGroups().catch(error => { captureError = error; });
-    this.child.stdin.end();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([this.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, Math.min(fixedWait(2000), Math.max(1, deadline - performance.now()))); })]);
-    clearTimeout(timer);
-    await this.close(deadline);
-    if (captureError) throw captureError;
+    if (this.ending) return this.ending;
+    this.ending = (async () => {
+      let captureError: unknown;
+      await this.captureProcessGroups().catch(error => { captureError = error; });
+      if (!this.child.stdin.writableEnded) this.child.stdin.end();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const eofDeadline = Math.min(deadline, forceAt ?? performance.now() + fixedWait(2000));
+      await Promise.race([this.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(1, eofDeadline - performance.now())); })]);
+      clearTimeout(timer);
+      await this.close(deadline, forceAt);
+      if (captureError) throw captureError;
+    })();
+    return this.ending;
   }
 }

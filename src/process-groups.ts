@@ -67,12 +67,13 @@ export async function collectProcessGroups(owner: Owner): Promise<Owner[]> {
 }
 
 /** End verified groups and await every member, including children holding no pipes. */
-export async function endProcessGroups(owners: readonly Owner[], deadline = performance.now() + fixedWait(10000)): Promise<Owner[]> {
+export async function endProcessGroups(owners: readonly Owner[], deadline = performance.now() + fixedWait(10000),
+  forceAt = performance.now() + fixedWait(2000)): Promise<Owner[]> {
   const known = new Map(owners.map(owner => { const parsed = parseOwner(owner); return [parsed.pid, parsed] as const; }));
   if (!known.size) return [];
   let remaining = [...known.values()];
   const terminated = new Set<number>();
-  const forceAt = Math.min(deadline, performance.now() + fixedWait(2000));
+  const forceDeadline = Math.min(deadline, forceAt);
   while (performance.now() < deadline) {
     let table: ProcessSnapshot[];
     try { table = await processSnapshot(deadline); }
@@ -86,7 +87,7 @@ export async function endProcessGroups(owners: readonly Owner[], deadline = perf
     remaining = survivingProcessGroups([...known.values()], table);
     if (!remaining.length) return [];
     for (const owner of remaining) {
-      const forced = performance.now() >= forceAt;
+      const forced = performance.now() >= forceDeadline;
       if (!forced && terminated.has(owner.pid)) continue;
       try { process.kill(process.platform === 'win32' ? owner.pid : -owner.pid, forced ? 'SIGKILL' : 'SIGTERM'); }
       catch (error) { if (!errno(error, 'ESRCH')) throw error; }
@@ -97,6 +98,6 @@ export async function endProcessGroups(owners: readonly Owner[], deadline = perf
   return remaining;
 }
 
-export async function endProcessGroup(owner: Owner, deadline?: number): Promise<Owner[]> {
-  return endProcessGroups(await collectProcessGroups(owner), deadline);
+export async function endProcessGroup(owner: Owner, deadline?: number, forceAt?: number): Promise<Owner[]> {
+  return endProcessGroups(await collectProcessGroups(owner), deadline, forceAt);
 }
