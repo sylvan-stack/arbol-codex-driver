@@ -23,6 +23,9 @@ from .stand_in import ACCOUNT, CONFIG, SOURCE, VERSION, append_record, environme
 type Record = dict[str, Any]
 SCENARIOS = {
     "C4",
+    "C5",
+    "C7",
+    "C8",
     "C9",
     "C10",
     "C11",
@@ -41,8 +44,10 @@ SCENARIOS = {
     "C28",
     "C29",
     "C30",
+    "C32",
     "C33",
     "C35",
+    "C36",
     "C37",
     "C38",
     "C40",
@@ -53,6 +58,9 @@ PARTS = {
     "supported",
     "success",
     "plain",
+    "failed",
+    "stderr",
+    "question",
     "hold",
     "malformed",
     "text",
@@ -136,6 +144,29 @@ WORKER_PARTS = {
     "background",
     "linger",
     "hold",
+}
+STABLE_SCHEMA_FIELDS = {
+    "ThreadStartParams": ("cwd", "model", "approvalPolicy", "sandbox", "serviceTier", "developerInstructions", "ephemeral", "config"),
+    "TurnStartParams": ("threadId", "input", "model", "effort", "summary", "approvalPolicy", "sandboxPolicy", "serviceTier"),
+    "ThreadResumeParams": ("threadId", "model", "config"),
+    "ThreadInjectItemsParams": ("threadId", "items"),
+    "ThreadReadParams": ("threadId", "includeTurns"),
+    "TurnInterruptParams": ("threadId", "turnId"),
+    "ErrorNotification": ("threadId", "turnId", "error", "willRetry"),
+    "AccountRateLimitsUpdatedNotification": ("rateLimits",),
+    "ThreadTokenUsageUpdatedNotification": ("threadId", "turnId", "tokenUsage"),
+    "TurnCompletedNotification": ("threadId", "turn"),
+}
+STABLE_SCHEMA_REQUIRED = {
+    "TurnStartParams": ("input", "threadId"),
+    "ThreadResumeParams": ("threadId",),
+    "ThreadInjectItemsParams": ("items", "threadId"),
+    "ThreadReadParams": ("threadId",),
+    "TurnInterruptParams": ("threadId", "turnId"),
+    "ErrorNotification": ("error", "threadId", "turnId", "willRetry"),
+    "AccountRateLimitsUpdatedNotification": ("rateLimits",),
+    "ThreadTokenUsageUpdatedNotification": ("threadId", "tokenUsage", "turnId"),
+    "TurnCompletedNotification": ("threadId", "turn"),
 }
 
 
@@ -454,7 +485,9 @@ class RunFixture:
                 )
                 if not correct:
                     raise Failure("tool_failed", "The Driver did not settle the unexpected vendor request correctly.")
-                if not self.server_requests and self.scenario == "C25":
+                if not self.server_requests and (
+                    self.scenario in {"C25", "C36"} or self.scenario == "C33" and self.part == "question"
+                ):
                     await self.text("permissions-answer", "answer")
                     await self.completed_turn(self.thread_id, self.turn_id, "completed")
                     self.turn_active = False
@@ -501,8 +534,18 @@ class RunFixture:
         elif method == "account/read":
             await answer({"account": ACCOUNT if self.logged_in else None, "requiresOpenaiAuth": True})
         elif method == "account/login/start":
+            if params.get("type") not in ("chatgpt", "chatgptDeviceCode"):
+                await error("Unsupported login type")
+                return
             await answer(
                 {
+                    "type": "chatgptDeviceCode",
+                    "loginId": "fixture-login",
+                    "verificationUrl": "https://auth.openai.com/codex/device",
+                    "userCode": "FIXT-12345",
+                }
+                if params["type"] == "chatgptDeviceCode"
+                else {
                     "type": "chatgpt",
                     "loginId": "fixture-login",
                     "authUrl": "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&state=fixture",
@@ -517,18 +560,30 @@ class RunFixture:
                 {"loginId": "fixture-login", "success": True, "error": None, "onboardingEntrypoint": None},
             )
             await self.notify("account/updated", {"authMode": "chatgpt", "planType": "fixture"})
+        elif method == "account/login/cancel":
+            await answer({"status": "canceled" if params.get("loginId") == "fixture-login" else "notFound"})
+        elif method == "account/logout":
+            (self.home / "auth.json").unlink(missing_ok=True)
+            self.logged_in = False
+            await answer({})
+            await self.notify("account/updated", {"authMode": None, "planType": None})
         elif method == "model/list":
             if params.get("includeHidden", False) is not False or params.get("cursor") is not None:
                 await error("Invalid model list request")
             else:
                 await answer({"data": fixture_models(), "nextCursor": None})
+        elif method == "skills/list" and self.scenario == "C32":
+            skill = Path(os.environ["HOME"]) / ".agents/skills/arbol-probe/SKILL.md"
+            skills = [{"name": "arbol-probe", "description": "A disposable probe skill", "path": str(skill),
+                       "enabled": True, "scope": "user"}] if skill.is_file() else []
+            await answer({"data": [{"cwd": str(Path.cwd()), "skills": skills, "errors": []}]})
         elif method == "account/rateLimits/read":
             limits = self.rate_limits(75, 100) if self.scenario == "C30" else self.rate_limits(25, 100 if self.part == "reset" else 40)
             if self.part == "reset":
                 limits["secondary"]["resetsAt"] = int(time.time()) + 120
             limits.update(rateLimitReachedType="rate_limit_reached", spendControlReached=False)
             await answer({
-                "ordinaryUsageAllowed": False,
+                "ordinaryUsageAllowed": self.scenario == "C32",
                 "rateLimits": limits,
                 "rateLimitsByLimitId": {"codex": limits},
                 "rateLimitResetCredits": {"availableCount": 0, "credits": []},
@@ -536,6 +591,9 @@ class RunFixture:
                 "rateLimitUpsell": None,
             })
         elif method == "thread/start":
+            probe_thread = self.scenario == "C32" and params.get("model") is None
+            if probe_thread:
+                params = {**params, "model": "gpt-6.1-sol"}
             try:
                 same_directory = isinstance(params.get("cwd"), str) and Path(params["cwd"]).resolve(
                     strict=True
@@ -543,8 +601,8 @@ class RunFixture:
             except OSError:
                 same_directory = False
             if (
-                not self.logged_in
-                or self.thread_params
+                not self.logged_in and not probe_thread
+                or self.thread_params and not probe_thread
                 or params.get("model") not in ("gpt-6.1-sol", "gpt-6-astra")
                 or not same_directory
                 or params.get("approvalPolicy") != "never"
@@ -557,8 +615,10 @@ class RunFixture:
                 await error("Invalid fresh thread configuration")
                 return
             self.thread_params = params
-            if self.scenario in ("C14", "C38"):
+            if self.scenario in ("C14", "C38") or probe_thread:
                 self.thread_id = str(uuid.uuid4())
+            if probe_thread:
+                self.history_items = []
             self.saved_path = None if params.get("ephemeral") is True else self.saved_file(self.thread_id)
             self.persist()
             result = self.thread_result()
@@ -566,7 +626,7 @@ class RunFixture:
             await self.notify("thread/started", {"thread": result["thread"]})
         elif method == "thread/resume":
             if (
-                not self.logged_in
+                not self.logged_in and not (self.scenario == "C32" and params.get("model") is None)
                 or self.thread_params
                 or not isinstance(params.get("threadId"), str)
                 or set(params) - {"threadId", "model", "config"}
@@ -622,6 +682,11 @@ class RunFixture:
             self.history_items.extend(params["items"])
             self.persist()
             await answer({})
+        elif method == "thread/read":
+            if self.thread_params is None or params.get("threadId") != self.thread_id:
+                await error("No fixture thread found", -32600)
+                return
+            await answer({"thread": self.thread_result()["thread"]})
         elif method == "turn/start":
             await self.start_turn(params, request, answer, error)
         elif method == "turn/interrupt":
@@ -641,7 +706,10 @@ class RunFixture:
                 and params.get("turnId") == self.grandchild_context["turnId"]
                 and self.grandchild_active
             )
-            if not (main or child or grandchild) or self.part == "stubborn":
+            if not (main or child or grandchild):
+                await error("No active fixture turn found", -32600)
+                return
+            if self.part == "stubborn":
                 return
             await answer({})
             await self.completed_turn(str(params["threadId"]), str(params["turnId"]), "interrupted")
@@ -761,6 +829,7 @@ class RunFixture:
                     history_images.append({"mediaType": match[1], "data": match[2]})
         stop_fixture = (
             self.scenario in ("C15", "C17")
+            or self.scenario == "C5" and self.part == "hold"
             or self.scenario == "C38"
             and self.part == "hold"
             or self.scenario == "C33"
@@ -850,6 +919,12 @@ class RunFixture:
         if self.scenario == "C35":
             await self.completed_tools(turn)
             return
+        if self.scenario == "C7":
+            await self.credentials_fixture()
+            return
+        if self.scenario == "C36" or self.scenario == "C33" and self.part == "question":
+            await self.unexpected_questions()
+            return
         if stop_fixture:
             await self.notify(
                 "item/agentMessage/delta", {**self.context, "itemId": "partial-answer", "delta": "partial"}
@@ -891,12 +966,12 @@ class RunFixture:
             for number in range(32):
                 await self.text(f"fixture-answer-{number}", "s" * (64 * 1024))
         else:
-            await self.text("fixture-answer", "answer")
+            await self.text("fixture-answer", "ready" if self.scenario == "C32" else "answer")
         if self.scenario == "C13":
             await self.usage(3, 2)
             await self.usage(7, 5, 4, 3)
             await self.usage(7, 5, 4, 3)
-        if self.scenario in ("C42", "C14"):
+        if self.scenario in ("C42", "C14", "C32"):
             await self.usage(3, 2)
         if self.scenario in ("C11", "C20", "C42"):
             search = (
@@ -992,6 +1067,67 @@ class RunFixture:
             "individualLimit": None, "spendControlReached": None,
             "planType": "fixture", "rateLimitReachedType": None,
         }
+
+    async def credentials_fixture(self) -> None:
+        """Exercise all output envelopes and private owner diagnostics offline.
+
+        The login is tool-owned and never sent to the Driver. The MCP value is
+        already present in thread config, so it can be scrubbed without reading
+        the tool's login. Every event retains its shape with private literals
+        removed, including answer/reasoning and structured tool values.
+        """
+        secret = "fixture-key-SECRET-781"
+        await self.item("item/started", self.message("credential-answer", ""))
+        for delta in ("answer " + secret[:12], secret[12:]):
+            await self.notify("item/agentMessage/delta", {**self.context, "itemId": "credential-answer", "delta": delta})
+        await self.item("item/completed", self.message("credential-answer", "answer " + secret))
+        reasoning = {"type": "reasoning", "id": "credential-reasoning", "summary": ["thinking " + secret]}
+        await self.item("item/started", {**reasoning, "summary": []})
+        for delta in ("thinking " + secret[:12], secret[12:]):
+            await self.notify("item/reasoning/summaryTextDelta", {**self.context, "itemId": reasoning["id"], "delta": delta})
+        await self.item("item/completed", reasoning)
+        command = {**self.command(False), "command": "/bin/zsh -lc 'echo " + secret + "'"}
+        await self.item("item/started", command)
+        for delta in ("output " + secret[:12], secret[12:]):
+            await self.notify("item/commandExecution/outputDelta", {**self.context, "itemId": command["id"], "delta": delta})
+        await self.item("item/completed", {**command, "status": "completed", "exitCode": 0, "aggregatedOutput": "output " + secret})
+        structured = {"type": "mcpToolCall", "id": "credential-mcp", "server": "fixture", "tool": "echo",
+                      "arguments": {"private": secret}, "status": "inProgress", "result": None, "error": None}
+        await self.item("item/started", structured)
+        await self.item("item/completed", {**structured, "status": "completed",
+                                           "result": {"content": [{"type": "text", "text": secret}], "structuredContent": {"private": secret}}})
+        await self.notify("warning", {**self.context, "message": "Private diagnostic " + secret})
+        self.received({"stage": "credential-output", "checks": {**self.base["checks"], "ownerDiagnosticSent": True}})
+        if self.part == "stderr":
+            # Split delivery exercises the stderr prefix retained by the scrubber.
+            sys.stderr.write("Private stderr " + secret[:12])
+            sys.stderr.flush()
+            await asyncio.sleep(0.01)
+            sys.stderr.write(secret[12:] + "\n")
+            sys.stderr.flush()
+            self.exit_code = 1
+            self.input.close()
+        elif self.part == "failed":
+            await self.failed_turn("other", "Private failure " + secret)
+        else:
+            await self.completed_turn(self.thread_id, self.turn_id, "completed")
+            self.turn_active = False
+
+    async def unexpected_questions(self) -> None:
+        """Questions stay in the supported wire shape and receive typed errors."""
+        questions = [{
+            "id": "choice", "header": "Choose", "question": "Choose a fixture colour",
+            "isOther": False, "isSecret": False,
+            "options": [{"label": "Blue", "description": "Fixture colour"}],
+        }]
+        count = 2 if self.scenario == "C36" else 1
+        self.server_requests = {f"fixture-question-{index}": False for index in range(count)}
+        for index in range(count):
+            await self.write({
+                "id": f"fixture-question-{index}", "method": "item/tool/requestUserInput",
+                "params": {**self.context, "itemId": f"question-{index}", "questions": questions,
+                           "isBlocking": True, "autoResolutionMs": None},
+            })
 
     async def failed_turn(self, info: Any, message: str, *, retry: bool = False) -> None:
         error = {"message": message, "codexErrorInfo": info, "additionalDetails": None, "misalignment": None}
@@ -1623,7 +1759,7 @@ async def run_stand_in(directory: Path, args: list[str], output: Output) -> int:
     checks = {
         **environment_checks(home),
         "source": SOURCE,
-        "synthetic": "Input, tokens, omitted fields, model-effort rejection, failure and oversized-output variants",
+        "synthetic": "Input, tokens, omitted fields, errors, oversized output, private strings, unsolicited questions and development-check variants",
     }
     base: Record = {
         "scenario": scenario,
@@ -1637,6 +1773,32 @@ async def run_stand_in(directory: Path, args: list[str], output: Output) -> int:
     append_record(directory, base)
     if args == ["--version"]:
         await output.write(f"codex-cli {VERSION}\n")
+        return 0
+    if scenario == "C32" and len(args) == 4 and args[:3] == ["app-server", "generate-json-schema", "--out"]:
+        schema_directory = Path(args[3]) / "v2"
+        schema_directory.mkdir(parents=True, mode=0o700)
+        for name, fields in STABLE_SCHEMA_FIELDS.items():
+            path = schema_directory / (name + ".json")
+            fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                # Only the retained stable field index is rehearsed here. The
+                # fixture never claims to reproduce the tool's complete schema.
+                schema: Record = {"type": "object", "properties": {field: {} for field in fields},
+                                  "required": list(STABLE_SCHEMA_REQUIRED.get(name, ()))}
+                if name == "ErrorNotification":
+                    # CodexErrorInfo is embedded here in the stable 0.159.2
+                    # schema, not emitted as a standalone type file.
+                    schema["definitions"] = {"CodexErrorInfo": {"oneOf": [{
+                        "type": "string", "enum": [*sorted(ERROR_CLASSES - {"activeTurnNotSteerable"}), "other"],
+                    }]}}
+                stream.write(dumps(schema))
+        login_schema = schema_directory / "LoginAccountParams.json"
+        fd = os.open(login_schema, os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(dumps({"oneOf": [
+                {"properties": {"type": {"enum": ["chatgpt"]}}},
+                {"properties": {"type": {"enum": ["chatgptDeviceCode"]}}},
+            ]}))
         return 0
     if args != ["app-server"] or home is None:
         raise Failure("unsupported", "This stand-in requires app-server and a Subscription home.")

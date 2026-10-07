@@ -30,6 +30,9 @@ SUBSCRIPTION_PARTS = {
     "unknown-windows",
 }
 RUN_SCENARIOS = {
+    "C5",
+    "C7",
+    "C8",
     "C9",
     "C10",
     "C11",
@@ -48,8 +51,10 @@ RUN_SCENARIOS = {
     "C28",
     "C29",
     "C30",
+    "C32",
     "C33",
     "C35",
+    "C36",
     "C37",
     "C38",
     "C42",
@@ -139,6 +144,9 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     scenario, part = words[0] if words else "", words[1] if len(words) > 1 else "supported"
     if (
         scenario in RUN_SCENARIOS
+        and not (scenario == "C5" and part in SUBSCRIPTION_PARTS)
+        and not (scenario == "C7" and part in SUBSCRIPTION_PARTS and part != "failed")
+        and not (scenario == "C32" and part == "info")
         or scenario == "C40" and part not in SUBSCRIPTION_PARTS
         or scenario == "C4" and part == "success"
     ):
@@ -149,6 +157,8 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     if len(words) > 2 or not (
         scenario == "C31"
         and part in {"supported", "old", "missing"}
+        or scenario == "C3"
+        and part == "supported"
         or scenario == "C32"
         and part == "info"
         or subscriptions
