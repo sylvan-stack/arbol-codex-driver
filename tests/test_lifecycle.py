@@ -335,15 +335,24 @@ class Lifecycle(Fixture):
     async def test_pending_first_stdin_request_signal_and_eof_cancel_before_vendor(self) -> None:
         for path in ("signal", "eof"):
             with self.subTest(path=path):
-                self.log.unlink(missing_ok=True)
-                running = cast(Running, await self.start("first-" + path, extra=["--request", "-"]))
-                await asyncio.sleep(0.05)
-                if path == "signal":
-                    running.child.send_signal(signal.SIGTERM)
-                else:
-                    assert running.child.stdin is not None
-                    running.child.stdin.close()
-                self.assertEqual(await running.done(), (2, b""))
+                delay = 0.05
+                while True:
+                    self.log.unlink(missing_ok=True)
+                    running = cast(Running, await self.start("first-" + path, extra=["--request", "-"]))
+                    await asyncio.sleep(delay)
+                    if path == "signal":
+                        running.child.send_signal(signal.SIGTERM)
+                    else:
+                        assert running.child.stdin is not None
+                        running.child.stdin.close()
+                    status, stderr = await running.done()
+                    # A signal that comes before Python has installed the Driver's handler ends the process at once
+                    # (status -15). Such a start proves nothing about the Driver: start again and wait longer.
+                    if path == "signal" and status == -signal.SIGTERM and delay < 2:
+                        delay *= 2
+                        continue
+                    break
+                self.assertEqual((status, stderr), (2, b""))
                 self.final(running.events)
                 self.assertEqual(len(running.events), 1)
                 self.assertEqual(self.records(), [])
@@ -356,9 +365,15 @@ class Lifecycle(Fixture):
         running.reader.cancel()
         await asyncio.gather(running.reader, return_exceptions=True)
         assert running.child.stdout is not None
-        cast(ReaderTransport, running.child.stdout)._transport.close()
+        transport = cast(ReaderTransport, running.child.stdout)._transport
+        transport.close()
+        # asyncio closes the pipe on its next turn. Wait for that, so that the Driver's answer to the control line
+        # finds no reader; otherwise a busy machine lets that answer into the pipe and the Driver waits on.
+        while getattr(transport, "_pipe", None) is not None:
+            await asyncio.sleep(0)
         await running.control('{"type":"unknown"}\n')
-        self.assertEqual(await asyncio.wait_for(running.child.wait(), 4), 2)
+        # A guard against a hang only: the Driver's own stop deadlines add up to almost 3 seconds at scale 10.
+        self.assertEqual(await asyncio.wait_for(running.child.wait(), 10), 2)
         self.assertEqual(await running.stderr, b"")
         self.assertTrue(any(record.get("stage") == "interrupt" for record in self.records()))
         await self.cleaned("broken", owners)

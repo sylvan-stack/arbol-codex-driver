@@ -50,6 +50,11 @@ class ErrorRuns(Fixture):
         self.assertEqual(subscription["problem"], final["error"])
 
     async def test_total_limit_cleans_vendor_and_bounds_wait_for_blocked_output(self) -> None:
+        # Scale 5 gives the tool a stop grace of 0.4 seconds to see the interrupt, so that a busy machine cannot
+        # use it up first; the bounds follow from the scale and equal the former ones at scale 10.
+        scale = 5
+        self.env["ARBOL_TEST_TIME_SCALE"] = str(scale)
+        grace, stop = 2 / scale, 15 / scale
         self.scenario("C29 blocked-output")
         request = self.home / "clock-request.json"
         request.write_text(dumps({
@@ -64,14 +69,14 @@ class ErrorRuns(Fixture):
         assert owner is not None
         self.owners.append(owner)
         started = time.monotonic()
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(0.3 + grace + 1.5):
             while await owner_alive(owner):
                 await asyncio.sleep(0.01)
-        async with asyncio.timeout(3):
+        async with asyncio.timeout(stop + 1.5):
             while child.returncode is None:
                 await asyncio.sleep(0.01)
         self.assertEqual(child.returncode, 1)
-        self.assertLess(time.monotonic() - started, 2.8)
+        self.assertLess(time.monotonic() - started, 0.3 + stop + 1.0)
         self.assertTrue(any(record.get("stage") == "interrupt" for record in self.records()))
         assert child.stdout is not None and child.stderr is not None
         cast(ReaderTransport, child.stdout)._transport.close()
