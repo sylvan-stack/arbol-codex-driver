@@ -30,10 +30,13 @@ from .tool import inspect_tool, require_tool
 async def interrupt_turns(server: AppServer, mapper: RunEvents, deadline: float) -> None:
     sent: set[str] = set()
     pending: list[asyncio.Task[Json]] = []
+    asked = False
     try:
         for notice in server.take_notifications():
             mapper.consume(notice.method, notice.params)
-        while time.monotonic() < deadline:
+        # The tool is always asked once (DRV-2.16), also when the Driver gets here after the 2 seconds have passed.
+        while not asked or time.monotonic() < deadline:
+            asked = True
             for turn in mapper.active_turns:
                 key = str(turn["threadId"]) + ":" + str(turn["turnId"])
                 if key not in sent:
