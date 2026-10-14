@@ -101,12 +101,16 @@ async def collect_process_groups(owner: Owner) -> list[Owner]:
     return descendant_process_groups(owner, await process_snapshot(time.monotonic() + 1))
 
 
+# A group signalled with os.killpg may answer EPERM on macOS when its processes have exited but are not
+# yet reaped: it is ending, as with ProcessLookupError, and the next process snapshot shows one that remains.
+
+
 async def force_process_groups(owners: list[Owner], deadline: float) -> None:
     table = await process_snapshot(deadline)
     for owner in surviving_process_groups(owners, table):
         try:
             os.killpg(owner["pid"], signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
 
@@ -138,7 +142,7 @@ async def end_process_groups(
                 continue
             try:
                 os.killpg(owner["pid"], signal.SIGKILL if forced else signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             terminated.add(owner["pid"])
         await asyncio.sleep(min(fixed_wait(50), max(0.001, deadline - time.monotonic())))

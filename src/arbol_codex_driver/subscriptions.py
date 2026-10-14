@@ -257,7 +257,7 @@ class Subscriptions:
             if await owner_alive(tool):
                 try:
                     os.killpg(tool["pid"], signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
 
         async def change() -> None:

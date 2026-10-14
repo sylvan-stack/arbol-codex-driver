@@ -11,6 +11,7 @@ from arbol_codex_driver.json_types import iso
 from arbol_codex_driver.process_groups import (
     ProcessSnapshot,
     descendant_process_groups,
+    end_process_groups,
     force_process_groups,
     same_owner,
     surviving_process_groups,
@@ -97,6 +98,22 @@ class ForcedProcessGroupTests(unittest.IsolatedAsyncioTestCase):
                 await force_process_groups([owner(10)], time.monotonic() + 1)
                 snapshot.assert_awaited_once()
                 kill.assert_called_once_with(10, signal.SIGKILL)
+
+    async def test_a_group_that_is_ending_may_answer_eperm(self) -> None:
+        # macOS answers EPERM for a group whose processes have exited but are not yet reaped.
+        with (
+            patch("arbol_codex_driver.process_groups.process_snapshot", AsyncMock(return_value=[row(10, 10)])),
+            patch("arbol_codex_driver.process_groups.os.killpg", side_effect=PermissionError) as kill,
+        ):
+            await force_process_groups([owner(10)], time.monotonic() + 1)
+            kill.assert_called_once_with(10, signal.SIGKILL)
+        tables = AsyncMock(side_effect=[[row(10, 10)], []])
+        with (
+            patch("arbol_codex_driver.process_groups.process_snapshot", tables),
+            patch("arbol_codex_driver.process_groups.os.killpg", side_effect=PermissionError) as kill,
+        ):
+            self.assertEqual(await end_process_groups([owner(10)], time.monotonic() + 1), [])
+            kill.assert_called_once_with(10, signal.SIGTERM)
 
 
 if __name__ == "__main__":

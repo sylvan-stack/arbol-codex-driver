@@ -202,7 +202,7 @@ async def command(
             if child.returncode is None:
                 try:
                     os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
             try:
                 await asyncio.wait_for(child.wait(), 1)
@@ -231,7 +231,7 @@ async def stop_child(child: asyncio.subprocess.Process) -> None:
         if child.returncode is None:
             try:
                 os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
         try:
             await asyncio.wait_for(child.wait(), 1)
