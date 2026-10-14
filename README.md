@@ -27,8 +27,8 @@ Its three checks run the packaged unit tests, all 38 shared conformance
 scenarios, and exactly one quota-checked ready message on `test-chatgpt`.
 All must pass before the Build becomes `working` and the default.
 
-The build tool writes the launcher to `~/.local/bin`; that folder and Node.js
-24 or later must be on PATH. With the build tool installed from the sibling
+The build tool writes the launcher to `~/.local/bin`; that folder must be on
+PATH. The launcher is Python and needs no Node.js (SYL-165). With the build tool installed from the sibling
 `arbol` repository and `uv` available, run:
 
 ```sh
