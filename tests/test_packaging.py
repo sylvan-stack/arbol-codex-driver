@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import sys
 import tempfile
 import unittest
@@ -118,6 +119,14 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(set(environment), {"HOME", "PATH", "LANG"})
             self.assertNotEqual(environment["HOME"], "/tmp/caller-home")
             self.assertEqual(execute.call_args.kwargs["cwd"], folder)
+
+    def test_live_gate_defaults_to_the_test_state_directory(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "ARBOL_BUILD_TEST_STATE_DIR"}
+        with patch.dict(os.environ, environment, clear=True), patch.object(check_build, "run", return_value=0) as execute:
+            self.assertEqual(check_build.live(Path("/tmp/candidate")), 0)
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        self.assertEqual(execute.call_args.args[0][-2:],
+                         ["--state-dir", str(home / "Library/Application Support/Arbol/drivers/arbol-codex-driver")])
 
     def test_live_gate_refuses_relative_or_empty_test_state_before_start(self) -> None:
         for directory in ("", "relative/state"):

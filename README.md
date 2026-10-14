@@ -44,8 +44,10 @@ selects Build `1` explicitly; select any available number shown by `list`.
 Failed checks retain their Build number, record and log, and leave the previous
 working default in place. Contract and state format remain `1`.
 `ARBOL_CONFORMANCE_REPO` can name another shared-suite checkout;
-`ARBOL_BUILD_TEST_STATE_DIR` can name an absolute Driver state directory with
-the signed-in `test-chatgpt` Subscription.
+The live check finds the signed-in `test-chatgpt` Subscription in its own test
+state directory, `~/Library/Application Support/Arbol/drivers/arbol-codex-driver/`,
+not in the default one; `ARBOL_BUILD_TEST_STATE_DIR` can name another absolute
+Driver state directory with it (DRV-D41).
 
 ## Development
 
