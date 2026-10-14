@@ -174,9 +174,10 @@ class Subscriptions:
             object_value(object_value(self.settings.get("subscriptions")).get(id_)).get("settings")
         )
         for key in family_settings:
-            message = f"Ignoring unknown setting {self.settings_file}: subscriptions.{id_}.settings.{key}."
-            if not any(notice["message"] == message for notice in self.notices):
-                self.notices.append({"code": "unknown_setting", "message": message})
+            # The family chatgpt has no settings, so every key there is unknown (DRV-D34).
+            raise Failure(
+                "invalid_input", f"Settings file {self.settings_file}: unknown field subscriptions.{id_}.settings.{key}."
+            )
         result: Object = {**record, "settings": {}}
         pending = self.progress(id_)
         if (

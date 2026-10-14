@@ -35,6 +35,7 @@ from arbol_codex_driver.state import (
     read_json,
     write_json,
 )
+from arbol_codex_driver.subscriptions import Subscriptions
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -137,13 +138,23 @@ class Foundation(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(Failure):
                 parse_arguments(args)
         settings = self.folder / "settings.json"
-        settings.write_text(
-            '{"toolPath":"/tool", "unknown":"private-sentinel", "subscriptions":{"work":{"defaultModel":"a","settings":{"future":"private"}}}}'
-        )
+        settings.write_text('{"toolPath":"/tool", "subscriptions":{"work":{"defaultModel":"a","settings":{"future":"x"}}}}')
         config, notices = read_settings(settings)
-        self.assertEqual(config["toolPath"], "/tool")
-        self.assertTrue(notices)
-        self.assertNotIn("private-sentinel", dumps(cast(list[Json], notices)))
+        self.assertEqual((config["toolPath"], notices), ("/tool", []))
+        for text, field in (
+            ('{"toolPath":"/tool", "unknown":"private-sentinel"}', "unknown"),
+            ('{"defaultSubscripton":"private-sentinel"}', "defaultSubscripton"),
+            ('{"subscriptions":{"work":{"defaultModle":"private-sentinel"}}}', "subscriptions.work.defaultModle"),
+            ('{"subscriptions":{"work":{"secret":{"from":"keychain","account":"private-sentinel"}}}}',
+             "subscriptions.work.secret.account"),
+        ):
+            settings.write_text(text)
+            with self.subTest(field=field), self.assertRaises(Failure) as caught:
+                read_settings(settings)
+            self.assertEqual(caught.exception.result["code"], "invalid_input")
+            self.assertIn(str(settings), str(caught.exception))
+            self.assertIn(field, str(caught.exception))
+            self.assertNotIn("private-sentinel", str(caught.exception))
         settings.write_text('{"toolPath":false}')
         with self.assertRaises(Failure):
             read_settings(settings)
@@ -391,3 +402,20 @@ class Foundation(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Failure):
             await read_model_catalog(rejected)
         self.assertEqual(len(cast(list[Json], builtin_catalog()["models"])), 7)
+
+
+class FamilySettings(unittest.IsolatedAsyncioTestCase):
+    async def test_an_unknown_family_setting_refuses_and_is_named(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="codex-family-settings-")
+        self.addCleanup(temporary.cleanup)
+        folder = Path(temporary.name)
+        state = State(folder / "state")
+        state.initialize()
+        file = folder / "settings.json"
+        self.assertEqual((await Subscriptions(state, {}, [], file, {}).get("chatgpt"))["settings"], {})
+        settings: Object = {"subscriptions": {"chatgpt": {"settings": {"future": "private-sentinel"}}}}
+        with self.assertRaises(Failure) as caught:
+            await Subscriptions(state, settings, [], file, {}).get("chatgpt")
+        self.assertEqual(caught.exception.result["code"], "invalid_input")
+        self.assertIn(f"{file}: unknown field subscriptions.chatgpt.settings.future", str(caught.exception))
+        self.assertNotIn("private-sentinel", str(caught.exception))

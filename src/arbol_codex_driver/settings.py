@@ -27,9 +27,7 @@ def read_settings(file: Path) -> tuple[Object, list[Object]]:
     def unknown(item: Object, known: tuple[str, ...], prefix: str = "") -> None:
         for key in item:
             if key not in known:
-                notices.append(
-                    {"code": "unknown_setting", "message": f"Ignoring unknown setting {prefix}{key} in {file}."}
-                )
+                raise Failure("invalid_input", f"Settings file {file}: unknown field {prefix}{key}.")
 
     def strings(item: Object, known: tuple[str, ...], prefix: str = "") -> Object:
         clean: Object = {}
