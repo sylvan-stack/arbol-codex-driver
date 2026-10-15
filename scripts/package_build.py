@@ -86,11 +86,6 @@ def package(candidate: str | None) -> Path:
     for source in (ROOT / "scripts").iterdir():
         if source.suffix in (".py", ".json"):
             shutil.copy2(source, scripts / source.name)
-    fixtures = folder / "test"
-    fixtures.mkdir()
-    for source in (ROOT / "test").iterdir():
-        if source.is_file() and (source.suffix in (".json", ".txt") or source.name.startswith("conformance-")):
-            shutil.copy2(source, fixtures / source.name)
     binary = folder / "bin"
     binary.mkdir()
     shutil.copy2(ROOT / "bin/entry.py", binary / "entry.py")

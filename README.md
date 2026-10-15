@@ -70,28 +70,23 @@ PYTHONPATH=src uv run --locked python -m unittest discover -s tests -v
 
 The pinned Ruff and strict mypy versions are development dependencies only.
 The unit suite uses `unittest`; its synthetic vendor and worker processes also
-use Python. The `.mjs` files under `test/` are minimal glue to the shared TypeScript
-conformance suite in the sibling `arbol` repository. They require Node.js 24.
-`node test/conformance-full.mjs ../arbol` runs the complete registry without
-filters; the older focused wrappers retain their scopes for debugging.
-`ARBOL_DRIVER_ENTRY` selects a packaged executable.
+use Python. The shared conformance suite in the sibling `arbol` repository is Python too:
+`.venv/bin/python -I -B ../arbol/conformance/bin/arbol-conformance.py --driver bin/arbol-codex-driver` runs the complete registry,
+`--only <ids>` a part of it, and `--driver` names a packaged executable instead.
 
 Settings are read from `~/.arbol/arbol-codex-driver.json` on every invocation.
 `toolPath` names a Codex executable, otherwise it is found on `PATH`. The oldest
 supported version is `codex-cli 0.159.2`. The version probe uses a temporary home
 and a clean environment; it sends no prompt.
 
-With the sibling `arbol` repository compiled,
-`node test/conformance-base.mjs ../arbol` runs shared C31 and C32's `info` check.
-`node test/conformance-subscriptions.mjs ../arbol` runs ten account scenarios,
-with explicit subscription scopes for C4, C5, C7, C8 and C40. The full wrapper
-includes inference and every applicable shared scenario. Synthetic active-run
+With the sibling `arbol` repository, `--only C31,C32` runs shared C31 and C32.
+`--only C1,C2,C4,C5,C6,C7,C8,C39,C40,C41` runs the ten account scenarios. The
+full registry includes inference and every applicable shared scenario. Synthetic active-run
 tests verify account
 refusal and forced removal; real fresh-run checks are separate.
 
-`node test/conformance-runs.mjs ../arbol` runs eleven fresh-run scenarios, with
-explicit scopes for C33 (no control input and stdin request) and C40 (fresh-run
-refusals). The shared checks inspect native Codex RPCs as well as Claude input.
+`--only C10,C11,C12,C13,C18,C19,C20,C33,C40,C42,C43` runs the eleven fresh-run
+scenarios. The shared checks inspect native Codex RPCs as well as Claude input.
 Focused integration tests cover images, settings defaults, control refusals,
 stdout closure, account rechecks, and run-record cleanup.
 
@@ -120,7 +115,7 @@ notice reports the labelled text fallback. Failed and cancelled resumed runs
 invalidate their map entry while preserving a newer concurrent completion.
 Runs without a working folder use ephemeral threads and leave no map entry.
 
-`node test/conformance-continuity.mjs ../arbol` runs shared C14 against the Codex
+`--only C14` runs shared C14 against the Codex
 stand-in. Focused unit and integration checks cover digests, all rebuild reasons,
 native and text histories, private image files, model overrides, concurrent
 resumes and map invalidation.
@@ -143,15 +138,14 @@ orphaned tool and its command groups, removes its temporary folder and record,
 and invalidates the matching conversation entry. A program that makes itself a
 separate background service is outside this cleanup, as DRV-D33 specifies.
 
-`node test/conformance-stops.mjs ../arbol` runs shared C15, C16, C17, C38 and
-C33's active-record and peer-stop checks. Caller questions remain excluded from
-Codex's C33 scope. Focused tests cover control and signal stops, event-pipe loss,
+`--only C15,C16,C17,C33,C38` runs shared C15, C16, C17, C33 and C38; C33 checks
+that Codex refuses a caller question as unsupported. Focused tests cover control and signal stops, event-pipe loss,
 ignored interrupts, active child and descendant turns, process identities,
 simultaneous recovery and conditional conversation invalidation. Full owner
 tools and sub-agent routing are checked by the tools suite below. Error
 classification and inference time limits are checked by the errors suite.
 
-`node test/conformance-tools.mjs ../arbol` runs shared C9, C25, C35 and C37.
+`--only C9,C25,C35,C37` runs shared C9, C25, C35 and C37.
 Commands keep their plain shell input and vendor refusal reason; patches, web
 search and MCP results retain their specified shapes. Child text, tool output,
 usage and notices carry the call that started the child, including notifications
@@ -181,7 +175,7 @@ background command. Neither command runs in the offline unit suite.
 Current evidence, including unsuccessful attempts, is in the Artifact Corpus's
 `research/tools-2026-10-07/`.
 
-`node test/conformance-errors.mjs ../arbol` runs shared C4 and C26–C30.
+`--only C4,C26,C27,C28,C29,C30` runs shared C4 and C26 to C30.
 Failures use Codex's structured class and status before the permitted text
 fallback. Every retry emits a notice; the first credential refusal interrupts
 the run and marks its account `needs_attention`. A rate-limited failure makes
@@ -240,7 +234,7 @@ uv run --locked python scripts/package_build.py --candidate /absolute/empty/fold
 /absolute/empty/folder/runtime/python/bin/python3.14 /absolute/empty/folder/scripts/check_build.py unit --candidate /absolute/empty/folder
 ```
 
-The candidate contains its interpreter, runtime, tests, and contract wrappers.
+The candidate contains its interpreter, runtime and tests.
 Metadata checks validate the distribution and packaged file digests. The
 registry rehearsal validates relocation to a path with spaces, direct entry,
 selection, and failed-check refusal. The package gate runs the full shared suite,
