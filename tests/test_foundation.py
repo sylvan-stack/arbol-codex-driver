@@ -418,10 +418,12 @@ class Foundation(unittest.IsolatedAsyncioTestCase):
             None,
             now(),
         )
-        self.assertEqual([window["kind"] for window in usage["windows"]], ["session", "weekly"])
-        for window in usage["windows"]:
-            self.assertNotIn("resource", window)
-        self.assertEqual(usage["extra"]["credits"], {"hasCredits": True, "unlimited": False, "balance": "12.5"})
+        windows = usage["windows"]
+        assert isinstance(windows, list)
+        self.assertEqual([object_value(window)["kind"] for window in windows], ["session", "weekly"])
+        for window in windows:
+            self.assertNotIn("resource", object_value(window))
+        self.assertEqual(object_value(usage["extra"])["credits"], {"hasCredits": True, "unlimited": False, "balance": "12.5"})
 
 
 class FamilySettings(unittest.IsolatedAsyncioTestCase):
