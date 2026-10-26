@@ -31,6 +31,8 @@ def normalize_account(value: Json) -> Object | None:
 
 
 def normalize_window(value: Json) -> Object | None:
+    # DRV-1.27: the app server's RateLimitWindow carries usedPercent, windowDurationMins and resetsAt and names
+    # no unit, so a window carries no `resource`; it is never guessed (CDX-D31, schema of codex-cli 0.162.1).
     if value is None:
         return None
     if not isinstance(value, dict):

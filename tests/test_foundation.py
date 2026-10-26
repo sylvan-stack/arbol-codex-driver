@@ -403,6 +403,26 @@ class Foundation(unittest.IsolatedAsyncioTestCase):
             await read_model_catalog(rejected)
         self.assertEqual(len(cast(list[Json], builtin_catalog()["models"])), 7)
 
+    def test_usage_windows_carry_no_resource_the_app_server_does_not_state(self) -> None:
+        # DRV-1.27, CDX-1.16, CDX-D31: `account/rateLimits/read` names no unit for a window, so `resource` is never
+        # invented; the account's credit balance is a snapshot field, not a window's unit, and stays in `extra`.
+        usage = normalize_usage(
+            {
+                "rateLimits": {
+                    "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 2000},
+                    "secondary": {"usedPercent": 95, "windowDurationMins": 10080},
+                    "credits": {"hasCredits": True, "unlimited": False, "balance": "12.5"},
+                    "planType": "pro",
+                }
+            },
+            None,
+            now(),
+        )
+        self.assertEqual([window["kind"] for window in usage["windows"]], ["session", "weekly"])
+        for window in usage["windows"]:
+            self.assertNotIn("resource", window)
+        self.assertEqual(usage["extra"]["credits"], {"hasCredits": True, "unlimited": False, "balance": "12.5"})
+
 
 class FamilySettings(unittest.IsolatedAsyncioTestCase):
     async def test_an_unknown_family_setting_refuses_and_is_named(self) -> None:
