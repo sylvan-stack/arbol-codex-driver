@@ -1,7 +1,19 @@
-# Shared fixtures only; test bodies are in top/ and mid/. See TESTS.md.
+# Shared fixtures; case bodies live in top/ and mid/. See TESTS.md.
 """Exact DRV-6 lock and version-cache boundaries, without a vendor tool."""
 
 from __future__ import annotations
+import asyncio
+import os
+import shlex
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from arbol_codex_driver import state as state_module
+from arbol_codex_driver.errors import Failure
+from arbol_codex_driver.json_types import object_value
+from arbol_codex_driver.state import State, owner_json, process_owner, read_json, write_json
+from arbol_codex_driver.tool import inspect_tool
+
 
 import tempfile
 import unittest
@@ -30,7 +42,6 @@ class ConformanceState(unittest.IsolatedAsyncioTestCase):
         self.folder = Path(temporary.name)
         self.state = State(self.folder / "state")
         self.state.initialize()
-
 
 
 # Archived complete imports; restore needed names in their original scope, not at this file tail.
