@@ -2,28 +2,7 @@
 from __future__ import annotations
 
 import test_accounts_continuity as _support
-from test_accounts_continuity import (
-    Accounts,
-    Continuity,
-    ENTRY,
-    Fixture,
-    Json,
-    Object,
-    asyncio,
-    cast,
-    digest,
-    dumps,
-    iso,
-    loads,
-    now,
-    object_value,
-    os,
-    owner_json,
-    parse_owner,
-    process_owner,
-    time,
-    write_json,
-)
+from test_accounts_continuity import (ENTRY ,Json ,Object ,asyncio ,cast ,digest ,loads ,now ,object_value ,parse_owner ,write_json)
 
 
 class Accounts(_support.Accounts):
@@ -64,22 +43,6 @@ class Accounts(_support.Accounts):
             self.assertEqual((directory / "record.json").stat().st_mode & 0o777, 0o600)
 # TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_local_concurrent_creation_update_preserves_owner_settings_and_remove_isolated
 
-# TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_unsigned_refusals_and_malformed_state_do_not_start_vendor_or_disclose_contents
-    async def test_unsigned_refusals_and_malformed_state_do_not_start_vendor_or_disclose_contents(self) -> None:
-        self.scenario("C1 supported")
-        await self.invoke(["subscriptions", "create", "--family", "chatgpt", "--label", "Unsigned", "--id", "unsigned"])
-        for command in ("check", "models"):
-            code, output, _ = await self.invoke(["subscriptions", command, "unsigned"])
-            self.assertEqual(code, 1)
-            self.assertEqual(object_value(object_value(loads(output.decode()))["error"])["code"], "not_signed_in")
-        record = self.state / "subscriptions/unsigned/record.json"
-        for content in ("null", '"private-malformed"', '{"id":"private-malformed"}'):
-            record.write_text(content)
-            code, output, error = await self.invoke(["subscriptions", "list"])
-            self.assertEqual((code, error), (1, b""))
-            self.assertNotIn(b"private-malformed", output)
-        self.assertEqual(self.records(), [])
-# TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_unsigned_refusals_and_malformed_state_do_not_start_vendor_or_disclose_contents
 
 # TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_usage_last_good_cache_rejection_and_catalog_fallback
     async def test_usage_last_good_cache_rejection_and_catalog_fallback(self) -> None:
@@ -106,24 +69,6 @@ class Accounts(_support.Accounts):
         self.assertEqual(record["lastUsage"], fresh)
 # TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_usage_last_good_cache_rejection_and_catalog_fallback
 
-# TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_live_progress_dead_and_reused_owner_recovery
-    async def test_live_progress_dead_and_reused_owner_recovery(self) -> None:
-        self.scenario("C1 supported")
-        own = await process_owner(os.getpid())
-        assert own is not None
-        progress = self.state / "subscriptions/chatgpt/sign-in.json"
-        write_json(progress, {"owner": owner_json(own), "expiresAt": iso(time.time() + 300)})
-        _, output, _ = await self.invoke(["subscriptions", "list"])
-        self.assertEqual(object_value(cast(list[Json], loads(output.decode()))[0])["state"], "signing_in")
-        write_json(
-            progress,
-            {"owner": {**owner_json(own), "startedAt": "1970-01-01T00:00:00Z"}, "expiresAt": iso(time.time() + 300)},
-        )
-        _, output, _ = await self.invoke(["subscriptions", "list"])
-        self.assertEqual(object_value(cast(list[Json], loads(output.decode()))[0])["state"], "signed_in")
-        self.assertFalse(progress.exists())
-        self.assertEqual(self.records(), [])
-# TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_live_progress_dead_and_reused_owner_recovery
 
 # TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_login_replacement_cancels_pending_and_sign_out_clears_credentials
     async def test_login_replacement_cancels_pending_and_sign_out_clears_credentials(self) -> None:
@@ -158,7 +103,6 @@ class Accounts(_support.Accounts):
         self.assertEqual((await self.invoke(["subscriptions", "sign-out", "chatgpt"]))[0], 0)
         self.assertFalse((self.state / "subscriptions/chatgpt/home/auth.json").exists())
 # TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_login_replacement_cancels_pending_and_sign_out_clears_credentials
-
 
 
 class Continuity(_support.Continuity):

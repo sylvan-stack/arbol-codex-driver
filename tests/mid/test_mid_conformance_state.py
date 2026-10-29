@@ -2,66 +2,10 @@
 from __future__ import annotations
 
 import test_conformance_state as _support
-from test_conformance_state import (
-    ConformanceState,
-    Failure,
-    LockClock,
-    Path,
-    SimpleNamespace,
-    State,
-    asyncio,
-    inspect_tool,
-    object_value,
-    os,
-    owner_json,
-    patch,
-    process_owner,
-    read_json,
-    shlex,
-    state_module,
-    tempfile,
-    unittest,
-    write_json,
-)
+from test_conformance_state import (asyncio ,inspect_tool ,object_value ,os ,read_json ,shlex ,write_json)
 
 
 class ConformanceState(_support.ConformanceState):
-# TEST-TIER-BEGIN tests/test_conformance_state.py::ConformanceState.test_taken_lock_polls_every_50ms_and_fails_after_10s_with_owner
-    async def test_taken_lock_polls_every_50ms_and_fails_after_10s_with_owner(self) -> None:
-        owner = await process_owner(os.getpid())
-        assert owner is not None
-        lock = self.state.subscription("busy") / "lock"
-        write_json(lock, {"owner": owner_json(owner)})
-        original = lock.read_bytes()
-        changed = False
-
-        async def change() -> None:
-            nonlocal changed
-            changed = True
-
-        for scale in (1, 100):
-            with self.subTest(timeScale=scale):
-                clock = LockClock()
-                # Replace only this module's clock/sleep surface. The test loop
-                # still uses its real monotonic clock, and lock files are real.
-                scheduler = SimpleNamespace(sleep=clock.sleep, to_thread=asyncio.to_thread)
-                with (
-                    patch.object(state_module, "time", clock),
-                    patch.object(state_module, "asyncio", scheduler),
-                    self.assertRaises(Failure) as caught,
-                ):
-                    await self.state.with_subscription_lock("busy", change, {"ARBOL_TEST_TIME_SCALE": str(scale)})
-                self.assertEqual(caught.exception.result["code"], "internal")
-                message = str(caught.exception.result["message"])
-                self.assertIn(f"owner PID {owner['pid']}", message)
-                self.assertIn(owner["startedAt"], message)
-                self.assertEqual(len(clock.sleeps), 200)
-                self.assertTrue(all(seconds == 0.05 / scale for seconds in clock.sleeps))
-                self.assertAlmostEqual(clock.elapsed, 10 / scale)
-                self.assertFalse(changed)
-                self.assertEqual(lock.read_bytes(), original)
-                self.assertEqual(list(lock.parent.glob(".write-*")), [])
-# TEST-TIER-END tests/test_conformance_state.py::ConformanceState.test_taken_lock_polls_every_50ms_and_fails_after_10s_with_owner
 
 # TEST-TIER-BEGIN tests/test_conformance_state.py::ConformanceState.test_another_subscription_changes_while_first_lock_is_held
     async def test_another_subscription_changes_while_first_lock_is_held(self) -> None:

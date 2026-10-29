@@ -2,42 +2,10 @@
 from __future__ import annotations
 
 import test_privacy as _support
-from test_privacy import (
-    Capture,
-    EventPrivacy,
-    EventStream,
-    Object,
-    Output,
-    cast,
-    loads,
-    unittest,
-)
+from test_privacy import (Capture ,EventStream ,Object ,Output ,cast ,loads)
 
 
 class EventPrivacy(_support.EventPrivacy):
-# TEST-TIER-BEGIN tests/test_privacy.py::EventPrivacy.test_every_event_and_text_output_scrubs_nested_private_values
-    async def test_every_event_and_text_output_scrubs_nested_private_values(self) -> None:
-        capture = Capture()
-        stream = EventStream(cast(Output, capture))
-        stream.private_values = ("fixture-private-value",)
-        secret = stream.private_values[0]
-        stream.identity("run", {"caller": secret})
-        for type_ in ("notice", "text", "thinking", "tool_started", "tool_finished"):
-            stream.emit(type_, {"text": secret, "input": {secret: [secret]}, "result": {"output": secret}})
-        await stream.finish(data={"error": {"message": secret}})
-        self.assertNotIn(secret, capture.text)
-        records = [cast(Object, loads(line)) for line in capture.text.splitlines()]
-        self.assertEqual([record["seq"] for record in records], list(range(1, len(records) + 1)))
-        self.assertTrue(all(record["labels"] == {"caller": "[redacted]"} for record in records))
-        self.assertEqual(records[0]["input"], {"[redacted]": ["[redacted]"]})
-        text_capture = Capture()
-        stream = EventStream(cast(Output, text_capture))
-        stream.private_values = (secret,)
-        stream.text_only = True
-        stream.emit("text", {"text": f"before {secret} after"})
-        await stream.finish()
-        self.assertEqual(text_capture.text, "before [redacted] after")
-# TEST-TIER-END tests/test_privacy.py::EventPrivacy.test_every_event_and_text_output_scrubs_nested_private_values
 
 # TEST-TIER-BEGIN tests/test_privacy.py::EventPrivacy.test_split_values_and_open_suffixes_are_hidden_in_all_delta_streams
     async def test_split_values_and_open_suffixes_are_hidden_in_all_delta_streams(self) -> None:
