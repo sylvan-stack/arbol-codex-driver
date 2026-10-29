@@ -62,7 +62,7 @@ def read_schema(directory: Path, name: str) -> Json:
 async def probe(
     subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
-    raise RuntimeError('Tests are commented under the tier policy; see TESTS.md. Restore only in an explicitly requested testing task.')  # TEST-TIER-REFUSAL
+    return await _mid_tier_namespace()['probe'](subscriptions, inherited, cancellation)
 
 
 async def check_account(subscriptions: Subscriptions, refresh: bool = True) -> Object:
@@ -190,6 +190,30 @@ async def execute_run(
 async def live_check(
     build_only: bool, subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
-    raise RuntimeError('Tests are commented under the tier policy; see TESTS.md. Restore only in an explicitly requested testing task.')  # TEST-TIER-REFUSAL
+    return await _mid_tier_namespace()['live_check'](build_only, subscriptions, inherited, cancellation)
 
 # Archived complete imports; restore needed names in their original scope, not at this file tail.
+
+
+def _mid_tier_namespace():
+    """Load test-only code on explicit invocation, leaving normal product imports alone."""
+    from pathlib import Path as _TierPath
+    from types import ModuleType as _TierModule
+    import sys as _tier_sys
+    name = __name__ + '.__mid_tier'
+    if name not in _tier_sys.modules:
+        path = _TierPath(__file__).resolve().parents[2] / 'tests/mid/archived/src/arbol_codex_driver/dev.py'
+        if not path.is_file():
+            raise RuntimeError('Mid-tier source is unavailable in this installation; use the source checkout or an explicitly qualified test package. See MID_TIER.md.')
+        module = _TierModule(name)
+        # Preserve public case identities consumed by qualification contracts.
+        module.__dict__['__name__'] = __name__
+        module.__file__ = __file__
+        module.__package__ = __package__
+        _tier_sys.modules[name] = module
+        try:
+            exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+        except BaseException:
+            del _tier_sys.modules[name]
+            raise
+    return _tier_sys.modules[name].__dict__

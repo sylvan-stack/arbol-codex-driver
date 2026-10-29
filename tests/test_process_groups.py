@@ -1,7 +1,18 @@
-# Shared fixtures only; test bodies are in top/ and mid/. See TESTS.md.
+# Shared fixtures; case bodies live in top/ and mid/. See TESTS.md.
 """Process-table identity checks protect unrelated processes during cleanup."""
 
 from __future__ import annotations
+import signal
+
+from arbol_codex_driver.process_groups import (
+    ProcessSnapshot,
+    descendant_process_groups,
+    end_process_groups,
+    force_process_groups,
+    same_owner,
+    surviving_process_groups,
+)
+
 
 import time
 import unittest
@@ -28,8 +39,7 @@ class ProcessGroupTests(unittest.TestCase):
 
 
 class ForcedProcessGroupTests(unittest.IsolatedAsyncioTestCase):
-    pass  # Shared fixture base; case bodies live in top/ and mid/.
-
+    pass  # Shared fixtures; case bodies live in top/ and mid/.
 
 
 # Archived complete imports; restore needed names in their original scope, not at this file tail.
