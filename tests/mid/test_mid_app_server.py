@@ -2,69 +2,11 @@
 from __future__ import annotations
 
 import test_app_server as _support
-from test_app_server import (
-    AppServer,
-    AppServerTests,
-    Cancellation,
-    DRIVER_CONFIG,
-    EventStream,
-    FAKE,
-    Failure,
-    Json,
-    Object,
-    Output,
-    OutputTests,
-    Owner,
-    Path,
-    asyncio,
-    cast,
-    loads,
-    object_value,
-    os,
-    owner_alive,
-    patch,
-    process_owner,
-    shlex,
-    sys,
-    tempfile,
-    time,
-    unittest,
-    utf8,
-)
+from test_app_server import (AppServer ,Cancellation ,Failure ,Owner ,asyncio ,cast ,object_value ,owner_alive ,patch ,process_owner ,time)
 
 
 class AppServerTests(_support.AppServerTests):
-# TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_private_home_configuration_clean_environment_and_owner_cleanup
-    async def test_private_home_configuration_clean_environment_and_owner_cleanup(self) -> None:
-        server = await self.start()
-        self.assertTrue(await owner_alive(server.owner))
-        records = self.records()
-        env = object_value(records[0]["env"])
-        self.assertEqual(env["HOME"], self.env["HOME"])
-        self.assertEqual(env["CODEX_HOME"], str(self.home))
-        self.assertNotIn("OPENAI_API_KEY", env)
-        self.assertNotIn("CODEX_TOKEN", env)
-        self.assertNotIn("ARBOL_OTHER", env)
-        self.assertEqual(records[0]["cwd"], str(self.home.resolve()))
-        self.assertEqual([record.get("method") for record in records[1:]], ["initialize", "initialized", "config/read"])
-        self.assertEqual((self.home / "config.toml").read_text(), DRIVER_CONFIG)
-        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.home / "config.toml").stat().st_mode & 0o777, 0o600)
-        await server.close()
-        self.assertFalse(await owner_alive(server.owner))
-# TEST-TIER-END tests/test_app_server.py::AppServerTests.test_private_home_configuration_clean_environment_and_owner_cleanup
 
-# TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_handshake_version_and_effective_configuration_are_enforced
-    async def test_handshake_version_and_effective_configuration_are_enforced(self) -> None:
-        for scenario, code in (("old-handshake", "tool_unsupported"), ("bad-handshake", "tool_failed"),
-                               ("wrong-config", "tool_unsupported")):
-            with self.subTest(scenario=scenario), self.assertRaises(Failure) as caught:
-                await self.start(scenario)
-            self.assertEqual(caught.exception.result["code"], code)
-            if scenario == "old-handshake":
-                self.assertEqual(object_value(caught.exception.result["detail"])["toolVersion"], "0.158.0")
-                self.assertEqual(object_value(caught.exception.result["detail"])["neededVersion"], "0.159.2")
-# TEST-TIER-END tests/test_app_server.py::AppServerTests.test_handshake_version_and_effective_configuration_are_enforced
 
 # TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_fragmented_utf8_early_notifications_burst_and_unknown_request
     async def test_fragmented_utf8_early_notifications_burst_and_unknown_request(self) -> None:
@@ -157,24 +99,6 @@ class AppServerTests(_support.AppServerTests):
             self.log.unlink(missing_ok=True)
 # TEST-TIER-END tests/test_app_server.py::AppServerTests.test_startup_wrong_home_config_and_cancellation_gives_eof_before_force
 
-# TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_authentication_rejection_is_specific_and_diagnostics_are_bounded
-    async def test_authentication_rejection_is_specific_and_diagnostics_are_bounded(self) -> None:
-        server = await self.start()
-        for method, code in (
-            ("rpc-error", "credential_rejected"),
-            ("structured-error", "credential_rejected"),
-            ("unknown-error", "tool_failed"),
-        ):
-            with self.assertRaises(Failure) as caught:
-                await server.request(method, {})
-            self.assertEqual(caught.exception.result["code"], code)
-        with self.assertRaises(Failure) as caught:
-            await server.request("exit-log", {})
-        excerpt = str(object_value(caught.exception.result.get("detail")).get("excerpt", ""))
-        self.assertTrue(excerpt.endswith("diagnostic-sentinel"))
-        self.assertLessEqual(len(utf8(excerpt)), 1024)
-        self.assertNotIn("�", excerpt)
-# TEST-TIER-END tests/test_app_server.py::AppServerTests.test_authentication_rejection_is_specific_and_diagnostics_are_bounded
 
 # TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_cleanup_survives_capture_failure_and_ends_ignoring_descendant
     async def test_cleanup_survives_capture_failure_and_ends_ignoring_descendant(self) -> None:
@@ -194,21 +118,6 @@ class AppServerTests(_support.AppServerTests):
         self.servers.remove(server)
 # TEST-TIER-END tests/test_app_server.py::AppServerTests.test_cleanup_survives_capture_failure_and_ends_ignoring_descendant
 
-# TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_predicate_errors_settle_only_affected_waiter
-    async def test_predicate_errors_settle_only_affected_waiter(self) -> None:
-        server = await self.start()
-
-        def bad(value: Json) -> bool:
-            raise ValueError("predicate")
-
-        waiting = asyncio.create_task(server.wait_for_notification("account/login/completed", bad))
-        await asyncio.sleep(0)
-        await server.request("early", {})
-        with self.assertRaises(ValueError):
-            await waiting
-        self.assertEqual((await server.next_notification()).params, {"loginId": "other", "success": False})
-        self.assertIsNone(server.failure)
-# TEST-TIER-END tests/test_app_server.py::AppServerTests.test_predicate_errors_settle_only_affected_waiter
 
 # TEST-TIER-BEGIN tests/test_app_server.py::AppServerTests.test_notification_backpressure_preserves_long_stream_and_wakes_for_rpc
     async def test_notification_backpressure_preserves_long_stream_and_wakes_for_rpc(self) -> None:
@@ -224,58 +133,3 @@ class AppServerTests(_support.AppServerTests):
             total += 1
         self.assertEqual(await server.request("ping", {}), {"ok": True})
 # TEST-TIER-END tests/test_app_server.py::AppServerTests.test_notification_backpressure_preserves_long_stream_and_wakes_for_rpc
-
-
-
-class OutputTests(_support.OutputTests):
-# TEST-TIER-BEGIN tests/test_app_server.py::OutputTests.test_serialized_output_gapless_events_lone_surrogates_and_cancelled_blocked_flush
-    async def test_serialized_output_gapless_events_lone_surrogates_and_cancelled_blocked_flush(self) -> None:
-        read, write = os.pipe()
-        output = Output(write)
-        events = EventStream(output)
-        try:
-            events.emit("started")
-            events.emit("text", {"text": "\ud800"})
-            await events.finish()
-            raw = os.read(read, 8192).decode()
-            records = [object_value(loads(line)) for line in raw.splitlines()]
-            self.assertEqual([record["seq"] for record in records], [1, 2, 3])
-            self.assertEqual([record["type"] for record in records], ["started", "text", "finished"])
-            events.emit("text", {"text": "late"})
-            self.assertEqual(events.sequence, 3)
-            blocked = EventStream(output)
-            blocked.emit("text", {"text": "x" * (1024 * 1024)})
-            cancellation = Cancellation()
-            task = asyncio.create_task(blocked.flush(cancellation))
-            await asyncio.sleep(0.02)
-            cancellation.abort()
-            with self.assertRaises(Failure):
-                await asyncio.wait_for(task, 0.3)
-            blocked.abandon()
-            self.assertTrue(output.abandoned)
-            await asyncio.gather(*blocked.tasks, return_exceptions=True)
-        finally:
-            output.abandon()
-            os.close(read)
-# TEST-TIER-END tests/test_app_server.py::OutputTests.test_serialized_output_gapless_events_lone_surrogates_and_cancelled_blocked_flush
-
-# TEST-TIER-BEGIN tests/test_app_server.py::OutputTests.test_broken_output_aborts_writer_and_text_mode_uses_node_unicode_replacement
-    async def test_broken_output_aborts_writer_and_text_mode_uses_node_unicode_replacement(self) -> None:
-        read, write = os.pipe()
-        output = Output(write)
-        events = EventStream(output)
-        events.text_only = True
-        try:
-            events.emit("text", {"text": "\ud800\ud83d\ude00"})
-            await events.flush()
-            self.assertEqual(os.read(read, 8192), "�😀".encode())
-            os.close(read)
-            stopped = asyncio.Event()
-            output.on_error = stopped.set
-            events.emit("text", {"text": "broken"})
-            with self.assertRaises(BrokenPipeError):
-                await events.flush()
-            self.assertTrue(stopped.is_set())
-        finally:
-            output.abandon()
-# TEST-TIER-END tests/test_app_server.py::OutputTests.test_broken_output_aborts_writer_and_text_mode_uses_node_unicode_replacement

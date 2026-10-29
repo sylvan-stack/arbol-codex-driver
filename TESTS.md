@@ -4,11 +4,11 @@ Both tiers have uncommented source. Only the top-tier cases below may be selecte
 
 [Mid-tier descriptions and justifications](MID_TIER.md) · [Complete inventory and tier justifications](docs/test-inventory.md) · [Machine-readable inventory](test-tiers.json)
 
-Reviewed revision: `7db318307aa04f172b1d4daecf3262215ef759eb` (28 October 2026), plus the preceding local pruning changes. No tests were run for this reset.
+Reviewed revision: `0c596c5960c34039bd48d05df9b66b4ea9f31680` under SYL-327 (29 October 2026). No tests were run.
 
 ## Selection and limits
 
-2 top-tier inventory entries and 137 mid-tier entries are available. Definitions, scenarios, programs and entry points overlap; this is not a runtime suite count. Mid-tier source remains uncommented at the owner's request. Provisional classifications are execution decisions, not semantic approval. Low-tier removals remain removed.
+2 top-tier inventory entries and 49 mid-tier entries are available after the higher-bar review. 88 low-tier entries were removed under SYL-327. Definitions, scenarios, programs and entry points overlap; this is not a runtime suite count. Top-tier bodies are unchanged. Retained mid-tier sources remain uncommented.
 
 ## Active top tier
 
@@ -38,3 +38,7 @@ PYTHONPATH=src:tests:tests/top python -m unittest test_top_app_server.AppServerT
 For a Python method, use the same fixture setup as the top tier, put the mid folder on PYTHONPATH, and select `test_mid_<module>.Class.test_method`. Mycel's fixture-aware runner accepts `--tests tests/mid --select test_mid_<module>.Class.test_method`; store cases require explicit disposable-store settings. Archived scenarios and programs retain their original compatibility entry paths.
 
 Restoration under SYL-326 used static checks only. No tests, Builds, provider calls, Origin migrations or corpus ingest were performed. Original prerequisites and environment limits still apply.
+
+## Qualification after SYL-327
+
+The historical packaged unit gate refuses after this substantial pruning. A separately requested qualification task must review the reduced selection before restoring that gate. Individual top and mid selections remain governed by the policy above; their results cannot stand in for the former complete Build qualification.
