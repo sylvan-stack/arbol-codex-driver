@@ -87,3 +87,47 @@ class ConformanceState(_support.ConformanceState):
         await query(str(alternate), 4)  # A different path with identical metadata.
         await query(str(alternate), 4)
 # TEST-TIER-END tests/test_conformance_state.py::ConformanceState.test_version_cache_reuses_unchanged_tool_and_invalidates_path_size_and_mtime
+
+# LOW TIER — DO NOT ENABLE OR RECREATE
+# Historical examples only. Read before adding related tests; never execute.
+# LOW-TIER-BEGIN: tests/mid/test_mid_conformance_state.py::ConformanceState.test_taken_lock_polls_every_50ms_and_fails_after_10s_with_owner
+# Reason: Asserts exact mocked sleep counts and interval arithmetic for a held lock. Retained actual contention, independent subscription progress and process workflows observe the consequential locking behavior. Case reviewed: Taken lock polls every 50ms and fails after 10s with owner.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_conformance_state.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_taken_lock_polls_every_50ms_and_fails_after_10s_with_owner(self) -> None:
+#         owner = await process_owner(os.getpid())
+#         assert owner is not None
+#         lock = self.state.subscription("busy") / "lock"
+#         write_json(lock, {"owner": owner_json(owner)})
+#         original = lock.read_bytes()
+#         changed = False
+#
+#         async def change() -> None:
+#             nonlocal changed
+#             changed = True
+#
+#         for scale in (1, 100):
+#             with self.subTest(timeScale=scale):
+#                 clock = LockClock()
+#                 # Replace only this module's clock/sleep surface. The test loop
+#                 # still uses its real monotonic clock, and lock files are real.
+#                 scheduler = SimpleNamespace(sleep=clock.sleep, to_thread=asyncio.to_thread)
+#                 with (
+#                     patch.object(state_module, "time", clock),
+#                     patch.object(state_module, "asyncio", scheduler),
+#                     self.assertRaises(Failure) as caught,
+#                 ):
+#                     await self.state.with_subscription_lock("busy", change, {"ARBOL_TEST_TIME_SCALE": str(scale)})
+#                 self.assertEqual(caught.exception.result["code"], "internal")
+#                 message = str(caught.exception.result["message"])
+#                 self.assertIn(f"owner PID {owner['pid']}", message)
+#                 self.assertIn(owner["startedAt"], message)
+#                 self.assertEqual(len(clock.sleeps), 200)
+#                 self.assertTrue(all(seconds == 0.05 / scale for seconds in clock.sleeps))
+#                 self.assertAlmostEqual(clock.elapsed, 10 / scale)
+#                 self.assertFalse(changed)
+#                 self.assertEqual(lock.read_bytes(), original)
+#                 self.assertEqual(list(lock.parent.glob(".write-*")), [])
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END

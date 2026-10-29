@@ -194,3 +194,51 @@ class Continuity(_support.Continuity):
             await self.request_run({"chatSessionId": part, "history": history}, "fail", "failed")
             self.assertFalse((self.state / "subscriptions/chatgpt/chats" / (digest(part) + ".json")).exists())
 # TEST-TIER-END tests/test_accounts_continuity.py::Continuity.test_resume_vendor_refusal_and_missing_rollout_rebuild_then_failed_resume_invalidates_map
+
+# LOW TIER — DO NOT ENABLE OR RECREATE
+# Historical examples only. Read before adding related tests; never execute.
+# LOW-TIER-BEGIN: tests/mid/test_mid_accounts_continuity.py::Accounts.test_unsigned_refusals_and_malformed_state_do_not_start_vendor_or_disclose_contents
+# Reason: Repeats unsigned/malformed record refusals or a constructed owner-progress transition. Retained actual auth replacement, usage rejection and dead-owner recovery workflows supply the consequential lifecycle evidence. Case reviewed: Unsigned refusals and malformed state do not start vendor or disclose contents.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_accounts_continuity.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_unsigned_refusals_and_malformed_state_do_not_start_vendor_or_disclose_contents(self) -> None:
+#         self.scenario("C1 supported")
+#         await self.invoke(["subscriptions", "create", "--family", "chatgpt", "--label", "Unsigned", "--id", "unsigned"])
+#         for command in ("check", "models"):
+#             code, output, _ = await self.invoke(["subscriptions", command, "unsigned"])
+#             self.assertEqual(code, 1)
+#             self.assertEqual(object_value(object_value(loads(output.decode()))["error"])["code"], "not_signed_in")
+#         record = self.state / "subscriptions/unsigned/record.json"
+#         for content in ("null", '"private-malformed"', '{"id":"private-malformed"}'):
+#             record.write_text(content)
+#             code, output, error = await self.invoke(["subscriptions", "list"])
+#             self.assertEqual((code, error), (1, b""))
+#             self.assertNotIn(b"private-malformed", output)
+#         self.assertEqual(self.records(), [])
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_accounts_continuity.py::Accounts.test_live_progress_dead_and_reused_owner_recovery
+# Reason: Repeats unsigned/malformed record refusals or a constructed owner-progress transition. Retained actual auth replacement, usage rejection and dead-owner recovery workflows supply the consequential lifecycle evidence. Case reviewed: Live progress dead and reused owner recovery.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_accounts_continuity.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_live_progress_dead_and_reused_owner_recovery(self) -> None:
+#         self.scenario("C1 supported")
+#         own = await process_owner(os.getpid())
+#         assert own is not None
+#         progress = self.state / "subscriptions/chatgpt/sign-in.json"
+#         write_json(progress, {"owner": owner_json(own), "expiresAt": iso(time.time() + 300)})
+#         _, output, _ = await self.invoke(["subscriptions", "list"])
+#         self.assertEqual(object_value(cast(list[Json], loads(output.decode()))[0])["state"], "signing_in")
+#         write_json(
+#             progress,
+#             {"owner": {**owner_json(own), "startedAt": "1970-01-01T00:00:00Z"}, "expiresAt": iso(time.time() + 300)},
+#         )
+#         _, output, _ = await self.invoke(["subscriptions", "list"])
+#         self.assertEqual(object_value(cast(list[Json], loads(output.decode()))[0])["state"], "signed_in")
+#         self.assertFalse(progress.exists())
+#         self.assertEqual(self.records(), [])
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
