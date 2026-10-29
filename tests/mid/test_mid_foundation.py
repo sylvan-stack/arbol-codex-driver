@@ -202,3 +202,253 @@ class Foundation(_support.Foundation):
         self.assertIsNone(chats.entry("chatgpt", key))
         self.assertFalse(scratch.exists())
 # TEST-TIER-END tests/test_foundation.py::Foundation.test_continuity_selection_order_conditional_settlement_and_killed_owner
+
+# LOW TIER — DO NOT ENABLE OR RECREATE
+# Historical examples only. Read before adding related tests; never execute.
+# LOW-TIER-BEGIN: tests/mid/test_mid_foundation.py::Foundation.test_arguments_settings_environment_and_error_sanitization
+# Reason: Routine argument/settings/catalog/identity/history field mapping is already exercised by retained real account, history, native-schema and owner-configuration workflows. This body adds no distinct difficult invariant under the raised bar. Case reviewed: Arguments settings environment and error sanitization.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_foundation.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     def test_arguments_settings_environment_and_error_sanitization(self) -> None:
+#         command = parse_arguments(["--state-dir=/a b", "run", "hello", "--label", "x=y", "--label=z=", "--control"])
+#         self.assertEqual(command.options["state-dir"], "/a b")
+#         self.assertEqual(command.options["label"], ["x=y", "z="])
+#         for args in (
+#             [],
+#             ["--build", "1", "info"],
+#             ["info", "--control"],
+#             ["run", "--output", "other"],
+#             ["runs", "stop"],
+#             ["info", "--state-dir", "--bad"],
+#         ):
+#             with self.assertRaises(Failure):
+#                 parse_arguments(args)
+#         settings = self.folder / "settings.json"
+#         settings.write_text('{"toolPath":"/tool", "subscriptions":{"work":{"defaultModel":"a","settings":{"future":"x"}}}}')
+#         config, notices = read_settings(settings)
+#         self.assertEqual((config["toolPath"], notices), ("/tool", []))
+#         for text, field in (
+#             ('{"toolPath":"/tool", "unknown":"private-sentinel"}', "unknown"),
+#             ('{"defaultSubscripton":"private-sentinel"}', "defaultSubscripton"),
+#             ('{"subscriptions":{"work":{"defaultModle":"private-sentinel"}}}', "subscriptions.work.defaultModle"),
+#             ('{"subscriptions":{"work":{"secret":{"from":"keychain","account":"private-sentinel"}}}}',
+#              "subscriptions.work.secret.account"),
+#         ):
+#             settings.write_text(text)
+#             with self.subTest(field=field), self.assertRaises(Failure) as caught:
+#                 read_settings(settings)
+#             self.assertEqual(caught.exception.result["code"], "invalid_input")
+#             self.assertIn(str(settings), str(caught.exception))
+#             self.assertIn(field, str(caught.exception))
+#             self.assertNotIn("private-sentinel", str(caught.exception))
+#         settings.write_text('{"toolPath":false}')
+#         with self.assertRaises(Failure):
+#             read_settings(settings)
+#         env = clean_environment(
+#             {
+#                 "PATH": "/usr/bin:/bin",
+#                 "HOME": "/wrong",
+#                 "OPENAI_API_KEY": "secret",
+#                 "CODEX_TOKEN": "secret",
+#                 "NODE_OPTIONS": "bad",
+#                 "ARBOL_TEST_TIME_SCALE": "100",
+#                 "LANG": "C",
+#             },
+#             "/owner",
+#             "/private",
+#         )
+#         self.assertEqual(env, {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": "/owner", "CODEX_HOME": "/private"})
+#         failure = Failure(
+#             "tool_failed",
+#             "keep secret",
+#             {"detail": {"basis": "fields", "excerpt": "🌲" * 3000 + "secret"}, "retryAfterSeconds": 2},
+#             ("secret",),
+#         )
+#         self.assertNotIn("secret", dumps(failure.result))
+#         self.assertLessEqual(len(utf8(str(object_value(failure.result["detail"])["excerpt"]))), 1024)
+#         self.assertNotIn("retryAfterSeconds", failure.result)
+#         self.assertEqual(safe_failure(ValueError("private"))["code"], "internal")
+#         for scale in ("", "0", "-1", "nan", "Infinity", "no"):
+#             with self.assertRaises(Failure):
+#                 fixed_wait(10, {"ARBOL_TEST_TIME_SCALE": scale})
+#         self.assertEqual(fixed_wait(100, {"ARBOL_TEST_TIME_SCALE": "2"}), 0.05)
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_foundation.py::Foundation.test_build_identity_ignores_cwd_and_rejects_invalid_metadata
+# Reason: Routine argument/settings/catalog/identity/history field mapping is already exercised by retained real account, history, native-schema and owner-configuration workflows. This body adds no distinct difficult invariant under the raised bar. Case reviewed: Build identity ignores cwd and rejects invalid metadata.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_foundation.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     def test_build_identity_ignores_cwd_and_rejects_invalid_metadata(self) -> None:
+#         folder = self.folder / "artifact"
+#         folder.mkdir()
+#         write_json(folder / "build.json", {"component": "arbol-codex-driver", "build": "a", "packageVersion": "1.2.3"})
+#         self.assertEqual(build_identity(folder), {"version": "1.2.3", "build": "a"})
+#         write_json(folder / "build.json", {"component": "other", "build": "a", "packageVersion": "1.2.3"})
+#         with self.assertRaises(Failure):
+#             build_identity(folder)
+#         (folder / "build.json").write_text("null")
+#         with self.assertRaises(Failure):
+#             build_identity(folder)
+#         self.assertEqual(build_identity()["version"], "1.0.0")
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_foundation.py::Foundation.test_history_native_pairing_shell_fields_and_private_ordered_images
+# Reason: Routine argument/settings/catalog/identity/history field mapping is already exercised by retained real account, history, native-schema and owner-configuration workflows. This body adds no distinct difficult invariant under the raised bar. Case reviewed: History native pairing shell fields and private ordered images.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_foundation.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     def test_history_native_pairing_shell_fields_and_private_ordered_images(self) -> None:
+#         history: list[Object] = [
+#             {"type": "message", "role": "user", "text": "old", "images": [{"mediaType": "image/png", "data": "aQ=="}]},
+#             {
+#                 "type": "tool_call",
+#                 "name": "shell",
+#                 "input": {"command": "pwd", "cwd": "/work", "vendorOnly": "removed"},
+#                 "ok": False,
+#                 "result": {"output": "out", "exitCode": 2},
+#                 "error": "bad",
+#             },
+#             {"type": "message", "role": "assistant", "text": "reply"},
+#         ]
+#         items = history_items(history)
+#         call, result = object_value(items[1]), object_value(items[2])
+#         self.assertEqual(call["call_id"], result["call_id"])
+#         self.assertRegex(str(call["call_id"]), r"^call_[a-zA-Z0-9]{24}$")
+#         self.assertEqual(loads(str(call["arguments"])), {"command": "pwd", "cwd": "/work"})
+#         self.assertEqual(result["output"], "out\nexit code: 2\nbad")
+#         rebuilt = labelled_history_input(
+#             history, {"text": "new", "images": [{"mediaType": "image/jpeg", "data": "b2s="}]}
+#         )
+#         self.assertIn("New message:\n\nnew", str(rebuilt["text"]))
+#         inputs = prepare_turn_input(rebuilt, self.folder)
+#         self.assertEqual(inputs[0], {"type": "text", "text": rebuilt["text"]})
+#         for index, raw in enumerate(inputs[1:]):
+#             file = Path(str(object_value(raw)["path"]))
+#             self.assertEqual(file.read_bytes(), [b"i", b"ok"][index])
+#             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_foundation.py::Foundation.test_catalog_pagination_fallback_usage_and_unknown_identifiers
+# Reason: Routine argument/settings/catalog/identity/history field mapping is already exercised by retained real account, history, native-schema and owner-configuration workflows. This body adds no distinct difficult invariant under the raised bar. Case reviewed: Catalog pagination fallback usage and unknown identifiers.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_foundation.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_catalog_pagination_fallback_usage_and_unknown_identifiers(self) -> None:
+#         self.assertEqual(
+#             normalize_account({"account": {"type": "chatgpt", "email": "u", "planType": "future", "secret": "unused"}}),
+#             {"email": "u", "plan": "future"},
+#         )
+#         self.assertIsNone(normalize_account({"account": {"type": "apiKey"}}))
+#         usage = normalize_usage(
+#             {
+#                 "rateLimits": {
+#                     "primary": {"usedPercent": 110, "windowDurationMins": 1440},
+#                     "secondary": {"usedPercent": None},
+#                     "planType": None,
+#                 }
+#             },
+#             "plus",
+#             now(),
+#         )
+#         self.assertEqual(
+#             usage["windows"],
+#             [
+#                 {
+#                     "kind": "other",
+#                     "label": "1-day window",
+#                     "usedPercent": 100,
+#                     "windowMinutes": 1440,
+#                     "limitReached": True,
+#                 },
+#                 {"kind": "other", "label": "Usage window"},
+#             ],
+#         )
+#         model: Object = {
+#             "id": "one",
+#             "displayName": "One",
+#             "hidden": False,
+#             "supportedReasoningEfforts": [{"reasoningEffort": "future"}],
+#             "defaultReasoningEffort": "future",
+#             "isDefault": False,
+#             "serviceTiers": [{"id": "future"}],
+#         }
+#         models = normalize_models([model, {**model, "id": "hidden", "hidden": True}, model])
+#         self.assertEqual(len(cast(list[Json], models["models"])), 1)
+#         requests: list[Json] = []
+#
+#         async def request(method: str, params: Json) -> Json:
+#             requests.append(params)
+#             return {"data": [model], "nextCursor": "next" if len(requests) == 1 else None}
+#
+#         self.assertEqual((await read_model_catalog(request))["source"], "tool")
+#         self.assertEqual(requests, [{"includeHidden": False}, {"includeHidden": False, "cursor": "next"}])
+#
+#         async def cyclic(method: str, params: Json) -> Json:
+#             return {"data": [model], "nextCursor": "same"}
+#
+#         self.assertEqual((await read_model_catalog(cyclic))["source"], "builtin")
+#
+#         async def rejected(method: str, params: Json) -> Json:
+#             raise Failure("credential_rejected", "Expired")
+#
+#         with self.assertRaises(Failure):
+#             await read_model_catalog(rejected)
+#         self.assertEqual(len(cast(list[Json], builtin_catalog()["models"])), 7)
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_foundation.py::Foundation.test_usage_windows_carry_no_resource_the_app_server_does_not_state
+# Reason: Routine argument/settings/catalog/identity/history field mapping is already exercised by retained real account, history, native-schema and owner-configuration workflows. This body adds no distinct difficult invariant under the raised bar. Case reviewed: Usage windows carry no resource the app server does not state.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_foundation.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     def test_usage_windows_carry_no_resource_the_app_server_does_not_state(self) -> None:
+#         # DRV-1.27, CDX-1.16, CDX-D31: `account/rateLimits/read` names no unit for a window, so `resource` is never
+#         # invented; the account's credit balance is a snapshot field, not a window's unit, and stays in `extra`.
+#         usage = normalize_usage(
+#             {
+#                 "rateLimits": {
+#                     "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 2000},
+#                     "secondary": {"usedPercent": 95, "windowDurationMins": 10080},
+#                     "credits": {"hasCredits": True, "unlimited": False, "balance": "12.5"},
+#                     "planType": "pro",
+#                 }
+#             },
+#             None,
+#             now(),
+#         )
+#         windows = usage["windows"]
+#         assert isinstance(windows, list)
+#         self.assertEqual([object_value(window)["kind"] for window in windows], ["session", "weekly"])
+#         for window in windows:
+#             self.assertNotIn("resource", object_value(window))
+#         self.assertEqual(object_value(usage["extra"])["credits"], {"hasCredits": True, "unlimited": False, "balance": "12.5"})
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_foundation.py::FamilySettings.test_an_unknown_family_setting_refuses_and_is_named
+# Reason: Routine argument/settings/catalog/identity/history field mapping is already exercised by retained real account, history, native-schema and owner-configuration workflows. This body adds no distinct difficult invariant under the raised bar. Case reviewed: An unknown family setting refuses and is named.
+# Source: arbol-codex-driver@0c596c5960c34039bd48d05df9b66b4ea9f31680:tests/mid/test_mid_foundation.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_an_unknown_family_setting_refuses_and_is_named(self) -> None:
+#         temporary = tempfile.TemporaryDirectory(prefix="codex-family-settings-")
+#         self.addCleanup(temporary.cleanup)
+#         folder = Path(temporary.name)
+#         state = State(folder / "state")
+#         state.initialize()
+#         file = folder / "settings.json"
+#         self.assertEqual((await Subscriptions(state, {}, [], file, {}).get("chatgpt"))["settings"], {})
+#         settings: Object = {"subscriptions": {"chatgpt": {"settings": {"future": "private-sentinel"}}}}
+#         with self.assertRaises(Failure) as caught:
+#             await Subscriptions(state, settings, [], file, {}).get("chatgpt")
+#         self.assertEqual(caught.exception.result["code"], "invalid_input")
+#         self.assertIn(f"{file}: unknown field subscriptions.chatgpt.settings.future", str(caught.exception))
+#         self.assertNotIn("private-sentinel", str(caught.exception))
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
