@@ -23,6 +23,7 @@ from .stand_in import ACCOUNT, CONFIG, SOURCE, VERSION, append_record, environme
 type Record = dict[str, Any]
 SCENARIOS = {
     "C4",
+    "C44",
     "C5",
     "C7",
     "C8",

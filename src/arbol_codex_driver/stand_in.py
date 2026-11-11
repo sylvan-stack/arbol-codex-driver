@@ -31,6 +31,7 @@ SUBSCRIPTION_PARTS = {
 }
 RUN_SCENARIOS = {
     "C5",
+    "C44",
     "C7",
     "C8",
     "C9",
@@ -110,6 +111,8 @@ def environment_checks(home: str | None) -> Record:
         "home": home,
         "privateHome": private,
         "source": SOURCE,
+        **{key: os.environ[name] for key, name in (("arbolRoot", "ARBOL_ROOT"), ("arbolChat", "ARBOL_CHAT"))
+           if name in os.environ},  # C44: launch identity (DRV-2.37); identifiers, not secrets
         "injectedVariablesAbsent": all(
             not name.startswith("OPENAI_")
             and (not name.startswith("CODEX_") or name == "CODEX_HOME")
