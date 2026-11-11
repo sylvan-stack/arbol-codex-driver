@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import test_owner_setup as _support
-from test_owner_setup import (Failure ,HEADER ,PRIVATE ,asyncio ,dumps)
+from test_owner_setup import HEADER, PRIVATE, Failure, asyncio, dumps
 
 
 class OwnerDiagnostics(_support.OwnerDiagnostics):

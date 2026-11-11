@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import test_privacy as _support
-from test_privacy import (Capture ,EventStream ,Object ,Output ,cast ,loads)
+from test_privacy import Capture, EventStream, Object, Output, cast, loads
 
 
 class EventPrivacy(_support.EventPrivacy):

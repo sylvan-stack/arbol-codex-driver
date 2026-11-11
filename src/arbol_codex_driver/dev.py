@@ -4,7 +4,7 @@
 import asyncio
 import uuid
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from .cancellation import Cancellation, interruptible
 from .dev_support import (
@@ -62,7 +62,8 @@ def read_schema(directory: Path, name: str) -> Json:
 async def probe(
     subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
-    return await _mid_tier_namespace()['probe'](subscriptions, inherited, cancellation)
+    result: tuple[int, Object] = await _mid_tier_namespace()['probe'](subscriptions, inherited, cancellation)
+    return result
 
 
 async def check_account(subscriptions: Subscriptions, refresh: bool = True) -> Object:
@@ -190,16 +191,19 @@ async def execute_run(
 async def live_check(
     build_only: bool, subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
-    return await _mid_tier_namespace()['live_check'](build_only, subscriptions, inherited, cancellation)
+    result: tuple[int, Object] = await _mid_tier_namespace()['live_check'](
+        build_only, subscriptions, inherited, cancellation
+    )
+    return result
 
 # Archived complete imports; restore needed names in their original scope, not at this file tail.
 
 
-def _mid_tier_namespace():
+def _mid_tier_namespace() -> dict[str, Any]:
     """Load test-only code on explicit invocation, leaving normal product imports alone."""
+    import sys as _tier_sys
     from pathlib import Path as _TierPath
     from types import ModuleType as _TierModule
-    import sys as _tier_sys
     name = __name__ + '.__mid_tier'
     if name not in _tier_sys.modules:
         path = _TierPath(__file__).resolve().parents[2] / 'tests/mid/archived/src/arbol_codex_driver/dev.py'

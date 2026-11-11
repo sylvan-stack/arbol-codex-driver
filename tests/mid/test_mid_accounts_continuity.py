@@ -2,7 +2,19 @@
 from __future__ import annotations
 
 import test_accounts_continuity as _support
-from test_accounts_continuity import (ENTRY ,Json ,Object ,asyncio ,cast ,digest ,loads ,now ,object_value ,parse_owner ,write_json)
+from test_accounts_continuity import (
+    ENTRY,
+    Json,
+    Object,
+    asyncio,
+    cast,
+    digest,
+    loads,
+    now,
+    object_value,
+    parse_owner,
+    write_json,
+)
 
 
 class Accounts(_support.Accounts):

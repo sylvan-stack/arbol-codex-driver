@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import test_conformance_state as _support
-from test_conformance_state import (asyncio ,inspect_tool ,object_value ,os ,read_json ,shlex ,write_json)
+from test_conformance_state import asyncio, inspect_tool, object_value, os, read_json, shlex, write_json
 
 
 class ConformanceState(_support.ConformanceState):

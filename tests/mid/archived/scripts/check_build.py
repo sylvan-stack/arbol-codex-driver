@@ -1,15 +1,14 @@
 """Check the program in its final Build folder, without starting a registry launcher."""
 
 from __future__ import annotations
-import pwd
-import unittest
-
 
 import argparse
 import json
 import os
+import pwd
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 from typing import Any
 
