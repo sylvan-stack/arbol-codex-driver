@@ -31,7 +31,7 @@ class RunRequest:
     labels: Object | None = None
     control: bool = False
     output: str = "events"
-    arbol_chat_identity: tuple[str, str] | None = None
+    arbol_chat_id: str | None = None
 
 
 async def read_run_request(
@@ -110,14 +110,15 @@ async def read_run_request(
         if key in value and (not isinstance(value[key], str) or not value[key]):
             bad(f"Invalid request field {key}.")
     chat_id = string(value.get("chatSessionId"))
-    arbol_chat_identity = None
+    arbol_chat_id = None
     if "rootId" in value:
-        root_id = value["rootId"]
-        if not isinstance(root_id, str) or not re.fullmatch(r"[a-z0-9]+", root_id):
-            raise Failure("invalid_input", "Invalid request field rootId.")
+        bad("The legacy rootId field is not accepted.")
+    if "arbolChat" in value:
+        if value["arbolChat"] is not True:
+            bad("arbolChat must be true when supplied.")
         if chat_id is None or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", chat_id):
-            raise Failure("invalid_input", "rootId requires a lower-case chatSessionId UUID with hyphens.")
-        arbol_chat_identity = (root_id, chat_id)
+            bad("arbolChat requires a lower-case chatSessionId UUID with hyphens.")
+        arbol_chat_id = chat_id
     if "systemPrompt" in value and not isinstance(value["systemPrompt"], str):
         bad("Invalid systemPrompt.")
     settings = settings or {}
@@ -237,5 +238,5 @@ async def read_run_request(
         labels,
         options.get("control") is True,
         output,
-        arbol_chat_identity=arbol_chat_identity,
+        arbol_chat_id=arbol_chat_id,
     )

@@ -258,7 +258,7 @@ async def run(
             home=subscriptions.file(request.subscription_id, "home"),
             cwd=cwd,
             env=child_env,
-            arbol_chat_identity=request.arbol_chat_identity,
+            arbol_chat_id=request.arbol_chat_id,
             cancellation=cancellation,
             request_timeout=fixed_wait(30000, env),
             launch_identity_path=temporary / "tool-owner.txt",

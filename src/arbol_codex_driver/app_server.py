@@ -130,7 +130,7 @@ class AppServer:
         tool_path: str,
         home: Path,
         env: dict[str, str],
-        arbol_chat_identity: tuple[str, str] | None = None,
+        arbol_chat_id: str | None = None,
         cwd: Path | None = None,
         cancellation: Cancellation | None = None,
         request_timeout: float = 30,
@@ -157,9 +157,10 @@ class AppServer:
                 str(launch_identity_path),
                 tool_path,
             ]
+        # The clean environment excludes inherited Arbol identity.
         child_env = clean_environment(env, env.get("HOME") or str(Path.home()), str(home))
-        if arbol_chat_identity is not None:
-            child_env["ARBOL_ROOT"], child_env["ARBOL_CHAT"] = arbol_chat_identity
+        if arbol_chat_id is not None:
+            child_env["ARBOL_CHAT"] = arbol_chat_id
         try:
             child = await asyncio.create_subprocess_exec(
                 *arguments,
