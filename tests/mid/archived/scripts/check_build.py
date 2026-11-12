@@ -77,13 +77,22 @@ def contract(folder: Path) -> int:
 
 def live(folder: Path) -> int:
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    # The test Subscriptions live in a state directory of their own, not in the default one (DRV-D41).
-    test_state = home / "Library/Application Support/Arbol/drivers/arbol-codex-driver"
-    state = os.environ.get("ARBOL_BUILD_TEST_STATE_DIR", str(test_state))
-    if not state or not Path(state).is_absolute():
-        raise ValueError("ARBOL_BUILD_TEST_STATE_DIR must be an absolute test state directory.")
+    # Owner correction, 12 November 2026: qualify only an existing real profile directly.
+    existing_state = home / "Library/Application Support/Arbol/drivers/codex"
+    state = os.environ.get("ARBOL_BUILD_TEST_STATE_DIR", str(existing_state))
+    identifier = os.environ.get("ARBOL_BUILD_LIVE_SUBSCRIPTION", "chatgpt")
+    if not state or not Path(state).is_absolute() or not Path(state).is_dir():
+        raise ValueError("ARBOL_BUILD_TEST_STATE_DIR must name an absolute existing real state directory.")
+    if not identifier or identifier.startswith("test-"):
+        raise ValueError("Select an existing real Subscription ID; test profiles are prohibited.")
+    record = Path(state) / "subscriptions" / identifier / "record.json"
+    if not record.is_file():
+        raise ValueError("The selected real Subscription is not registered in the existing state.")
+    profile = read_object(record)
+    if profile.get("id") != identifier or profile.get("family") != "chatgpt" or profile.get("state") != "signed_in":
+        raise ValueError("The selected existing real Subscription must be signed in to ChatGPT.")
     env = {"HOME": str(home), "PATH": f"{home / '.local/bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-           "LANG": os.environ.get("LANG", "C")}
+           "LANG": os.environ.get("LANG", "C"), "ARBOL_BUILD_LIVE_SUBSCRIPTION": identifier}
     return run([str(folder / ENTRY), "dev", "build-check", "--state-dir", state], cwd=folder, env=env)
 
 

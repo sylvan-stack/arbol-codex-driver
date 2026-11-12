@@ -351,14 +351,16 @@ async def probe(
     return status, save_report(subscriptions.state, report)
 
 
-async def check_account(subscriptions: Subscriptions, refresh: bool = True) -> Object:
-    account = await subscriptions.require_signed_in(SUBSCRIPTION)
+async def check_account(subscriptions: Subscriptions, refresh: bool = True, identifier: str = "chatgpt") -> Object:
+    if not identifier or identifier.startswith("test-") or identifier not in subscriptions.ids():
+        raise Failure("invalid_input", "Select a registered real existing Subscription; test profiles are prohibited.")
+    account = await subscriptions.require_signed_in(identifier)
     if account["family"] != "chatgpt":
-        raise Failure("invalid_input", "test-chatgpt must belong to the chatgpt family.")
+        raise Failure("invalid_input", "The selected existing Subscription must belong to the chatgpt family.")
     refuse_exhausted(object_value(account.get("lastUsage")))
     if not refresh:
         return object_value(account.get("lastUsage"))
-    usage = await subscriptions.usage(SUBSCRIPTION)
+    usage = await subscriptions.usage(identifier)
     if usage.get("outcome") != "ok":
         raise Failure("tool_failed", "The test Subscription usage is unavailable; no prompt was sent.")
     refuse_exhausted(usage)
@@ -476,11 +478,12 @@ async def execute_run(
 async def live_check(
     build_only: bool, subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
+    identifier = inherited.get("ARBOL_BUILD_LIVE_SUBSCRIPTION", "chatgpt")
     checks: list[Json] = []
     report: Object = {
         "check": "dev.build-check" if build_only else "dev.live-check",
         "at": now(),
-        "subscriptionId": SUBSCRIPTION,
+        "subscriptionId": identifier,
         "turnsAttempted": 0,
         "inferenceRequests": 0,
         "inferenceCountBasis": "observed Driver started events; vendor requests and child turns can exceed this count",
@@ -495,14 +498,14 @@ async def live_check(
     directory: Path | None = None
     status = 0
     try:
-        before = await check_account(subscriptions)
+        before = await check_account(subscriptions, identifier=identifier)
         report["usageBefore"] = before
         tool = await inspect_tool(
             subscriptions.state, string(subscriptions.settings.get("toolPath")), inherited, cancellation
         )
         require_tool(tool)
         report["toolVersion"] = tool["version"]
-        model, effort = select_model(await subscriptions.models(SUBSCRIPTION))
+        model, effort = select_model(await subscriptions.models(identifier))
         report.update(model=model, **({"effort": effort} if effort else {}))
         temporary = subscriptions.state.directory / "tmp"
         private_directory(temporary)
@@ -518,10 +521,10 @@ async def live_check(
             history: list[Json] | None = None,
         ) -> tuple[list[Object], str]:
             assert directory is not None
-            await check_account(subscriptions)
+            await check_account(subscriptions, identifier=identifier)
             cancellation.check()
             request: Object = {
-                "subscriptionId": SUBSCRIPTION,
+                "subscriptionId": identifier,
                 "model": model,
                 "tools": "all" if tools else "none",
                 "history": history or [],
@@ -682,7 +685,7 @@ async def live_check(
         # unavailable outcome instead of silently claiming the old usage value.
         if before:
             try:
-                after = await subscriptions.usage(SUBSCRIPTION)
+                after = await subscriptions.usage(identifier)
             except Exception as failure:
                 after = {"outcome": "unavailable", "fetchedAt": now(), "windows": [], "error": safe_failure(failure)}
             report.update(usageAfter=after, usageChange=usage_change(before, after))

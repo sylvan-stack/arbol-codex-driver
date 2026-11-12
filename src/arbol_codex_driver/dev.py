@@ -8,7 +8,6 @@ from typing import Any, cast
 
 from .cancellation import Cancellation, interruptible
 from .dev_support import (
-    SUBSCRIPTION,
     driver_environment,
     refuse_exhausted,
     stop_child,
@@ -66,14 +65,16 @@ async def probe(
     return result
 
 
-async def check_account(subscriptions: Subscriptions, refresh: bool = True) -> Object:
-    account = await subscriptions.require_signed_in(SUBSCRIPTION)
+async def check_account(subscriptions: Subscriptions, refresh: bool = True, identifier: str = "chatgpt") -> Object:
+    if not identifier or identifier.startswith("test-") or identifier not in subscriptions.ids():
+        raise Failure("invalid_input", "Select a registered real existing Subscription; test profiles are prohibited.")
+    account = await subscriptions.require_signed_in(identifier)
     if account["family"] != "chatgpt":
-        raise Failure("invalid_input", "test-chatgpt must belong to the chatgpt family.")
+        raise Failure("invalid_input", "The selected existing Subscription must belong to the chatgpt family.")
     refuse_exhausted(object_value(account.get("lastUsage")))
     if not refresh:
         return object_value(account.get("lastUsage"))
-    usage = await subscriptions.usage(SUBSCRIPTION)
+    usage = await subscriptions.usage(identifier)
     if usage.get("outcome") != "ok":
         raise Failure("tool_failed", "The test Subscription usage is unavailable; no prompt was sent.")
     refuse_exhausted(usage)
