@@ -16,15 +16,15 @@ from .errors import Failure, safe_text
 from .json_types import Json, Object, dumps, loads, object_value, string
 from .owner_setup import DiagnosticScrubber, sanitize_diagnostic
 from .process_groups import collect_process_groups, end_process_groups, force_process_groups
-from .state import Owner, atomic_write, fixed_wait, owner_json, private_directory, process_owner
+from .state import Owner, fixed_wait, owner_json, private_directory, process_owner
 from .tool import OLDEST_SUPPORTED, supported_version
 
-DRIVER_CONFIG = 'check_for_update_on_startup = false\nweb_search = "live"\ncli_auth_credentials_store = "file"\n\n[analytics]\nenabled = false\n\n[features]\nmemories = false\n'
-
-
-def write_driver_config(home: Path) -> None:
-    private_directory(home)
-    atomic_write(home / "config.toml", DRIVER_CONFIG)
+APP_SERVER_OPTIONS = (
+    "--disable", "memories",
+    "-c", "check_for_update_on_startup=false",
+    "-c", "analytics.enabled=false",
+    "-c", 'web_search="live"',
+)
 
 
 def validate_driver_config(value: Json) -> Object:
@@ -32,7 +32,6 @@ def validate_driver_config(value: Json) -> Object:
     if (
         config.get("check_for_update_on_startup") is not False
         or config.get("web_search") != "live"
-        or config.get("cli_auth_credentials_store") != "file"
         or object_value(config.get("analytics")).get("enabled") is not False
         or object_value(config.get("features")).get("memories") is not False
     ):
@@ -148,17 +147,17 @@ class AppServer:
         isolated_home = home.absolute() if home is not None else None
         home = isolated_home if isolated_home is not None else Path(owner_home) / ".codex"
         if isolated_home is not None:
-            write_driver_config(isolated_home)
+            private_directory(isolated_home)
         identity = build_identity()
-        arguments = [tool_path, "app-server"]
+        arguments = [tool_path, "app-server", *APP_SERVER_OPTIONS]
         if launch_identity_path is not None:
             arguments = [
                 "/bin/sh",
                 "-c",
-                'umask 077; ledger="$1.write"; { printf "%s\\n" "$$"; TZ=UTC LC_ALL=C /bin/ps -p "$$" -o lstart=; } > "$ledger" && /bin/mv -f "$ledger" "$1" || exit 1; exec "$2" app-server',
+                'umask 077; ledger="$1.write"; { printf "%s\\n" "$$"; TZ=UTC LC_ALL=C /bin/ps -p "$$" -o lstart=; } > "$ledger" && /bin/mv -f "$ledger" "$1" || exit 1; shift; exec "$@"',
                 "arbol-codex-launch",
                 str(launch_identity_path),
-                tool_path,
+                *arguments,
             ]
         # The clean environment excludes inherited Arbol identity.
         child_env = clean_environment(env, owner_home, str(isolated_home) if isolated_home is not None else None)
