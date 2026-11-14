@@ -573,55 +573,61 @@ class Subscriptions:
             timer = asyncio.get_running_loop().call_later(max(0.001, expiration - time.time()), cancellation.abort)
             if self.cancellation is not None:
                 relay = asyncio.create_task(forward_stop())
-            if not by_code:
-                await self.local_login(id_, progress)
             own = progress
 
             async def spawned(tool: Owner) -> None:
                 await self.set_tool(id_, own, tool)
 
             server = await self.start(id_, spawned, cancellation)
-            result = object_value(
-                await server.request(
-                    "account/login/start",
-                    {"type": "chatgptDeviceCode" if by_code else "chatgpt"},
-                    cancellation=cancellation,
+            account = None
+            if id_ == "chatgpt":
+                account = normalize_account(
+                    await server.request("account/read", {"refreshToken": False}, cancellation=cancellation)
                 )
-            )
-            login_id = string(result.get("loginId"))
-            if login_id is None:
-                raise Failure("tool_failed", "Codex returned an unreadable sign-in answer.")
-            address = string(result.get("verificationUrl" if by_code else "authUrl"))
-            if address is None or by_code and not isinstance(result.get("userCode"), str):
-                raise Failure("tool_failed", "Codex returned no sign-in address.")
-            try:
-                url = urlsplit(address)
-            except ValueError:
-                raise Failure("tool_failed", "Codex returned an invalid sign-in address.") from None
-            if url.scheme != "https" or url.hostname != "auth.openai.com" or url.username or url.password:
-                raise Failure("tool_failed", "Codex returned an unexpected sign-in host.")
-            await emit(
-                {
-                    "step": "open_url",
-                    "url": address,
-                    "allowedHosts": ["auth.openai.com", "127.0.0.1"],
-                    "expiresAt": progress["expiresAt"],
-                    **({"userCode": result["userCode"]} if by_code else {}),
-                }
-            )
-            completed = object_value(
-                await server.wait_for_notification(
-                    "account/login/completed",
-                    lambda value: object_value(value).get("loginId") == login_id,
-                    cancellation=cancellation,
-                    timeout=max(0.001, expiration - time.time()),
+            if account is None:
+                if not by_code:
+                    await self.local_login(id_, progress)
+                result = object_value(
+                    await server.request(
+                        "account/login/start",
+                        {"type": "chatgptDeviceCode" if by_code else "chatgpt"},
+                        cancellation=cancellation,
+                    )
                 )
-            )
-            if completed.get("success") is not True:
-                raise Failure("vendor_error", string(completed.get("error")) or "Codex sign-in failed.")
-            account = normalize_account(
-                await server.request("account/read", {"refreshToken": False}, cancellation=cancellation)
-            )
+                login_id = string(result.get("loginId"))
+                if login_id is None:
+                    raise Failure("tool_failed", "Codex returned an unreadable sign-in answer.")
+                address = string(result.get("verificationUrl" if by_code else "authUrl"))
+                if address is None or by_code and not isinstance(result.get("userCode"), str):
+                    raise Failure("tool_failed", "Codex returned no sign-in address.")
+                try:
+                    url = urlsplit(address)
+                except ValueError:
+                    raise Failure("tool_failed", "Codex returned an invalid sign-in address.") from None
+                if url.scheme != "https" or url.hostname != "auth.openai.com" or url.username or url.password:
+                    raise Failure("tool_failed", "Codex returned an unexpected sign-in host.")
+                await emit(
+                    {
+                        "step": "open_url",
+                        "url": address,
+                        "allowedHosts": ["auth.openai.com", "127.0.0.1"],
+                        "expiresAt": progress["expiresAt"],
+                        **({"userCode": result["userCode"]} if by_code else {}),
+                    }
+                )
+                completed = object_value(
+                    await server.wait_for_notification(
+                        "account/login/completed",
+                        lambda value: object_value(value).get("loginId") == login_id,
+                        cancellation=cancellation,
+                        timeout=max(0.001, expiration - time.time()),
+                    )
+                )
+                if completed.get("success") is not True:
+                    raise Failure("vendor_error", string(completed.get("error")) or "Codex sign-in failed.")
+                account = normalize_account(
+                    await server.request("account/read", {"refreshToken": False}, cancellation=cancellation)
+                )
             cancellation.check()
             if account is None:
                 raise Failure(
