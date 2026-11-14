@@ -7,9 +7,26 @@ The base (SYL-79), Subscription operations (SYL-81), fresh inference runs
 tools, child agents and owner setup (SYL-90), errors, retries, clocks and
 run-derived usage (SYL-91), and packaged probes and conformance (SYL-92)
 are implemented. `run` validates its request and account, starts one
-private-home app-server, streams answer and reasoning blocks with gapless
+native-home app-server for canonical `chatgpt`, streams answer and reasoning blocks with gapless
 sequence numbers, reports token totals, and ends with one final event after
 cleanup. Runs in progress are visible through `runs list`.
+
+Production has one canonical Subscription, `chatgpt`, using the owner's native
+Codex sign-in and default `~/.codex` home with the real HOME. It sets no
+`CODEX_HOME`, inherits no `CODEX_*` or `OPENAI_*` configuration, and writes no
+native configuration or authentication files. Creating a second Subscription,
+signing `chatgpt` out and removing it all refuse with `invalid_input`, including
+`--force`; sign out in `codex` itself. Sign-in first asks the app-server for the
+current account and returns `done` for an existing ChatGPT login. It starts a
+browser/device login only when no ChatGPT account is present, and cancellation
+never logs the native account out.
+
+ABR-41 restores this boundary in source using test-free static checks. It does
+not qualify the installed selected Build or native/provider behavior. ABR-38
+owns that qualification. Historical isolated homes and records stay in place;
+none is copied, relabelled or promoted to a real qualification profile. Current
+testing and Build policies are in [TESTS.md](TESTS.md); earlier commands and
+observations below retain their historical scope.
 
 | | |
 |---|---|
@@ -103,7 +120,10 @@ it. Images become private temporary `localImage` files. `--output text` prints
 complete answer blocks only. Use `--tools all --cwd <absolute-folder>` for
 unrestricted tools. A run whose tools are `none` uses Codex's read-only sandbox
 with network access off; Codex may still use a tool, whose calls are reported
-normally. Only Codex memories are switched off in its feature configuration.
+normally. The app-server receives only the accepted per-process options:
+`--disable memories -c check_for_update_on_startup=false -c analytics.enabled=false -c 'web_search="live"'`.
+The Driver checks those effective values and the handshake home; it does not
+force a credential-store setting or compare unrelated owner configuration.
 
 With a chat identifier and working folder, a completed run maps the caller's
 conversation to Codex's saved thread. The map stores identifiers, message counts
@@ -153,16 +173,16 @@ that arrive before its receiver thread is announced. The run waits for child
 turns and background commands, and gives other open calls, including child
 calls, their two-second completion grace.
 
-A tools-enabled run reads only the MCP tables from the owner's
-`~/.codex/config.toml` and forwards them in memory with `thread/start` or
-`thread/resume`. It neither imports the owner's login and other settings nor
-writes the tables to private state. Missing setup is empty; invalid setup gives
-a fixed error without file contents. Known owner table strings are scrubbed from
-every event and plain text output,
+A tools-enabled run uses the owner's native Codex settings, hooks, plug-ins,
+skills, MCP servers and instructions. The Driver reads only the MCP tables from
+`~/.codex/config.toml` to learn private strings for output redaction; it forwards
+no tables in `thread/start` or `thread/resume` and writes none. Missing,
+unreadable or malformed setup supplies no scrub strings and leaves validation
+to Codex. Known table strings are scrubbed from events and plain text output,
 including values split across streamed chunks. Assistant fingerprints use the
-redacted answer the caller receives. Codex discovers the owner's
-`~/.agents/skills` using the
-real HOME; no skill links or copies are written. An MCP server needing its own
+redacted answer the caller receives. No skill links, setup copies or native
+session-file scans are made. Codex itself discovers the owner's setup through
+its native home and the real HOME. An MCP server needing its own
 sign-in can report that; its sign-in workflow remains unspecified.
 
 The explicit checks `scripts/check_tools.py probe --output <file>` and
@@ -205,13 +225,14 @@ changed record values are synthetic test variants. Account and run RPC shapes
 come from the same recorded runs, with synthetic failures, pagination,
 concurrency, usage counts and oversized output.
 
-Every account child uses its Subscription's private `CODEX_HOME`; Codex keeps
-and renews the login there. Sign-in lasts in one command and emits JSON lines.
-Use `subscriptions sign-in <id> --by-code` for a device code. Replacing a login,
-ending its command or reaching five minutes cancels it and cleans up its child.
-Status checks renew through Codex, usage caches the last good report, and model
-catalogs include the tool's efforts and service tiers, with a marked built-in
-fallback. The Driver never reads or copies a credential file.
+Historical isolated-account implementation, before the accepted native-home
+boundary: every account child used its Subscription's private `CODEX_HOME`,
+and Codex kept and renewed the login there. Those records and observations
+remain recoverable. Current production account operations use the native
+`chatgpt` binding described above. Sign-in still emits JSON lines and supports
+`subscriptions sign-in chatgpt --by-code`; its existing timeout, attempt fences
+and owned-child cleanup remain. Status/usage/model requests use the app-server,
+and the Driver never reads or copies a credential file.
 
 Recorded vendor evidence remains in the Artifact Corpus:
 `research/base-info-2026-10-07.json`, `research/subscriptions-2026-10-07.json`,
