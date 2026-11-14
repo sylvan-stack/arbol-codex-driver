@@ -141,7 +141,7 @@ async def run(
                 raise Failure("in_use", "An account operation is still in progress.")
             record = await runs.reserve(parsed.run_id, parsed.subscription_id, parsed.labels, parsed.chat_session_id)
             reserved_id = parsed.run_id
-            plan = await chats.select(parsed, subscriptions.file(parsed.subscription_id, "home"))
+            plan = await chats.select(parsed)
             for key in ("conversation", "continuedConversation"):
                 if key in plan:
                     record[key] = plan[key]

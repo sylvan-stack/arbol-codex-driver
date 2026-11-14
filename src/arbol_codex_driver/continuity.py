@@ -80,16 +80,6 @@ def message_digest(items: list[Object]) -> Fingerprint:
     return stream.snapshot()
 
 
-def saved_conversation(home: Path, conversation: str) -> bool:
-    suffix = "-" + conversation + ".jsonl"
-    return any(
-        path.is_file() and path.name.startswith("rollout-") and path.name.endswith(suffix)
-        for directory in (home / "sessions", home / "archived_sessions")
-        for path in directory.rglob("*")
-        if directory.exists()
-    )
-
-
 class Chats:
     def __init__(self, state: State) -> None:
         self.state = state
@@ -134,7 +124,7 @@ class Chats:
             )
         }
 
-    async def select(self, request: RunRequest, home: Path) -> Object:
+    async def select(self, request: RunRequest) -> Object:
         if not request.history:
             return {"continuity": "fresh"}
 
@@ -153,8 +143,6 @@ class Chats:
             return rebuilt("working_folder_changed")
         if entry["systemPromptDigest"] != digest(request.system_prompt or ""):
             return rebuilt("system_prompt_changed")
-        if not saved_conversation(home, str(entry["conversation"])):
-            return rebuilt("conversation_gone")
         directory = self.state.directory / "runs"
         for file in directory.glob("*.json"):
             if file.name.startswith("."):
