@@ -326,3 +326,199 @@ def verify_payload(root: Path, component: str = COMPONENT, *, expected_build: st
             return Payload(root, parsed, entries)
     except (OSError, ValueError, RuntimeError, RecursionError, UnicodeError):
         raise invalid() from None
+
+
+@dataclass(frozen=True)
+class Authority:
+    """Verified static tuple; a live admission handshake is still required."""
+
+    registry: Path
+    registry_sha256: str
+    producer: Payload
+    provider: Payload
+    gate_sha256: str
+    acceptance_sha256: str
+    status: str
+    launchers: tuple[tuple[str, Path, str], ...]
+
+
+DRIVER_COMPONENTS = (
+    "arbol-claude-driver", "arbol-codex-driver", "arbol-mimo-driver", "arbol-pi-driver"
+)
+
+
+def registry_identity(registry: Path) -> str:
+    from .identity_protocol import canonical_bytes
+
+    with PrivateDirectory(registry) as root:
+        return sha256(canonical_bytes({"path": str(root.path), "device": root.info.st_dev, "inode": root.info.st_ino}))
+
+
+def _required(directory: PrivateDirectory, name: str) -> bytes:
+    value = directory.read(name)
+    if value is None:
+        raise invalid()
+    return value
+
+
+def _registered_root(registry: Path, component: str, number: str) -> Path:
+    root = registry / component / build_number(number)
+    with PrivateDirectory(root) as directory:
+        record = parse_bytes(_required(directory, "build.json"), canonical=False)
+        if not isinstance(record, dict) or record.get("component") != component or record.get("build") != number:
+            raise invalid()
+    return physical_path(str(root / "driver-payload"))
+
+
+def _provider(registry: Path, expected_digest: str) -> Payload:
+    matches: list[Payload] = []
+    with PrivateDirectory(registry / "arbol") as builds:
+        names = os.listdir(builds.fd)
+        if len(names) > MANIFEST_ENTRIES:
+            raise invalid()
+        for number in names:
+            if re.fullmatch(r"[1-9a-f][0-9a-f]*", number) is None:
+                continue
+            # Only the exact registered descriptor may select a provider;
+            # defaults, source checkouts and executable paths supply no proof.
+            # Legacy registered Builds may coexist without a new payload.
+            # Missing new metadata is not a competing qualified provider.
+            with PrivateDirectory(registry / "arbol" / number) as build_directory:
+                try:
+                    info = os.stat("driver-payload", dir_fd=build_directory.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    raise invalid()
+            root = _registered_root(registry, "arbol", number)
+            with PrivateDirectory(root) as directory:
+                declaration = directory.read(DECLARATION)
+            if declaration is not None and sha256(declaration) == expected_digest:
+                matches.append(verify_payload(root, "arbol", expected_build=number))
+        builds.check()
+    if len(matches) != 1:
+        raise invalid()
+    return matches[0]
+
+
+def _launcher(path: Path, expected_digest: str) -> None:
+    path = physical_path(str(path))
+    # Launcher directories need not be private; exact owner/type/bytes are
+    # pinned by gate.json. Never follow a link or run the launcher to verify it.
+    with_parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.stat(path.name, dir_fd=with_parent, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or not stat.S_IMODE(info.st_mode) & 0o111:
+            raise invalid()
+        if _file_hash(with_parent, path.name, info) != expected_digest:
+            raise invalid()
+        if not same_inode(info, os.stat(path.name, dir_fd=with_parent, follow_symlinks=False)):
+            raise invalid()
+    finally:
+        os.close(with_parent)
+
+
+def verify_authority(
+    registry: Path,
+    producer: Payload,
+    *,
+    expected_registry_sha256: str,
+    expected_gate_sha256: str,
+    expected_acceptance_sha256: str,
+    isolated_scope: Path | None = None,
+) -> Authority:
+    """Check exact registry bytes under the caller's component control mutex.
+
+    isolated_scope is internal qualification scope, never an argv/env switch.
+    Normal installed and Browser callers leave it absent. No status is issued,
+    registry file written, component lease acquired or Driver state inspected.
+    """
+    try:
+        registry = physical_path(str(registry))
+        if registry_identity(registry) != digest(expected_registry_sha256):
+            raise invalid()
+        registered = _registered_root(registry, COMPONENT, producer.declaration.build)
+        if registered != producer.root or producer.declaration.component != COMPONENT:
+            raise invalid()
+        fresh_producer = verify_payload(registered, expected_build=producer.declaration.build)
+        if fresh_producer != producer:
+            raise invalid()
+        qualification = registry / ".driver-qualification"
+        with PrivateDirectory(qualification) as directory:
+            gate_bytes = _required(directory, "gate.json")
+        if sha256(gate_bytes) != digest(expected_gate_sha256):
+            raise invalid()
+        gate = object_fields(parse_bytes(gate_bytes), {"version", "kind", "providerPayloadSha256", "components"})
+        integer(gate["version"], 1, 1)
+        if gate["kind"] != "driver-gate" or not isinstance(gate["components"], list):
+            raise invalid()
+        launchers: list[tuple[str, Path, str]] = []
+        for item in gate["components"]:
+            row = object_fields(item, {"component", "launcher", "launcherSha256"})
+            component = _text(row["component"])
+            path = physical_path(row["launcher"])
+            checksum = digest(row["launcherSha256"])
+            _launcher(path, checksum)
+            launchers.append((component, path, checksum))
+        if tuple(component for component, _, _ in launchers) != DRIVER_COMPONENTS:
+            raise invalid()
+        provider = _provider(registry, digest(gate["providerPayloadSha256"]))
+        selected_digest = digest(expected_acceptance_sha256)
+        with PrivateDirectory(registry / COMPONENT / ".driver-admission") as directory:
+            selected_bytes = _required(directory, "qualification.json")
+        selected = object_fields(parse_bytes(selected_bytes), {"version", "component", "acceptanceSha256"})
+        integer(selected["version"], 1, 1)
+        if selected["component"] != COMPONENT or selected["acceptanceSha256"] != selected_digest:
+            raise invalid()
+        with PrivateDirectory(qualification / "acceptances") as directory:
+            accepted_bytes = _required(directory, selected_digest + ".json")
+        if sha256(accepted_bytes) != selected_digest:
+            raise invalid()
+        accepted = object_fields(parse_bytes(accepted_bytes), {
+            "version", "kind", "status", "scope", "contract", "providerPayloadSha256", "producerPayloadSha256",
+            "gateSha256", "platform", "evidenceSha256",
+        })
+        integer(accepted["version"], 1, 1)
+        status = _text(accepted["status"])
+        if (
+            accepted["kind"] != "driver-qualification"
+            or status not in ("candidate", "qualified")
+            or accepted["contract"] != "DRV-browser-identity-1"
+            or physical_path(accepted["scope"]) != registry
+            or accepted["providerPayloadSha256"] != provider.declaration.payload_sha256
+            or accepted["producerPayloadSha256"] != producer.declaration.payload_sha256
+            or accepted["gateSha256"] != expected_gate_sha256
+        ):
+            raise invalid()
+        digest(accepted["evidenceSha256"])
+        platform = object_fields(accepted["platform"], {"system", "release", "machine"})
+        current = os.uname()
+        if (platform["system"], platform["release"], platform["machine"]) != (
+            "Darwin", current.release, current.machine
+        ) or current.sysname != "Darwin":
+            raise invalid()
+        if status == "candidate":
+            installed = Path.home() / "Library" / "Application Support" / "Arbol" / "builds"
+            if (
+                isolated_scope is None
+                or physical_path(str(isolated_scope)) != registry
+                or registry == installed.resolve()
+            ):
+                raise invalid()
+        # Recheck authority bytes after inventory reads. Admission code must
+        # still validate live control/boot/handoff while retaining its mutex.
+        with PrivateDirectory(qualification) as directory:
+            if _required(directory, "gate.json") != gate_bytes:
+                raise invalid()
+        with PrivateDirectory(registry / COMPONENT / ".driver-admission") as directory:
+            if _required(directory, "qualification.json") != selected_bytes:
+                raise invalid()
+        with PrivateDirectory(qualification / "acceptances") as directory:
+            if _required(directory, selected_digest + ".json") != accepted_bytes:
+                raise invalid()
+        if registry_identity(registry) != expected_registry_sha256:
+            raise invalid()
+        return Authority(registry, expected_registry_sha256, producer, provider, expected_gate_sha256,
+                         selected_digest, status, tuple(launchers))
+    except (OSError, ValueError, RuntimeError, RecursionError, UnicodeError):
+        raise invalid() from None
