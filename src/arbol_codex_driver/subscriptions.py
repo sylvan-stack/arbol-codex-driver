@@ -217,40 +217,7 @@ class Subscriptions:
     ) -> Object:
         if family != "chatgpt":
             raise Failure("invalid_input", "Choose the Subscription family chatgpt.")
-        if not isinstance(label, str) or not label:
-            raise Failure("invalid_input", "Give the new Subscription a label.")
-        number = 2
-        while True:
-            id_ = explicit_id or f"chatgpt-{number}"
-
-            async def change(id_: str = id_) -> bool:
-                if (
-                    id_ == "chatgpt"
-                    or read_json(self.file(id_, "record.json")) is not None
-                    or self.progress(id_) is not None
-                ):
-                    return False
-                time_ = now()
-                private_directory(self.file(id_, "home"))
-                write_json(
-                    self.file(id_, "record.json"),
-                    {
-                        "id": id_,
-                        "family": "chatgpt",
-                        "label": label,
-                        "auth": "vendor_login",
-                        "state": "signed_out",
-                        "createdAt": time_,
-                        "updatedAt": time_,
-                    },
-                )
-                return True
-
-            if await self.state.with_subscription_lock(id_, change, self.env):
-                return await self.get(id_)
-            if explicit_id is not None:
-                raise Failure("in_use", "That Subscription identifier already exists.")
-            number += 1
+        raise Failure("invalid_input", "ChatGPT uses the single native chatgpt Subscription; a second cannot be created.")
 
     async def reap(self, id_: str) -> None:
         pending = self.progress(id_)
@@ -718,6 +685,8 @@ class Subscriptions:
             await runs.stop(str(record["runId"]))
 
     async def sign_out(self, id_: str, force: bool = False) -> Object:
+        if id_ == "chatgpt":
+            raise Failure("invalid_input", "Sign out in codex itself; the native chatgpt Subscription cannot be signed out here.")
         await self.get(id_)
         await self.active_runs(id_, force)
         progress = await self.reserve(id_, "sign_out")
@@ -738,6 +707,8 @@ class Subscriptions:
             await self.finish(id_, progress)
 
     async def remove(self, id_: str, force: bool = False) -> None:
+        if id_ == "chatgpt":
+            raise Failure("invalid_input", "Sign out in codex itself; the native chatgpt Subscription cannot be removed.")
         await self.get(id_)
         await self.active_runs(id_, force)
         progress = await self.reserve(id_, "remove")

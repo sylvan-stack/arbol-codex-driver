@@ -50,11 +50,8 @@ async def main(args: list[str]) -> int:
         state = State(string(command.options.get("state-dir")) or default_state_directory(home))
         state.initialize()
         if command.name in (
-            "subscriptions create",
             "subscriptions update",
-            "subscriptions remove",
             "subscriptions sign-in",
-            "subscriptions sign-out",
             "subscriptions check",
             "subscriptions usage",
             "subscriptions models",
