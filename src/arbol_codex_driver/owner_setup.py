@@ -4,7 +4,7 @@ import math
 import tomllib
 from pathlib import Path
 
-from .errors import Failure, safe_text
+from .errors import safe_text
 from .json_types import Json, Object
 
 
@@ -22,7 +22,7 @@ def json_value(value: object) -> Json:
 
 
 def owner_mcp_config(env: dict[str, str]) -> Object:
-    """Read only the configured MCP tables; never import another owner setting."""
+    """Read MCP tables only for scrubbing; native Codex owns setup validation."""
     path = Path(env.get("HOME") or str(Path.home())) / ".codex" / "config.toml"
     try:
         with path.open("rb") as stream:
@@ -30,7 +30,7 @@ def owner_mcp_config(env: dict[str, str]) -> Object:
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
-        raise Failure("invalid_input", "Cannot read the owner's Codex MCP configuration.") from None
+        return {}
     if "mcp_servers" not in parsed:
         return {}
     try:
@@ -39,7 +39,7 @@ def owner_mcp_config(env: dict[str, str]) -> Object:
             raise ValueError
         return {"mcp_servers": json_value(tables)}
     except ValueError:
-        raise Failure("invalid_input", "The owner's Codex MCP configuration is not a valid JSON table.") from None
+        return {}
 
 
 def diagnostic_values(config: Object) -> tuple[str, ...]:

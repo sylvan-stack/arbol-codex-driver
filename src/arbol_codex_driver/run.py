@@ -324,8 +324,7 @@ async def run(
             try:
                 thread = await rpc(
                     "thread/resume",
-                    {"threadId": plan["conversation"], "model": model["id"],
-                     **({"config": owner_config} if owner_config else {})},
+                    {"threadId": plan["conversation"], "model": model["id"]},
                 )
             except Failure as failure:
                 if "vendorCode" not in object_value(failure.result.get("detail")) or cancellation.aborted:
@@ -344,7 +343,6 @@ async def run(
                     "model": model["id"],
                     "approvalPolicy": "never",
                     "sandbox": "read-only" if request.tools == "none" else "danger-full-access",
-                    **({"config": owner_config} if owner_config else {}),
                     **({"serviceTier": request.service_tier} if request.service_tier is not None else {}),
                     **({"developerInstructions": request.system_prompt} if request.system_prompt is not None else {}),
                     **({"ephemeral": True} if request.tools == "none" and request.working_directory is None else {}),
