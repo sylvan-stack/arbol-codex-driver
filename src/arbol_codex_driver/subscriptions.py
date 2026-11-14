@@ -7,7 +7,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import cast
 from urllib.parse import urlsplit
 
 from .app_server import AppServer
@@ -668,12 +667,12 @@ class Subscriptions:
                 await asyncio.gather(relay, return_exceptions=True)
             if server is not None:
                 if not success:
-                    for method, params in [
-                        ("account/login/cancel", cast(Object, {"loginId": login_id})),
-                        ("account/logout", cast(Object, {})),
-                    ]:
-                        if method == "account/login/cancel" and login_id is None:
-                            continue
+                    cleanup: list[tuple[str, Object]] = []
+                    if login_id is not None:
+                        cleanup.append(("account/login/cancel", {"loginId": login_id}))
+                    if id_ != "chatgpt":
+                        cleanup.append(("account/logout", {}))
+                    for method, params in cleanup:
                         try:
                             await server.request(method, params, timeout=fixed_wait(1000, self.env))
                         except Exception:
