@@ -115,7 +115,7 @@ async def inspect_tool(
         try:
             try:
                 output = await version_output(
-                    path, clean_environment(env, str(home), str(home / ".codex")), home, cancellation
+                    path, clean_environment(env, str(home)), home, cancellation
                 )
             except FileNotFoundError:
                 raise Failure(

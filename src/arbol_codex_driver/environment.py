@@ -24,6 +24,11 @@ INHERITED = (
 
 
 def clean_environment(source: dict[str, str], home: str, config_home: str | None = None) -> dict[str, str]:
+    """Inherit only the allow-list; private Codex homes are explicit overrides.
+
+    Production app-servers leave config_home unset and use the owner's HOME.
+    Vendor/account and Arbol identity variables never pass through implicitly.
+    """
     result = {key: source[key] for key in INHERITED if key in source}
     result["HOME"] = home
     if config_home is not None:
