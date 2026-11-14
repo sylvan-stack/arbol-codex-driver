@@ -255,7 +255,7 @@ async def run(
 
         server = await AppServer.start(
             tool_path=require_tool(tool),
-            home=subscriptions.file(request.subscription_id, "home"),
+            home=subscriptions.app_server_home(request.subscription_id),
             cwd=cwd,
             env=child_env,
             arbol_chat_id=request.arbol_chat_id,

@@ -128,7 +128,7 @@ class AppServer:
         cls,
         *,
         tool_path: str,
-        home: Path,
+        home: Path | None,
         env: dict[str, str],
         arbol_chat_id: str | None = None,
         cwd: Path | None = None,
@@ -144,8 +144,11 @@ class AppServer:
             cancellation.check()
         if not math.isfinite(request_timeout) or request_timeout <= 0:
             raise Failure("invalid_input", "The app-server request timeout must be a positive finite number.")
-        home = home.absolute()
-        write_driver_config(home)
+        owner_home = env.get("HOME") or str(Path.home())
+        isolated_home = home.absolute() if home is not None else None
+        home = isolated_home if isolated_home is not None else Path(owner_home) / ".codex"
+        if isolated_home is not None:
+            write_driver_config(isolated_home)
         identity = build_identity()
         arguments = [tool_path, "app-server"]
         if launch_identity_path is not None:
@@ -158,13 +161,13 @@ class AppServer:
                 tool_path,
             ]
         # The clean environment excludes inherited Arbol identity.
-        child_env = clean_environment(env, env.get("HOME") or str(Path.home()), str(home))
+        child_env = clean_environment(env, owner_home, str(isolated_home) if isolated_home is not None else None)
         if arbol_chat_id is not None:
             child_env["ARBOL_CHAT"] = arbol_chat_id
         try:
             child = await asyncio.create_subprocess_exec(
                 *arguments,
-                cwd=cwd or home,
+                cwd=cwd or (home if isolated_home is not None else Path(owner_home)),
                 env=child_env,
                 start_new_session=True,
                 stdin=asyncio.subprocess.PIPE,

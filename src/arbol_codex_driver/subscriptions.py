@@ -145,6 +145,10 @@ class Subscriptions:
     def file(self, id_: str, name: str) -> Path:
         return self.state.subscription(id_) / name
 
+    def app_server_home(self, id_: str) -> Path | None:
+        """None selects native Codex; historical isolated homes stay in place."""
+        return None if id_ == "chatgpt" else self.file(id_, "home")
+
     def record(self, id_: str) -> Object:
         value = read_json(self.file(id_, "record.json"))
         if value is not None:
@@ -282,7 +286,8 @@ class Subscriptions:
 
         async def change() -> None:
             current = self.record(id_)
-            private_directory(self.file(id_, "home"))
+            if id_ != "chatgpt":
+                private_directory(self.file(id_, "home"))
             write_json(self.file(id_, "record.json"), {**current, "label": label, "updatedAt": now()})
 
         await self.state.with_subscription_lock(id_, change, self.env)
@@ -335,7 +340,7 @@ class Subscriptions:
         tool = await inspect_tool(self.state, string(self.settings.get("toolPath")), self.env, cancellation)
         return await AppServer.start(
             tool_path=require_tool(tool),
-            home=self.file(id_, "home"),
+            home=self.app_server_home(id_),
             env=self.env,
             cancellation=cancellation,
             on_spawn=on_spawn,
