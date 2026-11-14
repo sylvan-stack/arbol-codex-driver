@@ -4,15 +4,20 @@ Registry I/O is local protocol authority, not Subscription state. Every process
 opens an independent component lease; no inherited lock or PID alone admits it.
 """
 
+from __future__ import annotations
+
 import fcntl
 import os
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
+from contextvars import Token as ContextToken
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
@@ -122,10 +127,13 @@ class Frames:
     def __init__(self, descriptor: int) -> None:
         integer(descriptor, 3)
         self.socket = socket.socket(fileno=descriptor)
-        if self.socket.family != socket.AF_UNIX or self.socket.type != socket.SOCK_STREAM:
+        try:
+            if self.socket.family != socket.AF_UNIX or self.socket.type != socket.SOCK_STREAM:
+                raise invalid()
+            os.set_inheritable(descriptor, False)
+        except BaseException:
             self.socket.close()
-            raise invalid()
-        os.set_inheritable(descriptor, False)
+            raise
         self.deadline = time.monotonic() + 20
 
     def _timeout(self) -> None:
@@ -260,11 +268,18 @@ class Registry:
                 "phase", "components", "checkpoint",
             })
             _version(status)
-            if status["kind"] != "driver-gate-deployment" or status["phase"] != "complete":
+            if status["kind"] != "driver-gate-deployment" or status["phase"] not in (
+                "staged", "closed-installed", "awaiting-boot", "boot-verified", "maintaining", "complete", "failed-closed"
+            ):
+                raise invalid()
+            if status["phase"] != "complete" and not (permit_draining and row["phase"] == "draining"):
                 raise invalid()
             canonical_uuid(status["session"])
             canonical_uuid(status["oldBoot"])
-            canonical_uuid(status["newBoot"])
+            if status["newBoot"] is not None:
+                canonical_uuid(status["newBoot"])
+            elif status["phase"] == "complete":
+                raise invalid()
             token(status["checkpoint"])
             for key in ("registrySha256", "gateSha256", "callersSha256"):
                 digest(status[key])
@@ -389,15 +404,35 @@ class Session:
     lease: int
     accepted: Object
     handoffs: dict[str, Object] = field(default_factory=dict)
+    _activity: threading.Condition = field(default_factory=threading.Condition, repr=False)
+    _spawning: int = field(default=0, init=False)
+    _closing: bool = field(default=False, init=False)
+    _abandon_complete: bool = field(default=False, init=False)
+    _entered: bool = field(default=False, init=False)
+    _context_token: ContextToken[Session | None] | None = field(default=None, init=False, repr=False)
 
     def __enter__(self) -> Session:
-        self.registry.check_lock("admission.lock", self.lease)
+        with self._activity:
+            if self._entered or self._closing or self.lease < 0:
+                raise invalid()
+            self.registry.check_lock("admission.lock", self.lease)
+            self._entered = True
+            self._context_token = _CURRENT.set(self)
         return self
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None, tb: TracebackType | None) -> None:
-        # Terminal settlement is the next accepted source leaf. Until present,
-        # never convert an active invocation into a guessed terminal result.
-        self.abandon()
+        try:
+            # CLI entry returns only after asyncio.run has joined its tasks and
+            # executor. Expected SystemExit includes failed/cancelled CLI output.
+            if kind is None or kind is SystemExit:
+                self.finish()
+            else:
+                self.abandon()
+        finally:
+            if self._context_token is not None:
+                _CURRENT.reset(self._context_token)
+                self._context_token = None
+            self._entered = False
 
     def _check(self) -> None:
         if self.lease < 0:
@@ -421,6 +456,30 @@ class Session:
             raise invalid()
 
     def spawn_helper(
+        self, arguments: list[str], *, entry: str, environment: dict[str, str] | None = None,
+        cwd: Path | None = None, stdin: int | IO[bytes] | None = None,
+        stdout: int | IO[bytes] | None = None, stderr: int | IO[bytes] | None = None,
+        start_new_session: bool = True,
+    ) -> subprocess.Popen[bytes]:
+        with self._activity:
+            if self._closing or self.lease < 0:
+                raise invalid()
+            self._spawning += 1
+        try:
+            return self._spawn_helper(
+                arguments, entry=entry, environment=environment, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr,
+                start_new_session=start_new_session,
+            )
+        finally:
+            with self._activity:
+                self._spawning -= 1
+                self._activity.notify_all()
+                # An uncertain process cannot release admission while another
+                # spawning thread can still publish registry metadata.
+                if self._abandon_complete and self._spawning == 0:
+                    self._close_owned()
+
+    def _spawn_helper(
         self, arguments: list[str], *, entry: str, environment: dict[str, str] | None = None,
         cwd: Path | None = None, stdin: int | IO[bytes] | None = None,
         stdout: int | IO[bytes] | None = None, stderr: int | IO[bytes] | None = None,
@@ -532,14 +591,84 @@ class Session:
             if frames is not None:
                 frames.close()
 
+    def _close_owned(self) -> None:
+        if self.lease >= 0:
+            descriptor, self.lease = self.lease, -1
+            os.close(descriptor)  # Never LOCK_UN another process's description.
+
+    def _settle_handoffs(self) -> None:
+        if _handoff(_read(self.registry.handoff_path(self.context["handoff"]))) != self.accepted:
+            raise invalid()
+        for handoff, expected_handoff in self.handoffs.items():
+            if expected_handoff["phase"] != "accepted":
+                raise invalid()
+            if _handoff(_read(self.registry.handoff_path(handoff))) != expected_handoff:
+                raise invalid()
+            context_path = self.registry.folder / "handoffs" / (handoff + ".context.json")
+            child_context = _context(_read(context_path))
+            context_hash = sha256(canonical_bytes(child_context))
+            if (
+                context_hash != expected_handoff["contextSha256"]
+                or {**_pending(child_context, context_hash), "phase": "accepted",
+                    "challenge": expected_handoff["challenge"]} != expected_handoff
+            ):
+                raise invalid()
+            expected_writer = _own_writer(child_context, context_hash)
+            actual = self.registry.writer(child_context["invocation"], child_context["writer"])
+            if actual not in (expected_writer, {**expected_writer, "phase": "terminal"}):
+                raise invalid()
+            # An accepted active helper owns its independent lease/obligation;
+            # parent completion neither erases it nor claims that it exited.
+
+    def finish(self) -> None:
+        deadline = time.monotonic() + 20
+        with self._activity:
+            if self.lease < 0 or self._closing:
+                raise invalid()
+            self._closing = True
+            while self._spawning and time.monotonic() < deadline:
+                self._activity.wait(max(0, deadline - time.monotonic()))
+            busy = bool(self._spawning)
+        if busy:
+            self.abandon()
+            raise invalid()
+        try:
+            with self.registry.mutex():
+                self._check()
+                self._settle_handoffs()
+                terminal = {**_own_writer(self.context, self.context_hash), "phase": "terminal"}
+                _publish(self.registry.writer_path(self.context["invocation"], self.context["writer"]), _writer(terminal))
+                self.registry.check_lock("admission.lock", self.lease)
+            with self._activity:
+                self._close_owned()
+        except BaseException:
+            self.abandon()
+            raise
+
     def abandon(self) -> None:
+        with self._activity:
+            self._closing = True
         try:
             with self.registry.mutex():
                 self.registry.custody_loss(self.context)
         finally:
-            if self.lease >= 0:
-                os.close(self.lease)
-                self.lease = -1
+            with self._activity:
+                self._abandon_complete = True
+                if self._spawning == 0:
+                    self._close_owned()
+                # If a timed-out spawning thread remains, retain this process's
+                # lease until that thread's last protocol effect, or process
+                # death. Its active record and taint remain unresolved.
+
+
+_CURRENT: ContextVar[Session | None] = ContextVar("codex_driver_admission", default=None)
+
+
+def current_session() -> Session:
+    session = _CURRENT.get()
+    if session is None or session._closing or session.lease < 0:
+        raise invalid()
+    return session
 
 
 def admit(payload: Payload, context: Path, descriptor: int, *, isolated_scope: Path | None = None) -> Session:
