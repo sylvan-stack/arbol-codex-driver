@@ -522,3 +522,60 @@ def verify_authority(
                          selected_digest, status, tuple(launchers))
     except (OSError, ValueError, RuntimeError, RecursionError, UnicodeError):
         raise invalid() from None
+
+
+def bootstrap_entry(root_path: str, entry_path: str, declaration_bytes: bytes) -> None:
+    """Complete immutable validation and select one live, mutually exclusive wire."""
+    from contextlib import AbstractContextManager
+    from importlib import import_module
+    from typing import Protocol, cast
+
+    class Factory(Protocol):
+        def __call__(
+            self, payload: Payload, context: Path, descriptor: int, *, isolated_scope: Path | None = None
+        ) -> AbstractContextManager[object]: ...
+
+    payload = verify_payload(Path(root_path))
+    with PrivateDirectory(payload.root) as directory:
+        if _required(directory, DECLARATION) != declaration_bytes:
+            raise invalid()
+    entry = physical_path(entry_path).relative_to(payload.root).as_posix()
+    if entry not in (payload.declaration.entry, *payload.declaration.helpers):
+        raise invalid()
+    pairs = (
+        ("ARBOL_DRIVER_ADMISSION_FD", "ARBOL_DRIVER_ADMISSION_CONTEXT", "admission"),
+        ("ARBOL_DRIVER_MAINTENANCE_FD", "ARBOL_DRIVER_MAINTENANCE_CONTEXT", "maintenance"),
+    )
+    selected: list[tuple[int, Path, str]] = []
+    for fd_name, path_name, module in pairs:
+        descriptor, context = os.environ.get(fd_name), os.environ.get(path_name)
+        if descriptor is None and context is None:
+            continue
+        if descriptor is None or context is None or re.fullmatch(r"[1-9][0-9]*", descriptor) is None:
+            raise invalid()
+        number = int(descriptor)
+        if number < 3 or str(number) != descriptor:
+            raise invalid()
+        # A normal parent publishes the process-bound context after spawn;
+        # the child must wait for offer before opening that final file.
+        context_path = Path(context)
+        if (
+            not context_path.is_absolute() or str(context_path) != context
+            or physical_path(str(context_path.parent)) != context_path.parent
+            or "/" in relative_path(context_path.name)
+        ):
+            raise invalid()
+        selected.append((number, context_path, module))
+    if len(selected) != 1:
+        raise invalid()
+    selected_descriptor, selected_context, selected_module = selected[0]
+    # The child keeps the exact descriptor/context locally, never forwards the
+    # inherited pair to CLI-launched vendor/version processes.
+    for fd_name, path_name, _ in pairs:
+        os.environ.pop(fd_name, None)
+        os.environ.pop(path_name, None)
+    factory = cast(Factory, import_module("." + selected_module, __package__).admit)
+    with factory(payload, selected_context, selected_descriptor):
+        from .cli import entry as cli_entry
+
+        cli_entry()
