@@ -15,10 +15,12 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from types import TracebackType
+from types import FrameType, TracebackType
 from typing import Any, Literal
 
 from arbol_codex_driver.admission import HelperHandoff, Session, current_session
@@ -756,3 +758,324 @@ class CodexH1Support:
         # stdio0/1/2 stay ordinary DEVNULL/private captures, never authority or
         # control grants. Caller must perform no application State/output after
         # this point; the REAL owning Session context alone finishes admission.
+
+
+@dataclass(frozen=True)
+class TerminalLocalResult:
+    """Actual final local callback evidence, not a provisional4da status row.
+
+    The fixed full-runner adapter creates these only after each actual unittest
+    success, including the positive H1 case's AFTER-reap persistence assertions.
+    The separate complete-body review must admit that exact callback/dataflow.
+    No wire/environment can supply a result or shortened selection.
+    """
+
+    case_id: str
+    actual_result: bytes
+
+
+@dataclass(frozen=True)
+class TerminalHelperWitness:
+    """REAL source-owned ticket/Popen/result, never reported process claims."""
+
+    ticket: HelperHandoff
+    child: subprocess.Popen[bytes]
+    owner: Identity
+    actual_result: bytes
+
+
+class CodexTerminalClose:
+    """af1 fixed final own-close fixture; no manual finish or extra authority.
+
+    The static runner nests EXACTLY as follows (not wired by this source):
+        with CodexTerminalClose(real_session) as terminal:
+            with real_session:
+                with CodexH1Support(...) as support:
+                    ... complete ALL real local/H1/tasks/output work ...
+                    terminal.arm(support, ... actual final callback evidence ...)
+    The owning Session context alone invokes finish. This OUTER fixture scope
+    stays alive through that exit, restores only its own hook, and emits NOTHING
+    after arm/finish. The full runner must catch propagated failures quietly and
+    exit unsuccessfully; it must not add a traceback/application diagnostic.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.real_close = os.close
+        self.hook = self._close
+        self.close_code = Session._close_owned.__code__
+        self.finish_code = Session.finish.__code__
+        self.exit_code = Session.__exit__.__code__
+        self.thread = threading.current_thread()
+        self.thread_id = threading.get_ident()
+        self.entered = False
+        self.armed = False
+        self.finish_may_have_begun = False
+        self.matched = False
+        self.real_close_called = False
+        self.restored = False
+        self.saved_fd = -1
+        self.saved_identity: tuple[int, int, int, int] | None = None
+        self.suite: Identity | None = None
+        self.lock_path: Path | None = None
+        self.unavailable: str | None = None
+
+    def __enter__(self) -> CodexTerminalClose:
+        require(not self.entered and not self.session._entered and self.session.lease >= 3
+                and type(self.session) is Session and os.close is self.real_close
+                and getattr(self.real_close, "__module__", None) == "posix"
+                and getattr(self.real_close, "__name__", None) == "close",
+                "Fixed terminal fixture must enclose the one REAL owning Session context.")
+        self.entered = True
+        return self
+
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
+                 traceback: TracebackType | None) -> None:
+        # NO State/metadata/stdio/evidence/diagnostic operation here. Actual
+        # Session.__exit__ already ran; restoring the OS function is not a retry
+        # of finish, terminal publication or an admission-description close.
+        changed = os.close is not self.real_close and os.close is not self.hook
+        if os.close is self.hook:
+            os.close = self.real_close
+        self.restored = not changed
+        positive_exit = (error is None or (isinstance(error, SystemExit)
+                         and (error.code is None or (type(error.code) is int and error.code == 0))))
+        if not positive_exit:
+            if error is not None and (changed or self.unavailable is not None):
+                error.add_note("Fixed own-close fixture unavailable; original real API failure retained.")
+            return
+        # Real Session.__exit__ explicitly permits SystemExit. A successful
+        # SystemExit(0) still owes every fixture observation; it cannot bypass
+        # arm/actual own-close by being classified as an arbitrary exception.
+        require(not changed and self.armed and self.matched and self.real_close_called
+                and self.unavailable is None and not self.session._entered and self.session.lease < 0,
+                "Real terminal/own-close fixture was not completed; no positive check.")
+
+    def _sole_thread(self) -> bool:
+        return (threading.current_thread() is self.thread and threading.get_ident() == self.thread_id
+                and threading.enumerate() == [self.thread])
+
+    def _original_fd(self, fd: int) -> bool:
+        if type(fd) is not int or fd != self.saved_fd or self.saved_identity is None or self.lock_path is None:
+            return False
+        held, named = os.fstat(fd), self.lock_path.lstat()
+        return (stat.S_ISREG(held.st_mode) and stat.S_ISREG(named.st_mode)
+                and held.st_nlink == named.st_nlink == 1
+                and (held.st_dev, held.st_ino, held.st_uid, stat.S_IMODE(held.st_mode)) == self.saved_identity
+                and (named.st_dev, named.st_ino, named.st_uid, stat.S_IMODE(named.st_mode)) == self.saved_identity)
+
+    def _site(self, frame: FrameType) -> bool:
+        parent = frame.f_back
+        owning_exit = None if parent is None else parent.f_back
+        return (frame.f_code is self.close_code and frame.f_locals.get("self") is self.session
+                and parent is not None and parent.f_code is self.finish_code
+                and parent.f_locals.get("self") is self.session
+                and owning_exit is not None and owning_exit.f_code is self.exit_code
+                and owning_exit.f_locals.get("self") is self.session
+                and Session.__exit__.__code__ is self.exit_code
+                and Session._close_owned.__code__ is self.close_code and Session.finish.__code__ is self.finish_code)
+
+    def _close(self, fd: int) -> None:
+        if type(fd) is not int or fd != self.saved_fd:
+            self.real_close(fd)  # All other resource closes retain real behavior.
+            return
+        # In-memory-only checks at the literal OS boundary. Do not call current_
+        # session/_check: real Codex finish already set _closing/lease=-1.
+        self.finish_may_have_begun = True
+        try:
+            exact = (not self.matched and self.armed and self._sole_thread()
+                     and self._site(sys._getframe(1)) and self._original_fd(fd)
+                     and self.suite is not None and self.suite["pid"] == os.getpid()
+                     and self.session.lease == -1 and self.session._closing and matches(self.suite))
+        except BaseException:
+            self.unavailable = "original-fd-or-site-observation-failed"
+            os.close = self.real_close
+            self.real_close_called = True
+            self.real_close(fd)
+            raise
+        if not exact:
+            # The real nonmatching close still runs unchanged, WITHOUT STOP.
+            # Its caller/API error remains original; outer scope refuses a pass.
+            self.unavailable = "saved-fd-site-thread-or-birth-mismatch"
+            os.close = self.real_close
+            self.real_close_called = True
+            self.real_close(fd)
+            return
+        self.matched = True
+        stop_error: BaseException | None = None
+        try:
+            assert self.suite is not None
+            os.kill(self.suite["pid"], signal.SIGSTOP)
+        except BaseException as error:
+            stop_error = error
+            self.unavailable = "actual-self-stop-failed"
+        finally:
+            # On CONT (or failed STOP), restore BEFORE the ONE genuine close.
+            # Never emit a postterminal message or read/write product State.
+            os.close = self.real_close
+            self.restored = True
+            self.real_close_called = True
+            self.real_close(fd)  # Original result/error, no retry or LOCK_UN.
+        if stop_error is not None:
+            raise stop_error
+
+    def _helper_rows(self, support: CodexH1Support, witnesses: Sequence[TerminalHelperWitness],
+                     expected_entries: Sequence[str]) -> list[Object]:
+        require(len(witnesses) <= 4096 and len(witnesses) == len(expected_entries)
+                and tuple(item.ticket.pending["handoff"] for item in witnesses) == tuple(self.session.handoffs),
+                "Actual full helper schedule is missing/extra/reordered.")
+        require(support.ticket is not None and support.child is not None and support.child_owner is not None
+                and any(item.ticket is support.ticket and item.child is support.child for item in witnesses),
+                "Actual positive H1 ticket/Popen is absent from terminal settlement.")
+        rows: list[Object] = []
+        for index, (item, expected_entry) in enumerate(zip(witnesses, expected_entries, strict=True)):
+            ticket, child = item.ticket, item.child
+            require(ticket.parent is self.session and ticket.completed and ticket._closed
+                    and ticket.pending["phase"] == "accepted"
+                    and ticket.pending["entry"] == expected_entry
+                    and expected_entry in self.session.authority.producer.declaration.helpers
+                    and type(child.pid) is int and child.pid == item.owner["pid"]
+                    and type(child.returncode) is int and child.returncode == 0 and child.wait(timeout=0) == 0
+                    and not matches(item.owner) and len(item.actual_result) <= 65536,
+                    "Actual helper source/ACK/direct-child reap/result is incomplete.")
+            with PrivateDirectory(ticket.context_path.parent) as directory:
+                raw = directory.read(ticket.context_path.name)
+            require(raw is not None, "Actual finished helper context is absent.")
+            assert raw is not None
+            context = document(raw)
+            require(ticket.pending["contextSha256"] == sha(raw)
+                    and context["process"] == item.owner and context["entry"] == expected_entry
+                    and context["parent"] == {"writer": self.session.context["writer"],
+                                              **identity_record(self.session.context["process"])}
+                    and all(context[key] == self.session.context[key] for key in
+                            ("invocation", "component", "epoch", "boot", "payloadSha256", "acceptanceSha256")),
+                    "Actual terminal helper context/parent/tuple differs.")
+            with self.session.registry.mutex():
+                with PrivateDirectory(ticket.context_path.parent) as directory:
+                    accepted_raw = directory.read(token(context["handoff"]) + ".json")
+                require(accepted_raw is not None and document(accepted_raw) == ticket.pending,
+                        "Actual accepted handoff differs from the source-owned completed ticket.")
+                terminal = self.session.registry.writer(context["invocation"], context["writer"])
+                expected = {"version": 1, "invocation": context["invocation"], "writer": context["writer"],
+                    "parent": self.session.context["writer"], "component": COMPONENT, "epoch": context["epoch"],
+                    "payloadSha256": context["payloadSha256"], "boot": context["boot"], **context["process"],
+                    "phase": "terminal", "contextSha256": sha(raw)}
+                require(terminal == expected and self.session.handoffs[context["handoff"]] == ticket.pending,
+                        "Really reaped helper lacks its actual original terminal/accepted handoff.")
+            if ticket is support.ticket:
+                completion = document(support.fixture.read("helper-completion.json"))
+                require(child is support.child and item.owner == support.child_owner
+                        and item.actual_result == bytes(support.buffers["stdout"])
+                        and completion["waitStatus"] == child.returncode
+                        and completion["actorResultSha256"] == sha(item.actual_result)
+                        and completion["contextSha256"] == sha(raw)
+                        and completion["terminalRecordSha256"] == sha(canonical(terminal)),
+                        "Actual positive H1 result/wait/terminal receipt differs from the terminal witness.")
+            # These source-bound receipts bind actual returned synchronous ACK,
+            # accepted context, real Popen wait and genuine terminal bytes. They
+            # never grant authority or replace the outer independent graph.
+            ack_raw = canonical({"version": 1, "kind": "abr38-terminal-helper-actual-ack", "handoff": ticket.pending,
+                "contextSha256": sha(raw), "process": item.owner,
+                "ackPath": "synchronous-acknowledge-returned-before-ticket-close"}, limit=16 * 1024)
+            for name, evidence in ((f"terminal-helper-{index:04d}.context", raw),
+                                   (f"terminal-helper-{index:04d}.terminal", canonical(terminal)),
+                                   (f"terminal-helper-{index:04d}.result", item.actual_result),
+                                   (f"terminal-helper-{index:04d}.ack", ack_raw)):
+                support.fixture.publish(name, evidence, limit=65536)
+            rows.append({"invocation": context["invocation"], "writer": context["writer"], "handoff": context["handoff"],
+                "contextSha256": sha(raw), **item.owner, "waitStatus": child.returncode,
+                "resultSha256": sha(item.actual_result), "terminalRecordSha256": sha(canonical(terminal)),
+                "ackEvidenceSha256": sha(ack_raw)})
+        return rows
+
+    def arm(self, support: CodexH1Support, *, tuple_pins_sha256: str,
+            completed_local_results: Sequence[TerminalLocalResult], finished_helpers: Sequence[TerminalHelperWitness],
+            expected_helper_entries: Sequence[str]) -> None:
+        require(self.entered and not self.armed and type(self.session) is Session
+                and current_session() is self.session and support.session is self.session
+                and support.completed and not support.console.closed and not support.cleanup_errors
+                and len(completed_local_results) == len(support.ordered) <= 4096
+                and re.fullmatch(r"[0-9a-f]{64}", tuple_pins_sha256, re.ASCII) is not None
+                and self._sole_thread() and os.close is self.real_close,
+                "Terminal arm requires the actual whole positive local/ACK/task/output completion.")
+        self.session._check()
+        with self.session._activity:
+            require(self.session._spawning == 0 and not self.session._closing,
+                    "An actual spawning/ACK worker still owns Session activity.")
+        payload = self.session.authority.producer
+        source = payload.regular_file("src/arbol_codex_driver/admission.py")
+        require(Path(self.close_code.co_filename).resolve(strict=True) == source
+                and Path(self.finish_code.co_filename).resolve(strict=True) == source
+                and Path(self.exit_code.co_filename).resolve(strict=True) == source
+                and Session.__exit__.__code__ is self.exit_code
+                and Session._close_owned.__code__ is self.close_code and Session.finish.__code__ is self.finish_code,
+                "Actual real finish/close code objects differ from verified packaged source.")
+        rows: list[Object] = []
+        for index, (result, expected_id) in enumerate(zip(completed_local_results, support.ordered, strict=True)):
+            require(type(result) is TerminalLocalResult and result.case_id == expected_id
+                    and 0 < len(result.actual_result) <= 65536, "Final local result is missing/extra/reordered.")
+            support.fixture.publish(f"terminal-local-{index:04d}.result", result.actual_result, limit=65536)
+            rows.append({"id": expected_id, "resultSha256": sha(result.actual_result)})
+        helpers = self._helper_rows(support, finished_helpers, expected_helper_entries)
+        base_raw = support.fixture.read("phase-report.json", limit=1024 * 1024)
+        base = document(base_raw, limit=1024 * 1024)
+        require(base["selected"] == list(support.ordered) and base["pendingExternal"] == list(support.pending)
+                and base["inventorySha256"] == sha(support.inventory_raw), "Original full-local base changed.")
+        settled = canonical({"version": 1, "kind": "abr38-terminal-close-settled", "component": COMPONENT,
+            "inventorySha256": sha(support.inventory_raw),
+            "selectedSha256": sha(canonical(list(support.ordered), limit=1024 * 1024)),
+            "rows": rows, "helpers": helpers, "pendingExternal": list(support.pending)}, limit=1024 * 1024)
+        support.fixture.publish("terminal-close-settled.json", settled, limit=1024 * 1024)
+        self.saved_fd = self.session.lease  # BEFORE real Codex resets lease=-1.
+        self.lock_path = self.session.registry.folder / "admission.lock"
+        held = os.fstat(self.saved_fd)
+        self.saved_identity = (held.st_dev, held.st_ino, held.st_uid, stat.S_IMODE(held.st_mode))
+        require(self.saved_fd >= 3 and self._original_fd(self.saved_fd)
+                and held.st_uid == os.getuid() and stat.S_IMODE(held.st_mode) == 0o600,
+                "Saved actual own original admission descriptor is unavailable.")
+        self.suite = identity_record(self.session.context["process"])
+        parent = self.session.context["parent"]
+        require(isinstance(parent, dict), "Actual Suite parent is absent.")
+        assert isinstance(parent, dict)
+        provider_owner = identity_record({"pid": parent["pid"], "startedAt": parent["startedAt"]})
+        require(matches(self.suite, parent=provider_owner["pid"])
+                and self.suite["pid"] == os.getpid(), "Actual owning Suite kernel identity changed.")
+        intent = canonical({"version": 1, "kind": "abr38-terminal-close-intent", "case": support.fixture.case,
+            "component": COMPONENT, "tuplePinsSha256": tuple_pins_sha256, "phaseReportSha256": sha(base_raw),
+            "settledSha256": sha(settled), "suite": {"invocation": self.session.context["invocation"],
+                "writer": self.session.context["writer"], "handoff": self.session.context["handoff"],
+                "contextSha256": self.session.context_hash, **self.suite},
+            "provider": provider_owner,
+            "admissionLock": {"device": held.st_dev, "inode": held.st_ino},
+            "ownLease": {"fd": self.saved_fd, "device": held.st_dev, "inode": held.st_ino},
+            "closeSite": "codex-original-admission-close"}, limit=16 * 1024)
+        support.fixture.publish("terminal-close-intent.json", intent, limit=16 * 1024)
+        # Every application/State/output assertion is complete BEFORE arming.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.fsync(1)
+        os.fsync(2)
+        end = min(support.end, time.monotonic() + 5)
+        raw = canonical({"version": 1, "kind": "terminal-close-armed", "case": support.fixture.case,
+                         "intentSha256": sha(intent)})
+        require(not support.console.closed and len(support.console.control) == 3,
+                "Existing separated runner stdio is unavailable.")
+        with selectors.DefaultSelector() as selector:
+            selector.register(support.console.control[1], selectors.EVENT_WRITE)
+            remaining = memoryview(raw)
+            while remaining:
+                require(time.monotonic() < end, "Terminal armed frame exceeded its finite publication bound.")
+                if selector.select(min(.05, max(0, end - time.monotonic()))):
+                    try:
+                        count = os.write(support.console.control[1], remaining)
+                    except BlockingIOError:
+                        continue
+                    require(count > 0, "Terminal armed stdio closed before complete frame.")
+                    remaining = remaining[count:]
+        # Do not close/duplicate the original SH. Data controls are joined/closed
+        # here; the ordinary support finalizer will then close an empty list.
+        support.console.close()
+        require(self._original_fd(self.saved_fd) and self._sole_thread() and os.close is self.real_close,
+                "Saved own descriptor/thread/OS function changed before installation.")
+        self.armed = True
+        os.close = self.hook
