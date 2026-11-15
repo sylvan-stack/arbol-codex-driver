@@ -6,6 +6,7 @@ opens an independent component lease; no inherited lock or PID alone admits it.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 import socket
@@ -532,6 +533,51 @@ class Session:
         finally:
             ticket.close()
 
+    async def spawn_helper_async(
+        self, arguments: list[str], *, entry: str, environment: dict[str, str], cwd: Path,
+        limit: int = 1024 * 1024,
+    ) -> asyncio.subprocess.Process:
+        """One admitted new-session asyncio child; never abandon its ACK worker."""
+        if type(limit) is not int or limit <= 0:
+            raise invalid()
+        ticket = self.prepare_helper(entry)
+        spawning: asyncio.Task[asyncio.subprocess.Process] | None = None
+        handshake: asyncio.Task[None] | None = None
+        child: asyncio.subprocess.Process | None = None
+        try:
+            spawning = asyncio.create_task(asyncio.create_subprocess_exec(
+                *ticket.prefix, *arguments, env=ticket.environment(environment), cwd=cwd,
+                pass_fds=ticket.pass_fds, close_fds=True, start_new_session=True,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                limit=limit,
+            ))
+            child = await asyncio.shield(spawning)
+            handshake = asyncio.create_task(asyncio.to_thread(ticket.acknowledge, child.pid))
+            await asyncio.shield(handshake)
+            return child
+        except BaseException:
+            # A second cancellation must not detach a spawning coroutine or a
+            # registry-writing thread. Their fixed bounds still apply.
+            if child is None and spawning is not None:
+                try:
+                    child = await _join_owned(spawning)
+                except BaseException:
+                    pass
+            if handshake is not None:
+                try:
+                    await _join_owned(handshake)
+                except BaseException:
+                    pass
+            if child is not None:
+                from .dev_support import stop_child
+                try:
+                    await _join_owned(asyncio.create_task(stop_child(child)))
+                except BaseException:
+                    pass  # Preserve the original failure; custody is never cleared.
+            raise
+        finally:
+            ticket.close()
+
     def _close_owned(self) -> None:
         if self.lease >= 0:
             descriptor, self.lease = self.lease, -1
@@ -737,6 +783,16 @@ class HelperHandoff:
             raise
         finally:
             self._release()
+
+
+async def _join_owned[T](task: asyncio.Task[T]) -> T:
+    """Join an owned bounded task despite repeated caller cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
 
 
 _CURRENT: ContextVar[Session | None] = ContextVar("codex_driver_admission", default=None)
