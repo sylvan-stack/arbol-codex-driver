@@ -200,7 +200,7 @@ class PrivateDirectory:
         self.check()
         name = _safe_name(name)
         try:
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=self.fd)
         except FileNotFoundError:
             return None
         try:
