@@ -16,6 +16,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = "arbol-codex-driver"
 ENTRY = f"bin/{COMPONENT}"
+PAYLOAD = "driver-payload"
+IDENTITY_METADATA = frozenset(("driver-payload-manifest.json", "driver-capability.json"))
 BUILD_NUMBER = re.compile(r"[1-9a-f][0-9a-f]*\Z")
 
 
@@ -48,7 +50,7 @@ def source_provenance(root: Path = ROOT) -> dict[str, str | bool]:
         return subprocess.run(["git", *arguments], cwd=root, check=True, capture_output=True, text=True, timeout=15).stdout.strip()
 
     return {"repository": str(root.resolve()), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-            "commit": git("rev-parse", "HEAD"), "uncommittedChanges": bool(git("status", "--porcelain"))}
+            "commit": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}"), "uncommittedChanges": bool(git("status", "--porcelain"))}
 
 
 def target() -> str:
