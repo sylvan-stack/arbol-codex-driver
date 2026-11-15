@@ -13,7 +13,14 @@ from .app_server import AppServer
 from .cancellation import Cancellation
 from .catalog import builtin_catalog, normalize_account, normalize_usage, read_model_catalog
 from .errors import Failure, safe_failure
-from .identity import IdentityJournal, PendingIdentity, canonical_id, expected_proof
+from .identity import (
+    IdentityJournal,
+    LifetimeSnapshot,
+    PendingIdentity,
+    canonical_id,
+    expected_proof,
+    lifetime_matches,
+)
 from .identity_protocol import PrivateDirectory
 from .json_types import Json, Object, iso, now, object_value, string, timestamp
 from .run_limits import merge_usage_reports
@@ -207,6 +214,23 @@ class Subscriptions:
             result.pop("problem", None)
         return result
 
+    async def observe(self, id_: str, *, signed_in: bool = False) -> tuple[Object, LifetimeSnapshot | None]:
+        # Retain normal local settings/reap behavior before the atomic capture.
+        initial = await self.get(id_)
+        await self.settle_identity(id_)
+
+        async def capture() -> tuple[Object, LifetimeSnapshot | None]:
+            current = self.record(id_)
+            result: Object = {**current, "settings": {}}
+            if initial["state"] == "signing_in" and self.progress(id_) is not None:
+                result["state"] = "signing_in"
+                result.pop("problem", None)
+            if signed_in and result["state"] != "signed_in":
+                raise Failure("not_signed_in", "Sign in to this Subscription first.", {"remedy": "Sign in again."})
+            return result, LifetimeSnapshot.capture(self.state.assert_admitted(), id_)
+
+        return await self.state.with_subscription_lock(id_, capture, self.env)
+
     def ids(self) -> list[str]:
         ids = ["chatgpt"]
         directory = self.state.directory / "subscriptions"
@@ -267,6 +291,11 @@ class Subscriptions:
 
         async def change() -> None:
             current = self.record(id_)
+            # Relabeling preserves an existing witness, but cannot cross an
+            # unsettled removal or manufacture a replacement lifetime.
+            state = self.state.assert_admitted()
+            if state.format == 2 and IdentityJournal(state, id_).pending() is not None:
+                raise Failure("in_use", "Subscription identity settlement is pending.")
             if id_ != "chatgpt":
                 private_directory(self.file(id_, "home"))
             write_json(self.file(id_, "record.json"), {**current, "label": label, "updatedAt": now()})
@@ -280,15 +309,21 @@ class Subscriptions:
             raise Failure("not_signed_in", "Sign in to this Subscription first.", {"remedy": "Sign in again."})
         return item
 
-    async def run_report(self, initial: Object, error: Object) -> None:
+    async def run_report(
+        self, initial: Object, error: Object, *, lifetime: LifetimeSnapshot | None = None,
+    ) -> None:
         if error["code"] == "credential_rejected":
-            await self.merge(initial, {"state": "needs_attention", "problem": error, "checkedAt": now()})
+            await self.merge(initial, {"state": "needs_attention", "problem": error, "checkedAt": now()}, lifetime=lifetime)
 
-    async def store_run_usage(self, initial: Object, usage: Object) -> None:
+    async def store_run_usage(
+        self, initial: Object, usage: Object, *, lifetime: LifetimeSnapshot | None = None,
+    ) -> None:
         """Save a run snapshot without restoring a replaced or signed-out login."""
         id_ = str(initial["id"])
 
         async def change() -> None:
+            if not lifetime_matches(self.state.assert_admitted(), id_, lifetime):
+                return
             try:
                 current = self.record(id_)
             except Failure as error:
@@ -327,10 +362,14 @@ class Subscriptions:
             on_spawn=on_spawn,
         )
 
-    async def merge(self, initial: Object, fields: Object) -> Object:
+    async def merge(
+        self, initial: Object, fields: Object, *, lifetime: LifetimeSnapshot | None = None,
+    ) -> Object:
         id_ = str(initial["id"])
 
         async def change() -> None:
+            if not lifetime_matches(self.state.assert_admitted(), id_, lifetime):
+                return
             try:
                 current = self.record(id_)
             except Failure as error:
@@ -351,7 +390,7 @@ class Subscriptions:
         return await self.get(id_)
 
     async def check(self, id_: str) -> Object:
-        initial = await self.get(id_)
+        initial, lifetime = await self.observe(id_)
         if initial["state"] == "signed_out":
             raise Failure("not_signed_in", "Sign in to this Subscription first.", {"remedy": "Sign in again."})
         server: AppServer | None = None
@@ -371,11 +410,12 @@ class Subscriptions:
                     ).result,
                     "checkedAt": now(),
                 },
+                lifetime=lifetime,
             )
         except Failure as error:
             if error.result["code"] == "credential_rejected":
                 return await self.merge(
-                    initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}
+                    initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
                 )
             raise
         finally:
@@ -383,7 +423,7 @@ class Subscriptions:
                 await server.close()
 
     async def usage(self, id_: str) -> Object:
-        initial = await self.get(id_)
+        initial, lifetime = await self.observe(id_)
         if initial["state"] != "signed_in":
             return {
                 "outcome": "needs_sign_in",
@@ -398,11 +438,13 @@ class Subscriptions:
                 await server.request("account/rateLimits/read", {}, cancellation=self.cancellation),
                 string(object_value(initial.get("account")).get("plan")),
             )
-            await self.merge(initial, {"lastUsage": usage})
+            await self.merge(initial, {"lastUsage": usage}, lifetime=lifetime)
             return usage
         except Exception as error:
             if isinstance(error, Failure) and error.result["code"] == "credential_rejected":
-                await self.merge(initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()})
+                await self.merge(
+                    initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
+                )
                 return {"outcome": "needs_sign_in", "fetchedAt": now(), "windows": [], "message": str(error)}
             if isinstance(error, Failure) and error.result["code"] in ("tool_missing", "tool_unsupported"):
                 raise
@@ -417,7 +459,7 @@ class Subscriptions:
                 await server.close()
 
     async def models(self, id_: str) -> Object:
-        initial = await self.require_signed_in(id_)
+        initial, lifetime = await self.observe(id_, signed_in=True)
         server: AppServer | None = None
         try:
             server = await self.start(id_)
@@ -429,7 +471,9 @@ class Subscriptions:
             return await read_model_catalog(request)
         except Exception as error:
             if isinstance(error, Failure) and error.result["code"] == "credential_rejected":
-                await self.merge(initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()})
+                await self.merge(
+                    initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
+                )
                 raise
             if isinstance(error, Failure) and error.result["code"] in ("tool_missing", "tool_unsupported"):
                 raise

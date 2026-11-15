@@ -353,6 +353,48 @@ def subscription_sidecar(directory: PrivateDirectory) -> Object | None:
 
 
 @dataclass(frozen=True)
+class LifetimeSnapshot:
+    """Private captured lifetime, never part of a public Subscription record."""
+
+    subscription: str
+    generation: str
+    witness: str
+
+    @classmethod
+    def capture(cls, state: IdentityState, identifier: str) -> LifetimeSnapshot | None:
+        # Caller validates the local record and holds its short lock.
+        state.check()
+        if state.format == 1:
+            return None
+        proof = state.capture_proof(identifier, None)
+        return cls(canonical_id(identifier), token(proof["generation"]), token(proof["witness"]))
+
+
+def lifetime_matches(state: IdentityState, identifier: str, snapshot: LifetimeSnapshot | None) -> bool:
+    """Compare under the short lock without materializing or repairing identity.
+
+    Legacy callers have no proof. Format2 callers must carry the independently
+    captured tokens; a late completion cannot derive them from current state.
+    """
+    state.check()
+    identifier = canonical_id(identifier)
+    if state.format == 1:
+        return snapshot is None
+    if snapshot is None or snapshot.subscription != identifier or snapshot.generation != state.generation:
+        return False
+    token(snapshot.generation)
+    token(snapshot.witness)
+    try:
+        with PrivateDirectory(state.directory / "subscriptions" / identifier) as directory:
+            if IdentityJournal._pending(directory) is not None:
+                return False
+            sidecar = subscription_sidecar(directory)
+            return sidecar is not None and sidecar["state"] == "active" and sidecar["witness"] == snapshot.witness
+    except FileNotFoundError:
+        return False
+
+
+@dataclass(frozen=True)
 class IdentityJournal:
     """Caller holds the canonical short Subscription lock throughout a method.
 
