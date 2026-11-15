@@ -13,6 +13,7 @@ from .app_server import AppServer
 from .cancellation import Cancellation
 from .catalog import builtin_catalog, normalize_account, normalize_usage, read_model_catalog
 from .errors import Failure, safe_failure
+from .identity import canonical_id, expected_proof
 from .json_types import Json, Object, iso, now, object_value, string, timestamp
 from .run_limits import merge_usage_reports
 from .runs import Runs
@@ -165,6 +166,19 @@ class Subscriptions:
             "createdAt": created,
             "updatedAt": created,
         }
+
+    async def identity(self, id_: str, expect: str | None = None) -> Object:
+        id_, expected = canonical_id(id_), expected_proof(expect)
+        self.state.assert_admitted().require_proof()
+
+        async def capture() -> Object:
+            # Validate only the local catalogue record (including implicit
+            # chatgpt). get/reap/settings/auth/vendor discovery is excluded.
+            self.state.assert_admitted().require_proof()
+            self.record(id_)
+            return self.state.assert_admitted().capture_proof(id_, expected)
+
+        return await self.state.with_subscription_lock(id_, capture, self.env)
 
     def progress(self, id_: str) -> Object | None:
         value = read_json(self.file(id_, "sign-in.json"))

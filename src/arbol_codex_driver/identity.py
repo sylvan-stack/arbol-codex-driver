@@ -24,8 +24,28 @@ from .identity_protocol import (
     same_inode,
     token,
 )
+from .json_types import Object
 
 DATA_FORMAT = 2
+
+
+def canonical_id(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value, re.ASCII) is None:
+        raise Failure("invalid_input", "The Subscription identifier is not a safe file name.")
+    return value
+
+
+def expected_proof(value: str | None) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and len(value) == 87:
+        parts = value.split(".")
+        if len(parts) == 2:
+            try:
+                return token(parts[0]), token(parts[1])
+            except Failure:
+                pass
+    raise Failure("invalid_input", "Give --expect exactly one canonical generation.witness pair.")
 
 
 def state_format(root: Path) -> int | None:
@@ -228,6 +248,67 @@ class IdentityState:
                 raise invalid()
         if self.format == 2 and root_generation(self.directory) != self.generation:
             raise invalid()
+
+    def require_proof(self) -> str:
+        self.check()
+        if self.format != 2:
+            raise Failure(
+                "invalid_input",
+                "Subscription identity requires upgraded Driver state.",
+                {"remedy": "Upgrade Driver state under exclusive maintenance before using Subscription identity."},
+            )
+        if self.generation is None:
+            raise invalid()
+        return self.generation
+
+    def capture_proof(self, identifier: str, expected: tuple[str, str] | None) -> Object:
+        """Caller holds the short lock and has validated the current record.
+
+        A record's timestamp/auth state never supplies this witness. Pending
+        local settlement is unavailable; this operation cannot repair it.
+        """
+        identifier = canonical_id(identifier)
+        generation = self.require_proof()
+        with PrivateDirectory(self.directory / "subscriptions" / identifier) as directory:
+            try:
+                os.stat("identity-pending.json", dir_fd=directory.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise invalid()
+            raw = directory.read("identity.json")
+            sidecar: Object | None = None
+            if raw is not None:
+                sidecar = object_fields(parse_bytes(raw), {"version", "witness", "state"})
+                if (
+                    type(sidecar["version"]) is not int
+                    or sidecar["version"] != 1
+                    or sidecar["state"] not in ("active", "retired")
+                ):
+                    raise invalid()
+                token(sidecar["witness"])
+            materialized = sidecar is None or sidecar["state"] == "retired"
+            if materialized:
+                sidecar = {"version": 1, "witness": fresh_token(), "state": "active"}
+                directory.publish("identity.json", canonical_bytes(sidecar))
+            assert sidecar is not None
+            witness = token(sidecar["witness"])
+            self.check()
+            if expected is not None and (materialized or expected != (generation, witness)):
+                raise Failure(
+                    "in_use",
+                    "Subscription lifetime changed; select it again and explicitly rebind.",
+                    {"remedy": "Select the Subscription again and explicitly replace its browser binding."},
+                )
+            proof: Object = {
+                "version": 1,
+                "driver": "codex",
+                "subscription": identifier,
+                "generation": generation,
+                "witness": witness,
+            }
+            canonical_bytes(proof)  # Keep the successful wire document bounded.
+            return proof
 
     def close(self) -> None:
         if not self.closed:
