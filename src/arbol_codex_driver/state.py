@@ -244,35 +244,42 @@ class State:
         self, id_: str, change: Callable[[], Awaitable[T]], env: dict[str, str] | None = None
     ) -> T:
         directory = self.subscription(id_)
-        timeout, retry = fixed_wait(10000, env), fixed_wait(50, env)
-        private_directory(directory.parent)
-        private_directory(directory)
-        path = directory / "lock"
-        owner = await process_owner(os.getpid())
-        if owner is None:
-            raise Failure("internal", "Cannot identify the Driver process.")
-        temporary = prepare_file(path, dumps({"owner": owner_json(owner)}) + "\n")
-        deadline = time.monotonic() + timeout
-        acquired = False
-        try:
-            while not acquired:
-                try:
-                    os.link(temporary, path)
-                    acquired = True
-                except FileExistsError:
-                    existing = read_lock(path)
-                    if existing is None:
-                        continue
-                    if not await owner_alive(existing[1]):
-                        await reclaim_dead_file(path, existing[0], temporary)
-                    if time.monotonic() >= deadline:
-                        raise Failure(
-                            "internal",
-                            f"Subscription lock timed out after {timeout * 1000:g} milliseconds; owner PID {existing[1]['pid']}, started {existing[1]['startedAt']}.",
-                        ) from None
-                    await asyncio.sleep(retry)
-            return await change()
-        finally:
-            if acquired:
-                remove_file(path)
-            remove_file(temporary)
+        return await with_subscription_directory_lock(directory, change, env)
+
+
+async def with_subscription_directory_lock[T](
+    directory: Path, change: Callable[[], Awaitable[T]], env: dict[str, str] | None = None,
+) -> T:
+    """Existing canonical lock; caller establishes normal or exclusive admission."""
+    timeout, retry = fixed_wait(10000, env), fixed_wait(50, env)
+    private_directory(directory.parent)
+    private_directory(directory)
+    path = directory / "lock"
+    owner = await process_owner(os.getpid())
+    if owner is None:
+        raise Failure("internal", "Cannot identify the Driver process.")
+    temporary = prepare_file(path, dumps({"owner": owner_json(owner)}) + "\n")
+    deadline = time.monotonic() + timeout
+    acquired = False
+    try:
+        while not acquired:
+            try:
+                os.link(temporary, path)
+                acquired = True
+            except FileExistsError:
+                existing = read_lock(path)
+                if existing is None:
+                    continue
+                if not await owner_alive(existing[1]):
+                    await reclaim_dead_file(path, existing[0], temporary)
+                if time.monotonic() >= deadline:
+                    raise Failure(
+                        "internal",
+                        f"Subscription lock timed out after {timeout * 1000:g} milliseconds; owner PID {existing[1]['pid']}, started {existing[1]['startedAt']}.",
+                    ) from None
+                await asyncio.sleep(retry)
+        return await change()
+    finally:
+        if acquired:
+            remove_file(path)
+        remove_file(temporary)
