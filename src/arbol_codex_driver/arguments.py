@@ -1,6 +1,8 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 from .errors import Failure
+from .identity import canonical_id, expected_proof
 
 type Options = dict[str, str | bool | list[str]]
 
@@ -49,6 +51,7 @@ SCHEMAS = {
     "runs stop": Schema(1, 1),
     "subscriptions families": Schema(),
     "subscriptions list": Schema(),
+    "subscriptions identity": Schema(1, 1, ("expect",)),
     "subscriptions create": Schema(values=("family", "label", "id")),
     "subscriptions update": Schema(1, 1, ("label",)),
     "subscriptions remove": Schema(1, 1, flags=("force",)),
@@ -58,10 +61,51 @@ SCHEMAS = {
     "subscriptions usage": Schema(1, 1),
     "subscriptions models": Schema(1, 1, tool=True),
     "subscriptions import": Schema(1, 1, ("from",)),
+    "state upgrade": Schema(values=("from-format", "maintenance", "backup"), flags=("confirm-quiescent",)),
+    "state identity-reset": Schema(values=("maintenance", "backup"), flags=("confirm-quiescent",)),
+    "state restore": Schema(values=("source", "backup", "maintenance"), flags=("confirm-quiescent",)),
+    "state identity-recover": Schema(
+        values=("subscription", "maintenance", "backup"), flags=("retire", "confirm-quiescent"),
+    ),
     "dev probe": Schema(tool=True),
     "dev live-check": Schema(tool=True),
     "dev build-check": Schema(tool=True),
 }
+
+
+def administrative_path(options: Options, key: str) -> None:
+    value = options.get(key)
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise Failure("invalid_input", f"Give --{key} exactly one absolute canonical path.")
+    path = Path(value)
+    try:
+        if not path.is_absolute() or str(path) != value or str(path.resolve(strict=False)) != value:
+            raise ValueError
+    except (OSError, RuntimeError, ValueError):
+        raise Failure("invalid_input", f"Give --{key} exactly one absolute canonical path.") from None
+    # Private ownership, fresh-empty archives and the actual closed/drained
+    # handoff are verified under maintenance authority, never inferred here.
+
+
+def validate_identity_arguments(name: str, positionals: list[str], options: Options) -> None:
+    if name == "subscriptions identity":
+        canonical_id(positionals[0])
+        expected = options.get("expect")
+        expected_proof(expected if isinstance(expected, str) else None)
+    elif name.startswith("state "):
+        for key in ("state-dir", "maintenance", "backup"):
+            administrative_path(options, key)
+        if options.get("confirm-quiescent") is not True:
+            raise Failure("invalid_input", "Administrative state commands require --confirm-quiescent.")
+        if name == "state upgrade" and options.get("from-format") != "1":
+            raise Failure("invalid_input", "State upgrade requires --from-format 1.")
+        if name == "state restore":
+            administrative_path(options, "source")
+        if name == "state identity-recover":
+            subscription = options.get("subscription")
+            if not isinstance(subscription, str) or options.get("retire") is not True:
+                raise Failure("invalid_input", "Identity recovery requires --subscription <canonical-id> --retire.")
+            canonical_id(subscription)
 
 
 def parse_arguments(args: list[str]) -> Command:
@@ -88,7 +132,7 @@ def parse_arguments(args: list[str]) -> Command:
     if not words:
         raise Failure("invalid_input", "Name a command, such as info.")
     first = words.pop(0)
-    name = first + " " + (words.pop(0) if words else "") if first in ("subscriptions", "runs", "dev") else first
+    name = first + " " + (words.pop(0) if words else "") if first in ("subscriptions", "runs", "dev", "state") else first
     if name == "dev stand-in":
         if len(words) < 2 or words[1] != "--" or not words[0]:
             raise Failure("invalid_input", "Use dev stand-in <folder> -- <arguments>.")
@@ -138,4 +182,5 @@ def parse_arguments(args: list[str]) -> Command:
         raise Failure("invalid_input", "Tools must be all or none.")
     if "output" in options and options["output"] not in ("events", "text"):
         raise Failure("invalid_input", "Output must be events or text.")
+    validate_identity_arguments(name, positionals, options)
     return Command(name, positionals, options, schema.tool)
