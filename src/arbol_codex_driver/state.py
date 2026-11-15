@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -82,7 +83,16 @@ def write_json(path: Path, value: Json) -> None:
 
 def read_json(path: Path) -> Json:
     try:
-        value = loads(path.read_text())
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("State JSON is not a regular file")
+            # Keep the legacy text decoder/JSON grammar and unrestricted record
+            # size. The independent descriptor is closed even if wrapping fails.
+            with os.fdopen(descriptor, "r", closefd=False) as file:
+                value = loads(file.read())
+        finally:
+            os.close(descriptor)
         if value is None:
             raise ValueError("Null state record")
         return value
