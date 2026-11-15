@@ -11,7 +11,7 @@ from pathlib import Path
 from types import TracebackType
 
 from .errors import Failure
-from .identity import IdentityState, canonical_id, root_generation, state_format
+from .identity import IdentityState, PendingIdentity, canonical_id, retire_pending, root_generation, state_format
 from .identity_backup import (
     Archive,
     local_marker,
@@ -196,7 +196,9 @@ class Operation:
                             raise Failure("in_use", "An owned run still uses Driver state.")
         self.check()
 
-    def validate_metadata(self, *, target: str | None = None, upgrade: bool = False) -> None:
+    def validate_metadata(
+        self, *, target: str | None = None, upgrade: bool = False, allow_pending: bool = False,
+    ) -> None:
         self.check()
         for name in metadata_names(self.directory):
             raw = read_bytes(self.directory / name, limit=4096)
@@ -205,7 +207,7 @@ class Operation:
             validate_source(name, raw)
             if name == "identity-upgrade.json" and not upgrade:
                 raise invalid()
-            if name.endswith("/identity-pending.json") and (
+            if not allow_pending and name.endswith("/identity-pending.json") and (
                 target is None or name == f"subscriptions/{target}/identity-pending.json"
             ):
                 raise invalid()
@@ -282,6 +284,33 @@ class Operation:
         if self.read_marker() == self.marker("complete"):
             return self.result()
         self.write("identity.json", canonical_bytes({"version": 1, "generation": self.generation}))
+        return self.complete()
+
+    async def recover(self) -> Object:
+        if self.context["operation"] != "identity-recover":
+            raise invalid()
+        identifier = canonical_id(str(self.context["subscription"]))
+        await self.validate_records()
+        if state_format(self.directory) != 2 or root_generation(self.directory) != self.generation:
+            raise invalid()
+        self.validate_metadata(allow_pending=True)
+        name = f"subscriptions/{identifier}/identity-pending.json"
+        before = self.prepare(extra=[name])
+        raw = before.content(name)
+        if before.format != 2 or raw is None:
+            raise invalid()
+        value = parse_bytes(raw)
+        assert isinstance(value, dict)
+        original = PendingIdentity.parse(value)
+
+        async def change() -> None:
+            value = read_json(self.directory / "subscriptions" / identifier / "record.json")
+            if value is not None:
+                parse_record(value, identifier)
+            with PrivateDirectory(self.directory / "subscriptions" / identifier) as directory:
+                retire_pending(directory, original)
+
+        await self.short_lock(identifier, change)
         return self.complete()
 
     def validate_settled(self, *, complete: bool) -> None:

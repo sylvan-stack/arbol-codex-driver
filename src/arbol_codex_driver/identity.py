@@ -554,3 +554,23 @@ class IdentityJournal:
                 return state
         self.complete_remove(pending)
         return "retired"
+
+
+def retire_pending(directory: PrivateDirectory, original: PendingIdentity) -> None:
+    """Exclusive maintenance + canonical short lock, not original cleanup success.
+
+    The caller binds original to its immutable before-entry and validates any
+    current record. No record/credential/progress or root bytes are changed.
+    """
+    original.document()
+    current = IdentityJournal._pending(directory)
+    sidecar = subscription_sidecar(directory)
+    retired: Object = {"version": 1, "witness": original.witness, "state": "retired"}
+    if current is None:
+        if sidecar != retired:
+            raise invalid()
+        return
+    if current != original or sidecar is not None and sidecar["witness"] != original.witness:
+        raise invalid()
+    directory.publish("identity.json", canonical_bytes(retired))
+    directory.delete("identity-pending.json")
