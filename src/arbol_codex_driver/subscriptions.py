@@ -13,7 +13,8 @@ from .app_server import AppServer
 from .cancellation import Cancellation
 from .catalog import builtin_catalog, normalize_account, normalize_usage, read_model_catalog
 from .errors import Failure, safe_failure
-from .identity import canonical_id, expected_proof
+from .identity import IdentityJournal, PendingIdentity, canonical_id, expected_proof
+from .identity_protocol import PrivateDirectory
 from .json_types import Json, Object, iso, now, object_value, string, timestamp
 from .run_limits import merge_usage_reports
 from .runs import Runs
@@ -725,20 +726,118 @@ class Subscriptions:
                 await server.close()
             await self.finish(id_, progress)
 
+    def require_remove_receipt(self, id_: str, progress: Object) -> None:
+        current = self.progress(id_)
+        expected_owner = parse_owner(progress.get("owner"))
+        if (
+            current is None or current["attempt"] != progress["attempt"] or current["operation"] != "remove"
+            or expected_owner["pid"] != os.getpid() or parse_owner(current.get("owner")) != expected_owner
+        ):
+            raise Failure("in_use", "The original removal no longer owns this Subscription.")
+
+    async def settle_identity(self, id_: str) -> bool:
+        """Settle a validated local outcome under the short lock, never cleanup."""
+        if self.state.assert_admitted().format != 2:
+            return False
+
+        async def change() -> bool:
+            journal = IdentityJournal(self.state.assert_admitted(), id_)
+            pending = journal.pending()
+            if pending is None:
+                return False
+            value = read_json(self.file(id_, "record.json"))
+            if value is not None:
+                parse_record(value, id_)
+            journal.settle(record_present=value is not None)
+            return pending.operation == "remove"
+
+        return await self.state.with_subscription_lock(id_, change, self.env)
+
+    def remove_owned_trees(self, id_: str) -> None:
+        """No short Subscription lock is held across this filesystem cleanup."""
+        parent = self.state.subscription(id_)
+        for name in ("home", "chats"):
+            path = self.file(id_, name)
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            # Reject links/unsafe roots, including any redirected native home.
+            # The operation's progress/journal excludes cooperative replacement.
+            with PrivateDirectory(path):
+                shutil.rmtree(path)
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise Failure("internal", "Subscription cleanup did not remove its owned directory.")
+            with PrivateDirectory(parent) as directory:
+                os.fsync(directory.fd)
+
     async def remove(self, id_: str, force: bool = False) -> None:
         if id_ == "chatgpt":
             raise Failure("invalid_input", "Sign out in codex itself; the native chatgpt Subscription cannot be removed.")
+        if await self.settle_identity(id_):
+            return  # A validated committed removal, not absence, supplies this outcome.
         await self.get(id_)
         await self.active_runs(id_, force)
         progress = await self.reserve(id_, "remove")
+        pending: PendingIdentity | None = None
+        potentially_pending = False
+        committed = False
         try:
             await self.active_runs(id_, force)
+            if self.cancellation is not None:
+                self.cancellation.check()
 
-            async def change() -> None:
-                for name in ("home", "chats"):
-                    shutil.rmtree(self.file(id_, name), ignore_errors=True)
-                self.file(id_, "record.json").unlink(missing_ok=True)
+            async def prepare() -> PendingIdentity | None:
+                nonlocal potentially_pending
+                self.require_remove_receipt(id_, progress)
+                self.record(id_)
+                state = self.state.assert_admitted()
+                if state.format == 1:
+                    return None
+                proof = state.capture_proof(id_, None)
+                # Publication failure may already have renamed the marker; keep
+                # original progress rather than guessing that nothing changed.
+                potentially_pending = True
+                return IdentityJournal(state, id_).begin_remove(str(proof["witness"]))
 
-            await self.state.with_subscription_lock(id_, change, self.env)
+            pending = await self.state.with_subscription_lock(id_, prepare, self.env)
+            if self.cancellation is not None and self.cancellation.aborted:
+                if pending is not None:
+                    async def cancel() -> None:
+                        self.require_remove_receipt(id_, progress)
+                        IdentityJournal(self.state.assert_admitted(), id_).cancel_remove(pending)
+
+                    await self.state.with_subscription_lock(id_, cancel, self.env)
+                    potentially_pending = False
+                self.cancellation.check()
+            self.remove_owned_trees(id_)
+
+            async def commit() -> None:
+                self.require_remove_receipt(id_, progress)
+                value = read_json(self.file(id_, "record.json"))
+                if value is not None:
+                    parse_record(value, id_)
+                state = self.state.assert_admitted()
+                # Cleanup succeeded in this original operation. Make receipt
+                # deletion durable before claiming the journal committed.
+                with PrivateDirectory(self.state.subscription(id_)) as directory:
+                    directory.delete("sign-in.json")
+                    if state.format == 1:
+                        os.unlink("record.json", dir_fd=directory.fd)
+                        os.fsync(directory.fd)
+                if state.format == 2:
+                    if pending is None:
+                        raise Failure("internal", "Removal has no captured lifetime settlement.")
+                    IdentityJournal(state, id_).complete_remove(pending)
+
+            await self.state.with_subscription_lock(id_, commit, self.env)
+            committed = True
         finally:
-            await self.finish(id_, progress)
+            if not committed and not potentially_pending:
+                await self.finish(id_, progress)
+            # Unknown cleanup or publication preserves prepared journal plus
+            # original receipt. Reaping/death cannot manufacture its success.
