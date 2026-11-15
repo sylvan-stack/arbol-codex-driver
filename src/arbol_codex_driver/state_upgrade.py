@@ -260,6 +260,30 @@ class Operation:
             await self.convert(before, self.maintenance.request.backup)
         return self.complete()
 
+    async def reset(self) -> Object:
+        if self.context["operation"] != "identity-reset":
+            raise invalid()
+        await self.validate_records()
+        if state_format(self.directory) != 2:
+            raise Failure("invalid_input", "Upgrade Driver state under exclusive maintenance before resetting identity.")
+        self.validate_metadata()
+        before = self.prepare()
+        if before.format != 2:
+            raise invalid()
+        original = before.content("identity.json")
+        if original is None:
+            raise invalid()
+        validate_source("identity.json", original)
+        value = parse_bytes(original)
+        assert isinstance(value, dict)
+        old = token(value["generation"])
+        if old == self.generation or root_generation(self.directory) not in (old, self.generation):
+            raise invalid()
+        if self.read_marker() == self.marker("complete"):
+            return self.result()
+        self.write("identity.json", canonical_bytes({"version": 1, "generation": self.generation}))
+        return self.complete()
+
     def validate_settled(self, *, complete: bool) -> None:
         operation = self.check()
         if self.before is None or self.source_hash != operation["sourceSha256"]:
