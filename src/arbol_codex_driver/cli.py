@@ -2,24 +2,47 @@ import asyncio
 import os
 import signal
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import cast
 
-from .arguments import parse_arguments
-from .build import build_identity
+from .admission import current_session
+from .arguments import Options, parse_arguments
+from .build import build_identity, qualified_capabilities
 from .cancellation import Cancellation
 from .errors import Failure, safe_failure
 from .event_stream import EventStream, Output, write_json
+from .identity_protocol import invalid
 from .json_types import Json, string
+from .maintenance import current_maintenance
 from .run import run
 from .runs import Runs
 from .settings import read_settings, settings_path
 from .state import State, default_state_directory, fixed_wait
+from .state_upgrade import Operation
 from .subscriptions import FAMILIES, Subscriptions
 from .tool import inspect_tool, require_tool
 
 
-async def main(args: list[str]) -> int:
+class Invocation:
+    """Owned by synchronous entry until asyncio.run joins tasks and executor."""
+
+    def __init__(self) -> None:
+        self.state: State | None = None
+        self.contexts = ExitStack()
+
+    def close(self) -> None:
+        try:
+            self.contexts.close()
+        finally:
+            if self.state is not None:
+                self.state.close()
+
+
+async def main(args: list[str], *, invocation: Invocation | None = None) -> int:
+    # Direct asynchronous callers may retain this object until their own loop
+    # settles. No destructor releases a guard when its lexical scope ends.
+    invocation = Invocation() if invocation is None else invocation
     output = Output()
     operation = next(
         (
@@ -38,6 +61,39 @@ async def main(args: list[str]) -> int:
         loop.add_signal_handler(signum, cancellation.abort)
     try:
         command = parse_arguments(args)
+        if command.name.startswith("state "):
+            maintenance = current_maintenance()
+            maintenance.recheck()
+            request = maintenance.request
+            expected: Options = {
+                "state-dir": str(request.state), "maintenance": str(request.receipt),
+                "backup": str(request.backup), "confirm-quiescent": True,
+            }
+            if request.operation == "upgrade":
+                expected["from-format"] = "1"
+            if request.source is not None:
+                expected["source"] = str(request.source)
+            if request.subscription is not None:
+                expected.update({"subscription": request.subscription, "retire": True})
+            if command.name != "state " + request.operation or command.options != expected:
+                raise invalid()
+            administration = invocation.contexts.enter_context(Operation(maintenance))
+            match request.operation:
+                case "upgrade":
+                    administrative_result = await administration.upgrade()
+                case "identity-reset":
+                    administrative_result = await administration.reset()
+                case "identity-recover":
+                    administrative_result = await administration.recover()
+                case "restore":
+                    administrative_result = await administration.restore()
+                case _:
+                    raise invalid()
+            cancellation.check()
+            await write_json(output, administrative_result)
+            return 0
+        # The new program never supplies a format1/source admission bypass.
+        current_session()
         if command.name == "dev stand-in":
             from .stand_in import stand_in
 
@@ -45,9 +101,20 @@ async def main(args: list[str]) -> int:
         fixed_wait(1)
         home = os.environ.get("HOME") or str(Path.home())
         file = settings_path(home)
-        settings, notices = read_settings(file)
         env = dict(os.environ)
         state = State(string(command.options.get("state-dir")) or default_state_directory(home))
+        invocation.state = state
+        if command.name == "subscriptions identity":
+            # Proof is independent of settings, run recovery, get/reap and
+            # native account discovery, including on signed-out chatgpt.
+            state.initialize()
+            proof = await Subscriptions(state, {}, [], file, env, cancellation).identity(
+                command.positionals[0], string(command.options.get("expect")),
+            )
+            cancellation.check()
+            await write_json(output, proof)
+            return 0
+        settings, notices = read_settings(file)
         state.initialize()
         if command.name in (
             "subscriptions update",
@@ -103,6 +170,7 @@ async def main(args: list[str]) -> int:
                     "driver": "codex",
                     **identity,
                     "contract": 1,
+                    "capabilities": qualified_capabilities(),
                     "stateDirectory": str(state.directory),
                     "settingsFile": str(file),
                     "tool": tool,
@@ -166,4 +234,11 @@ async def main(args: list[str]) -> int:
 
 
 def entry() -> None:
-    sys.exit(asyncio.run(main(sys.argv[1:])))
+    invocation = Invocation()
+    try:
+        code = asyncio.run(main(sys.argv[1:], invocation=invocation))
+    finally:
+        # asyncio.run has joined every remaining task and executor worker;
+        # component authority is still retained by the outer trusted entry.
+        invocation.close()
+    sys.exit(code)

@@ -6,7 +6,34 @@ from .errors import Failure
 from .json_types import Object, loads
 
 
+def qualified_capabilities() -> Object:
+    from .admission import current_session
+
+    # Admission already verified this exact D's integer capability fields.
+    current_session()
+    return {"subscriptionIdentity": 1}
+
+
 def build_identity(start: Path | None = None) -> Object:
+    if start is None:
+        from .admission import current_session
+
+        try:
+            session = current_session()
+        except Failure:
+            session = None
+        if session is not None:
+            payload = session.authority.producer
+            try:
+                project = tomllib.loads(payload.regular_file("pyproject.toml").read_text())["project"]
+                version = project["version"]
+                if project["name"] != "arbol-codex-driver" or not isinstance(version, str) or re.fullmatch(
+                    r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", version,
+                ) is None:
+                    raise ValueError
+            except (OSError, KeyError, TypeError, ValueError):
+                raise Failure("internal", "Cannot read immutable Driver package version.") from None
+            return {"version": version, "build": payload.declaration.build}
     directory = start or Path(__file__).resolve().parent
     while True:
         file = directory / "build.json"
