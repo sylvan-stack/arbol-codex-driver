@@ -1,14 +1,28 @@
-"""Prospective fixed final H1 local case; no suite/gate/inventory wiring."""
+"""Prospective local proof and final H1 cases; no gate or inventory wiring."""
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import stat
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from typing import ClassVar
 
-from identity_support import H1_ID, CodexH1Support, document, require, sha
+from identity_support import (
+    H1_ID,
+    CodexH1Support,
+    CodexLocalSubject,
+    LocalCapture,
+    LocalInvocation,
+    Object,
+    canonical,
+    document,
+    require,
+    sha,
+)
 
 from arbol_codex_driver.admission import current_session
 from arbol_codex_driver.identity_protocol import PrivateDirectory, canonical_bytes, object_fields, parse_bytes, token
@@ -128,3 +142,139 @@ class HelperSpanTests(unittest.TestCase):
                                               subscriptions_info.st_uid, stat.S_IMODE(subscriptions_info.st_mode)],
                             "subscription": [side_info.st_dev, side_info.st_ino],
                             "guard": [guard.st_dev, guard.st_ino, guard.st_uid, stat.S_IMODE(guard.st_mode)]})}
+
+
+class LocalIdentityTests(unittest.TestCase):
+    def test_signed_out_first_capture_contends_and_restart_accepts_persisted_proof(self) -> None:
+        subject = CodexLocalSubject(guarded_settings=True)
+        asyncio.run(self._contended_capture(subject))
+
+    async def _contended_capture(self, subject: CodexLocalSubject) -> None:
+        state = State(subject.state)
+        subscription = subject.state / "subscriptions/chatgpt"
+        sidecar = subscription / "identity.json"
+        record = subscription / "record.json"
+        invocations: list[LocalInvocation] = []
+
+        async def hold_first_write() -> list[Object]:
+            # The runner holds only its real short Subscription lock here.
+            # Both separate public providers bring their own component/session
+            # authority. The observer does not take the component mutex here.
+            for _ in range(2):
+                invocations.append(await subject.spawn("identity"))
+            observations = await subject.waiting_pair(invocations)
+            self.assertEqual(len({row["main"]["pid"] for row in observations}), 2)
+            return observations
+
+        try:
+            try:
+                state.initialize()
+                self.assertFalse(os.path.lexists(sidecar) or os.path.lexists(record))
+                root = subject._read(subject.state / "identity.json")
+                guard = subject._read(subject.state / "identity.guard")
+                observations = await state.with_subscription_lock("chatgpt", hold_first_write, subject.environment)
+            finally:
+                state.close()
+            subject.fixture.publish("observed-lock-contention.json", canonical({"waiting": observations}))
+            async with asyncio.TaskGroup() as tasks:
+                captures = [tasks.create_task(subject.collect(call, f"first-proof-{index}"))
+                            for index, call in enumerate(invocations, 1)]
+        finally:
+            async with asyncio.TaskGroup() as cleanup:
+                for call in invocations:
+                    cleanup.create_task(subject.stop(call))
+
+        proof, simultaneous = (self._proof(task.result()) for task in captures)
+        self.assertEqual(proof, simultaneous)
+        self.assertEqual(subject._read(subject.state / "identity.json"), root)
+        self.assertEqual(subject._read(subject.state / "identity.guard"), guard)
+        self.assertEqual(document(root[0]), {"version": 1, "generation": proof["generation"]})
+        persisted = subject._read(sidecar)
+        self.assertEqual(persisted[0], canonical({"version": 1, "state": "active", "witness": proof["witness"]}))
+        self.assertFalse(os.path.lexists(record), "Proof must preserve implicit signed-out chatgpt.")
+        self.assertEqual(sorted(path.name for path in subscription.iterdir()), ["identity.json"])
+        generation, witness = str(proof["generation"]), str(proof["witness"])
+        restarted = await subject.request("identity", "restarted-exact-expect", (generation, witness))
+        self.assertNotIn(restarted.owner, [call.owner for call in invocations])
+        self.assertEqual(self._proof(restarted), proof)
+        self.assertEqual(subject._read(sidecar), persisted)
+        self.assertEqual(subject._read(subject.state / "identity.guard"), guard)
+        subject.check_inputs()
+
+    def test_qualified_list_preserves_format1_and_identity_requires_upgrade(self) -> None:
+        subject = CodexLocalSubject()
+        subject.prepare_legacy(b"1\n")
+        asyncio.run(self._legacy_list(subject))
+
+    async def _legacy_list(self, subject: CodexLocalSubject) -> None:
+        before = subject.state_image()
+        listed = await subject.request("list", "legacy-catalogue")
+        self.assertEqual((listed.exit, listed.stderr), (0, b""))
+        rows = json.loads(listed.stdout)
+        self.assertIsInstance(rows, list)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(set(row), {"id", "family", "label", "auth", "state", "createdAt", "updatedAt", "settings"})
+        self.assertEqual((row["id"], row["family"], row["auth"], row["state"]),
+                         ("chatgpt", "chatgpt", "vendor_login", "signed_out"))
+        self.assertEqual(subject.state_image(), before)
+        refusal = await subject.request("identity", "legacy-proof-refusal")
+        failure = self._failure(refusal, "invalid_input")
+        self.assertEqual(failure["remedy"], "Upgrade Driver state under exclusive maintenance before using Subscription identity.")
+        self.assertEqual(subject.state_image(), before)
+
+    def test_interrupted_conversion_rejects_proof_and_list_without_repair(self) -> None:
+        for phase in ("before-format", "after-root"):
+            with self.subTest(phase=phase):
+                subject = CodexLocalSubject()
+                generation = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+                backup = subject.fixture.path / "historical-backup"
+                backup.mkdir(mode=0o700)
+                archive_rows = [{"path": "format", "present": True, "size": 2, "sha256": sha(b"1\n")}]
+                for name in ("identity-maintenance.json", "identity-upgrade.json", "identity.json"):
+                    archive_rows.append({"path": name, "present": False, "size": 0, "sha256": None})
+                before_manifest = canonical({"version": 1, "kind": "driver-identity-backup", "format": 1,
+                                             "files": archive_rows})
+                subject._publish(backup / "manifest.json", before_manifest)
+                subject._publish(backup / "format", b"1\n")
+                journal = canonical_bytes({"version": 1, "from": 1, "to": 2, "generation": generation,
+                                           "backup": str(backup), "backupSha256": sha(before_manifest)})
+                # These are fixed initial reader inputs. An actual interrupted
+                # maintenance operation and its retry need separate evidence.
+                late = phase == "after-root"
+                subject.prepare_legacy(b"2\n" if late else b"1\n", journal=journal,
+                                       root=canonical_bytes({"version": 1, "generation": generation}) if late else None)
+                asyncio.run(self._interrupted_refusals(subject, backup))
+
+    async def _interrupted_refusals(self, subject: CodexLocalSubject, backup: Path) -> None:
+        before = subject.state_image()
+        archive = (subject._read(backup / "manifest.json"), subject._read(backup / "format"))
+        for operation in ("identity", "list"):
+            capture = await subject.request(operation, "interrupted-" + operation + "-refusal")
+            self._failure(capture, "internal")
+            self.assertEqual(subject.state_image(), before)
+            self.assertEqual((subject._read(backup / "manifest.json"), subject._read(backup / "format")), archive)
+
+    def _proof(self, capture: LocalCapture) -> dict[str, object]:
+        self.assertEqual((capture.exit, capture.stderr), (0, b""))
+        proof = document(capture.stdout)
+        self.assertEqual(set(proof), {"version", "driver", "subscription", "generation", "witness"})
+        self.assertIs(type(proof["version"]), int)
+        self.assertEqual((proof["version"], proof["driver"], proof["subscription"]), (1, "codex", "chatgpt"))
+        for field in ("generation", "witness"):
+            value = proof[field]
+            self.assertIsInstance(value, str)
+            self.assertRegex(value, r"\A[A-Za-z0-9_-]{43}\Z")
+            raw = base64.b64decode(value + "=", altchars=b"-_", validate=True)
+            self.assertEqual(len(raw), 32)
+            self.assertEqual(base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii"), value)
+        return proof
+
+    def _failure(self, capture: LocalCapture, code: str) -> dict[str, object]:
+        self.assertEqual((capture.exit, capture.stderr), (1, b""))
+        result = document(capture.stdout)
+        self.assertEqual(set(result), {"error"})
+        error = result["error"]
+        self.assertIsInstance(error, dict)
+        self.assertEqual(error["code"], code)
+        return dict(error)

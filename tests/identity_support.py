@@ -5,6 +5,7 @@ Actual runner callbacks supply every local result; reports never mean gate succe
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,8 +26,9 @@ from types import FrameType, TracebackType
 from typing import Any, Literal
 
 from arbol_codex_driver.admission import HelperHandoff, Session, current_session
+from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.identity_protocol import PrivateDirectory, token
-from arbol_codex_driver.process_identity import Identity, identity_record, matches, process_identity
+from arbol_codex_driver.process_identity import Identity, identity_record, inspect, matches, process_identity
 
 Object = dict[str, Any]
 COMPONENT = "arbol-codex-driver"
@@ -1079,3 +1082,275 @@ class CodexTerminalClose:
                 "Saved own descriptor/thread/OS function changed before installation.")
         self.armed = True
         os.close = self.hook
+
+
+LocalRequest = Literal["identity", "list"]
+
+
+@dataclass(frozen=True)
+class LocalInvocation:
+    process: asyncio.subprocess.Process
+    owner: Identity
+
+
+@dataclass(frozen=True)
+class LocalCapture:
+    exit: int
+    stdout: bytes
+    stderr: bytes
+    owner: Identity
+
+
+class CodexLocalSubject:
+    """An owned local fixture and fresh ordinary candidate Driver invocations."""
+
+    def __init__(self, *, guarded_settings: bool = False) -> None:
+        session = current_session()
+        session._check()
+        require(session.context["entry"] == "scripts/check_build.py"
+                and session.context["role"] == "helper" and session.authority.status == "candidate"
+                and sys.argv[1:] == ["unit"]
+                and Path(sys.argv[0]) == session.authority.producer.regular_file("scripts/check_build.py"),
+                "Local proof cases require the actual complete candidate unit runner.")
+        self.fixture = FixtureRoot(session, uuid.uuid4().hex)
+        self.session = session
+        self.state = self.fixture.path / "state"
+        self.home = self.fixture.path / "home"
+        self.native = self.home / ".codex"
+        self.tools = self.fixture.path / "tools"
+        self.settings = self.home / ".arbol" / "arbol-codex-driver.json"
+        for directory in (self.home, self.native, self.tools, self.settings.parent):
+            directory.mkdir(mode=0o700)
+        self.vendor_marker = self.fixture.path / "vendor-invoked"
+        self.fake_secret = "abr38-disposable-output-sentinel"
+        self.auth = self.native / "auth.json"
+        self._publish(self.auth, canonical({"fixtureValue": self.fake_secret}))
+        self._publish(self.settings, b"{deliberately unreadable fixture settings\n" if guarded_settings else canonical({
+            "toolPath": str(self.tools / "codex"),
+        }))
+        # The stand-in fails closed and writes only this private sentinel if the
+        # ordinary proof/list path ever starts a vendor executable.
+        tool = self.tools / "codex"
+        self._publish(tool, b'#!/bin/sh\nprintf "called\\n" > "$ABR38_VENDOR_MARKER"\nexit 97\n')
+        tool.chmod(0o700)
+        self.environment = {"HOME": str(self.home), "CODEX_HOME": str(self.native),
+                            "PATH": str(self.tools) + ":/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC",
+                            "ABR38_VENDOR_MARKER": str(self.vendor_marker), "ARBOL_TEST_TIME_SCALE": "0.1"}
+        self.original_inputs = self._inputs()
+
+    @staticmethod
+    def _publish(path: Path, raw: bytes) -> None:
+        with PrivateDirectory(path.parent) as directory:
+            require(path.name not in os.listdir(directory.fd), "Local fixture would overwrite a real input.")
+            directory.publish(path.name, raw)
+
+    @staticmethod
+    def _read(path: Path) -> tuple[bytes, tuple[int, int, int]]:
+        with PrivateDirectory(path.parent) as directory:
+            raw = directory.read(path.name)
+            require(raw is not None, "Missing local evidence file.")
+            info = os.stat(path.name, dir_fd=directory.fd, follow_symlinks=False)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1,
+                    "Local evidence file changed type or owner.")
+            assert raw is not None
+            return raw, (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode))
+
+    def _inputs(self) -> tuple[tuple[bytes, tuple[int, int, int]], ...]:
+        require(not os.path.lexists(self.vendor_marker), "Ordinary local request started the vendor stand-in.")
+        with PrivateDirectory(self.tools) as directory:
+            descriptor = os.open("codex", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory.fd)
+            try:
+                held = os.fstat(descriptor)
+                named = os.stat("codex", dir_fd=directory.fd, follow_symlinks=False)
+                physical = (held.st_dev, held.st_ino, stat.S_IMODE(held.st_mode))
+                require(stat.S_ISREG(held.st_mode) and held.st_uid == os.getuid() and held.st_nlink == 1
+                        and physical == (named.st_dev, named.st_ino, 0o700) and 0 < held.st_size <= 4096,
+                        "The owned vendor observation executable changed.")
+                raw = os.read(descriptor, 4097)
+                require(len(raw) == held.st_size and os.fstat(descriptor).st_mtime_ns == held.st_mtime_ns,
+                        "Vendor sentinel bytes changed while reading.")
+            finally:
+                os.close(descriptor)
+        return self._read(self.auth), self._read(self.settings), (raw, physical)
+
+    def check_inputs(self) -> None:
+        self.fixture.check()
+        require(self._inputs() == self.original_inputs, "Ordinary local request modified native or settings inputs.")
+        with PrivateDirectory(self.native) as directory:
+            require(os.listdir(directory.fd) == ["auth.json"], "Ordinary local request created native/profile state.")
+
+    def prepare_legacy(self, marker: bytes, *, journal: bytes | None = None, root: bytes | None = None) -> None:
+        """Initial private fixture bytes for legacy/interrupted-format readers."""
+        self.fixture.check()
+        self.state.mkdir(mode=0o700)
+        self._publish(self.state / "format", marker)
+        self._publish(self.state / "identity.guard", b"")
+        if journal is not None:
+            self._publish(self.state / "identity-upgrade.json", journal)
+        if root is not None:
+            self._publish(self.state / "identity.json", root)
+
+    def state_image(self) -> Object:
+        """Snapshot the fixed fixture tree without following unexpected entries."""
+        paths: Object = {}
+        for folder, directories, files in os.walk(self.state, followlinks=False):
+            base = Path(folder)
+            with PrivateDirectory(base) as directory:
+                paths[base.relative_to(self.state).as_posix()] = [directory.info.st_dev, directory.info.st_ino]
+            for name in directories:
+                with PrivateDirectory(base / name):
+                    pass
+            for name in files:
+                file = base / name
+                raw, inode = self._read(file)
+                paths[file.relative_to(self.state).as_posix()] = {"sha256": sha(raw), "physical": list(inode)}
+            require(len(paths) <= 256, "Unexpected local fixture inventory size.")
+        return paths
+
+    async def spawn(self, request: LocalRequest, expected: tuple[str, str] | None = None) -> LocalInvocation:
+        authority = self.session.authority
+        provider = authority.provider
+        declaration = provider.declaration
+        if request == "list":
+            require(expected is None, "List does not accept identity expectation.")
+            tail = ["subscriptions", "list"]
+        else:
+            require(request == "identity", "Unexpected local Driver request.")
+            tail = ["subscriptions", "identity", "chatgpt"]
+            if expected is not None:
+                tail.extend(("--expect", ".".join(token(value) for value in expected)))
+        argv = [str(provider.regular_file(declaration.interpreter)), "-ISB", str(provider.regular_file(declaration.entry)),
+                "--qualification-launch", str(authority.registry), COMPONENT, authority.producer.declaration.build,
+                "driver", "--", "--state-dir", str(self.state), *tail]
+        process = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=self.fixture.path, env=self.environment, close_fds=True, limit=8192,
+        )
+        owner = process_identity(process.pid)
+        require(matches(owner, parent=os.getpid()), "The actual public provider is not our verified child.")
+        return LocalInvocation(process, owner)
+
+    async def collect(self, invocation: LocalInvocation, name: str) -> LocalCapture:
+        process = invocation.process
+        assert process.stdout is not None and process.stderr is not None
+
+        async def drain(stream: asyncio.StreamReader) -> bytes:
+            raw = bytearray()
+            while block := await stream.read(4096):
+                raw.extend(block)
+                require(len(raw) <= 4096, "Public Driver stream exceeded its local observation bound.")
+            return bytes(raw)
+
+        async with asyncio.timeout(100), asyncio.TaskGroup() as tasks:
+            stdout = tasks.create_task(drain(process.stdout))
+            stderr = tasks.create_task(drain(process.stderr))
+            waited = tasks.create_task(process.wait())
+        capture = LocalCapture(waited.result(), stdout.result(), stderr.result(), invocation.owner)
+        self.fixture.publish(name + ".json", canonical({
+            "owner": dict(capture.owner), "reapedExit": capture.exit, "stdoutHex": capture.stdout.hex(),
+            "stderrHex": capture.stderr.hex(),
+        }, limit=32768), limit=32768)
+        require(self.fake_secret.encode() not in capture.stdout + capture.stderr,
+                "Private fixture contents escaped the public Driver output.")
+        self._terminal(capture.owner)
+        return capture
+
+    async def stop(self, invocation: LocalInvocation) -> None:
+        process = invocation.process
+        if process.returncode is None and matches(invocation.owner, parent=os.getpid()):
+            process.terminate()
+        async with asyncio.timeout(20):
+            await process.wait()
+
+    def _terminal(self, owner: Identity) -> None:
+        registry = self.session.registry
+        with registry.mutex(), PrivateDirectory(registry.folder / "writers") as writers:
+            names = os.listdir(writers.fd)
+            require(len(names) <= 4096, "Local invocation writer inventory exceeded its bound.")
+            roots = []
+            for invocation in names:
+                with PrivateDirectory(registry.folder / "writers" / token(invocation)) as group:
+                    entries = os.listdir(group.fd)
+                    require(len(entries) <= 4096, "Local invocation writer group exceeded its bound.")
+                    for name in entries:
+                        require(name.endswith(".json"), "Unexpected public writer metadata entry.")
+                        writer = registry.writer(invocation, name.removesuffix(".json"))
+                        if (writer["pid"], writer["startedAt"]) == (owner["pid"], owner["startedAt"]):
+                            roots.append(writer)
+            require(len(roots) == 1, "Public proof provider has no independent real root disposition.")
+            root = roots[0]
+            require(root["phase"] == "terminal" and root["parent"] is None and not matches(owner),
+                    "Actual public provider has not finished.")
+            with PrivateDirectory(registry.folder / "handoffs") as directory:
+                main = []
+                names = os.listdir(directory.fd)
+                require(len(names) <= 4096, "Local handoff inventory exceeded its bound.")
+                for name in names:
+                    if name.endswith(".context.json"):
+                        continue
+                    raw = directory.read(name)
+                    if raw is None:
+                        continue
+                    row = document(raw)
+                    if row["invocation"] == root["invocation"] and row["role"] == "main":
+                        main.append(row)
+                require(len(main) == 1, "Public proof has no exact accepted MAIN transfer.")
+                transfer = main[0]
+                writer = registry.writer(root["invocation"], transfer["child"])
+                require(transfer["phase"] == "accepted" and transfer["parent"] == root["writer"]
+                        and transfer["entry"] == self.session.authority.producer.declaration.entry
+                        and writer["phase"] == "terminal" and writer["parent"] == root["writer"]
+                        and writer["contextSha256"] == transfer["contextSha256"]
+                        and writer["epoch"] == root["epoch"] == self.session.context["epoch"]
+                        and not matches(identity_record({"pid": writer["pid"], "startedAt": writer["startedAt"]})),
+                        "Actual MAIN custody did not finish.")
+                with PrivateDirectory(registry.folder / "writers" / token(root["invocation"])) as group:
+                    expected = {token(root["writer"]) + ".json", token(writer["writer"]) + ".json"}
+                    require(set(os.listdir(group.fd)) == expected,
+                            "The local proof invocation left an unexpected writer.")
+
+    async def request(self, request: LocalRequest, name: str, expected: tuple[str, str] | None = None) -> LocalCapture:
+        self.check_inputs()
+        invocation = await self.spawn(request, expected)
+        try:
+            result = await self.collect(invocation, name)
+        finally:
+            await self.stop(invocation)
+        self.check_inputs()
+        return result
+
+    async def waiting_pair(self, invocations: Sequence[LocalInvocation]) -> list[Object]:
+        """Both exact MAIN processes must have reached the held real short lock."""
+        subscription = self.state / "subscriptions/chatgpt"
+        path = subscription / "lock"
+        initial = self._read(path)
+        require(document(initial[0])["owner"]["pid"] == os.getpid(), "The test runner did not own the held lock.")
+        deadline = time.monotonic() + 80
+        while time.monotonic() < deadline:
+            waiting: dict[int, Object] = {}
+            with PrivateDirectory(subscription) as directory:
+                for name in os.listdir(directory.fd):
+                    if re.fullmatch(r"\.write-[0-9a-f-]{36}", name) is None:
+                        continue
+                    try:
+                        raw = directory.read(name)
+                        pid = document(raw).get("owner", {}).get("pid") if raw else None
+                    except (FileNotFoundError, Failure, ValueError):
+                        # A contender may have just created its temporary file.
+                        # Only a complete, stable owner row can count.
+                        continue
+                    if type(pid) is not int or pid == os.getpid():
+                        continue
+                    current = inspect(pid)
+                    if current is None:
+                        continue
+                    for call in invocations:
+                        if current.parent == call.owner["pid"] and matches(call.owner, parent=os.getpid()):
+                            waiting[current.parent] = {"main": dict(current.identity), "provider": dict(call.owner)}
+            if len(waiting) == 2:
+                require(self._read(path) == initial and not os.path.lexists(subscription / "identity.json"),
+                        "Both contenders must reach the first capture queue before sidecar publication.")
+                return [waiting[call.owner["pid"]] for call in invocations]
+            require(all(call.process.returncode is None for call in invocations), "A contender exited before real overlap.")
+            await asyncio.sleep(0.02)
+        raise FixtureFailure("The two public MAINs were never both observed at the held lock.")
