@@ -10,6 +10,32 @@ if not _imp.is_frozen("os") or not _imp.is_frozen("posixpath"):
     raise SystemExit(1)
 import os  # noqa: E402
 
+_admission_exit_may_have_begun = False
+_pre_admission_excepthook = sys.excepthook
+
+
+def _unhandled(kind: type[BaseException], error: BaseException, traceback: TracebackType | None) -> None:
+    """Even an interrupt escaping the standalone footer must stay quiet late."""
+    if _admission_exit_may_have_begun:
+        os._exit(2)
+    _pre_admission_excepthook(kind, error, traceback)
+
+
+class _QuietSessionScope:
+    """Delegate exactly one real Session enter/exit, guarding exit BEFORE call."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def __enter__(self) -> Session:
+        return self.session.__enter__()
+
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
+                 traceback: TracebackType | None) -> None:
+        global _admission_exit_may_have_begun
+        _admission_exit_may_have_begun = True
+        self.session.__exit__(kind, error, traceback)
+
 
 def refuse() -> None:
     os.write(2, b'{"error":{"code":"internal","message":"Driver admission is unavailable."}}\n')
@@ -336,6 +362,7 @@ def _lease_hold(session: Session, channel: Socket, case: str) -> None:
 
 def _run_admitted(root: str, script: str, declaration_raw: bytes) -> int:
     """The unmodified real normal wire owns the only Session/terminal lifecycle."""
+    global _admission_exit_may_have_begun
     import re
     import signal
     import socket
@@ -389,7 +416,7 @@ def _run_admitted(root: str, script: str, declaration_raw: bytes) -> int:
         channel.set_inheritable(False)
         session = admit(payload, context, int(fd_text))
         _require(channel.fileno() != session.lease, "H1 control aliases its independently opened lease.")
-        with session:
+        with _QuietSessionScope(session):
             body_started = True
             try:
                 _lease_hold(session, channel, case)
@@ -407,14 +434,15 @@ def _run_admitted(root: str, script: str, declaration_raw: bytes) -> int:
                 raise
         return 0  # Exactly one genuine context-manager finish, no manual finish.
     except BaseException as original:
-        if not body_started:
+        if not body_started and not _admission_exit_may_have_begun:
             os.write(2, b"H1 admission unavailable; retain its real failed evidence.\n")
-        if session is not None and session.lease >= 0:
+        if session is not None and session.lease >= 0 and not _admission_exit_may_have_begun:
             # A failure after real admit but before __enter__ still owns real
             # custody. Abandon THAT object; never silently drop the live lease
             # or synthesize a terminal. Normal with-session failures already
             # performed this real path and have lease=-1.
             try:
+                _admission_exit_may_have_begun = True
                 session.abandon()
             except BaseException as cleanup_error:
                 original.add_note("Actual admission abandon: " + type(cleanup_error).__name__)
@@ -427,17 +455,28 @@ def _run_admitted(root: str, script: str, declaration_raw: bytes) -> int:
 
 
 if __name__ == "__main__":
+    sys.excepthook = _unhandled
     try:
-        raise SystemExit(_bootstrap())
+        outcome = _bootstrap()
     except SystemExit:
+        if _admission_exit_may_have_begun:
+            os._exit(2)
         raise
     except BaseException:
+        if _admission_exit_may_have_begun:
+            os._exit(2)
         os.write(2, b"H1 helper requires its isolated immutable payload and normal admission.\n")
         raise SystemExit(2) from None
+    else:
+        # All output/resources and the real context exit already settled. An
+        # interpreter finalizer must not add application output after terminal.
+        if _admission_exit_may_have_begun:
+            os._exit(outcome)
+        raise SystemExit(outcome)
 else:
     # Types/library imports are unreachable on the standalone pre-admission path.
     from pathlib import Path
     from socket import socket as Socket
-    from types import FrameType
+    from types import FrameType, TracebackType
 
     from arbol_codex_driver.admission import Session
