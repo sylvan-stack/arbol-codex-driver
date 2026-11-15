@@ -17,6 +17,7 @@ from .identity import (
     IdentityJournal,
     LifetimeSnapshot,
     PendingIdentity,
+    RecoveryObservation,
     canonical_id,
     expected_proof,
     lifetime_matches,
@@ -273,6 +274,48 @@ class Subscriptions:
         raise Failure("invalid_input", "ChatGPT uses the single native chatgpt Subscription; a second cannot be created.")
 
     async def reap(self, id_: str) -> None:
+        if self.state.assert_admitted().format == 1:
+            await self.reap_legacy(id_)
+            return
+        pending = self.progress(id_)
+        if pending is None or await owner_alive(parse_owner(pending.get("owner"))):
+            return
+
+        async def capture() -> tuple[Object, RecoveryObservation] | None:
+            if self.progress(id_) != pending or await owner_alive(parse_owner(pending.get("owner"))):
+                return None
+            return self.record(id_), RecoveryObservation.capture(self.state.assert_admitted(), id_)
+
+        observed = await self.state.with_subscription_lock(id_, capture, self.env)
+        if observed is None:
+            return
+        record, identity = observed
+        if "tool" in pending:
+            tool = parse_owner(pending["tool"])
+            if await owner_alive(tool):
+                try:
+                    os.killpg(tool["pid"], signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                if await owner_alive(tool):
+                    return  # Cleanup uncertainty retains the original receipt.
+
+        async def change() -> None:
+            if (
+                self.progress(id_) != pending or self.record(id_) != record
+                or RecoveryObservation.capture(self.state.assert_admitted(), id_) != identity
+                or await owner_alive(parse_owner(pending.get("owner")))
+                or "tool" in pending and await owner_alive(parse_owner(pending["tool"]))
+            ):
+                return
+            # No account verdict/proof/journal is written. A settled signed-in
+            # record remains signed in; a successor receipt is never removed.
+            with PrivateDirectory(self.state.subscription(id_)) as directory:
+                directory.delete("sign-in.json")
+
+        await self.state.with_subscription_lock(id_, change, self.env)
+
+    async def reap_legacy(self, id_: str) -> None:
         pending = self.progress(id_)
         if pending is None or await owner_alive(parse_owner(pending.get("owner"))):
             return
@@ -385,7 +428,7 @@ class Subscriptions:
 
         async def change() -> None:
             if not lifetime_matches(self.state.assert_admitted(), id_, lifetime):
-                return
+                raise Failure("in_use", "The Subscription lifetime changed while Codex was answering.")
             try:
                 current = self.record(id_)
             except Failure as error:

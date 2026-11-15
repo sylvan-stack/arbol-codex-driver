@@ -409,6 +409,25 @@ def lifetime_matches(state: IdentityState, identifier: str, snapshot: LifetimeSn
 
 
 @dataclass(frozen=True)
+class RecoveryObservation:
+    """Fresh local state observation, never authority for an old auth result."""
+
+    generation: str
+    sidecar: bytes | None
+
+    @classmethod
+    def capture(cls, state: IdentityState, identifier: str) -> RecoveryObservation:
+        # Caller validates the record under the same short lock. Explicit
+        # absent/retired sidecars are observations, never materialized proof.
+        generation = state.require_proof()
+        with PrivateDirectory(state.directory / "subscriptions" / canonical_id(identifier)) as directory:
+            if IdentityJournal._pending(directory) is not None:
+                raise invalid()
+            sidecar = subscription_sidecar(directory)
+            return cls(generation, canonical_bytes(sidecar) if sidecar is not None else None)
+
+
+@dataclass(frozen=True)
 class IdentityJournal:
     """Caller holds the canonical short Subscription lock throughout a method.
 
