@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import cast
 
+from arbol_codex_driver.admission import current_session
 from arbol_codex_driver.app_server import AppServer
 from arbol_codex_driver.cancellation import Cancellation, interruptible
 from arbol_codex_driver.dev_support import (
@@ -404,22 +405,10 @@ async def execute_run(
     """Exercise the same public program from source or a relocated Build."""
     path = directory / (uuid.uuid4().hex + ".json")
     write_json(path, request)
-    entry = Path(__file__).resolve().parents[2] / "bin" / "arbol-codex-driver"
-    child = await asyncio.create_subprocess_exec(
-        str(entry),
-        "run",
-        "--request",
-        str(path),
-        "--state-dir",
-        str(subscriptions.state.directory),
-        *(["--control"] if stop else []),
-        env=driver_environment(env),
-        cwd=directory,
-        start_new_session=True,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=1024 * 1024,
+    child = await current_session().spawn_helper_async(
+        ["run", "--request", str(path), "--state-dir", str(subscriptions.state.directory),
+         *(["--control"] if stop else [])],
+        entry="bin/entry.py", environment=driver_environment(env), cwd=directory, limit=1024 * 1024,
     )
     assert child.stdin is not None and child.stdout is not None and child.stderr is not None
     stderr = asyncio.create_task(child.stderr.read())
