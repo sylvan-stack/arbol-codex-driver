@@ -121,6 +121,8 @@ def parse_progress(value: Json) -> Object:
     owner = parse_owner(value.get("owner"))
     if "tool" in value:
         parse_owner(value["tool"])
+    if "lifetime" in value:
+        LifetimeSnapshot.parse(value["lifetime"])
     return {
         **value,
         "owner": owner_json(owner),
@@ -191,6 +193,19 @@ class Subscriptions:
     def progress(self, id_: str) -> Object | None:
         value = read_json(self.file(id_, "sign-in.json"))
         return None if value is None else parse_progress(value)
+
+    def progress_matches(self, id_: str, progress: Object) -> bool:
+        # Missing legacy evidence is never promoted to the current proof.
+        lifetime = LifetimeSnapshot.parse(progress["lifetime"]) if "lifetime" in progress else None
+        return lifetime_matches(self.state.assert_admitted(), id_, lifetime)
+
+    @staticmethod
+    def same_progress(current: Object, captured: Object) -> bool:
+        return (
+            current["attempt"] == captured["attempt"]
+            and parse_owner(current.get("owner")) == parse_owner(captured.get("owner"))
+            and current.get("lifetime") == captured.get("lifetime")
+        )
 
     async def get(self, id_: str) -> Object:
         record = self.record(id_)
@@ -273,7 +288,8 @@ class Subscriptions:
             current = self.progress(id_)
             if (
                 current is not None
-                and current["attempt"] == pending["attempt"]
+                and self.same_progress(current, pending)
+                and self.progress_matches(id_, pending)
                 and not await owner_alive(parse_owner(current.get("owner")))
             ):
                 self.file(id_, "sign-in.json").unlink(missing_ok=True)
@@ -490,12 +506,15 @@ class Subscriptions:
             await self.reap(id_)
             return
 
-        async def change() -> None:
+        async def change() -> bool:
             current = self.progress(id_)
-            if current is not None and current["attempt"] == pending["attempt"]:
-                write_json(self.file(id_, "sign-in.json"), {**current, "stopReason": reason})
+            if current is None or not self.same_progress(current, pending) or not self.progress_matches(id_, pending):
+                return False
+            write_json(self.file(id_, "sign-in.json"), {**current, "stopReason": reason})
+            return True
 
-        await self.state.with_subscription_lock(id_, change, self.env)
+        if not await self.state.with_subscription_lock(id_, change, self.env):
+            raise Failure("in_use", "The account operation lifetime is no longer available.")
         if await owner_alive(owner):
             try:
                 os.kill(owner["pid"], signal.SIGTERM)
@@ -512,6 +531,7 @@ class Subscriptions:
 
     async def reserve(self, id_: str, operation: str, by_code: bool = False) -> Object:
         await self.get(id_)
+        await self.settle_identity(id_)
         self.state.clear_unfinished_writes()
         owner = await process_owner(os.getpid())
         if owner is None:
@@ -532,7 +552,12 @@ class Subscriptions:
                 record = self.record(id_)
                 current = self.progress(id_)
                 if current is not None:
+                    if not self.progress_matches(id_, current):
+                        raise Failure("in_use", "The prior account operation lifetime is unavailable; recover it offline.")
                     return current
+                lifetime = LifetimeSnapshot.capture(self.state.assert_admitted(), id_)
+                if lifetime is not None:
+                    progress["lifetime"] = lifetime.document()
                 if operation == "sign_in":
                     cleared: Object = {**record, "state": "signed_out", "updatedAt": now(), "checkedAt": now()}
                     for key in ("account", "problem", "lastUsage"):
@@ -562,7 +587,10 @@ class Subscriptions:
     async def finish(self, id_: str, progress: Object, fields: Object | None = None) -> None:
         async def change() -> None:
             pending = self.progress(id_)
-            if pending is None or pending["attempt"] != progress["attempt"]:
+            if (
+                pending is None or not self.same_progress(pending, progress)
+                or not self.progress_matches(id_, progress)
+            ):
                 if fields is not None and fields.get("state") == "signed_in":
                     raise Failure("in_use", "Another sign-in took its place.")
                 return
@@ -583,7 +611,10 @@ class Subscriptions:
     async def set_tool(self, id_: str, progress: Object, tool: Owner) -> None:
         async def change() -> None:
             current = self.progress(id_)
-            if current is None or current["attempt"] != progress["attempt"]:
+            if (
+                current is None or not self.same_progress(current, progress)
+                or not self.progress_matches(id_, progress)
+            ):
                 raise Failure("in_use", "Another account operation took its place.")
             write_json(self.file(id_, "sign-in.json"), {**current, "tool": owner_json(tool)})
 
@@ -778,6 +809,21 @@ class Subscriptions:
             or expected_owner["pid"] != os.getpid() or parse_owner(current.get("owner")) != expected_owner
         ):
             raise Failure("in_use", "The original removal no longer owns this Subscription.")
+
+        state = self.state.assert_admitted()
+        if state.format == 2:
+            if "lifetime" not in progress or current.get("lifetime") != progress["lifetime"]:
+                raise Failure("in_use", "The original removal lifetime is unavailable.")
+            lifetime = LifetimeSnapshot.parse(progress["lifetime"])
+            if lifetime.subscription != id_ or lifetime.generation != state.generation:
+                raise Failure("in_use", "The original removal lifetime is unavailable.")
+            journal = IdentityJournal(state, id_)
+            pending = journal.pending()
+            if pending is None:
+                if not lifetime_matches(state, id_, lifetime):
+                    raise Failure("in_use", "The original removal lifetime is unavailable.")
+            elif pending.operation != "remove" or pending.witness != lifetime.witness:
+                raise Failure("in_use", "The original removal lifetime is unavailable.")
 
     async def settle_identity(self, id_: str) -> bool:
         """Settle a validated local outcome under the short lock, never cleanup."""

@@ -24,7 +24,7 @@ from .identity_protocol import (
     same_inode,
     token,
 )
-from .json_types import Object
+from .json_types import Json, Object
 
 DATA_FORMAT = 2
 
@@ -361,6 +361,18 @@ class LifetimeSnapshot:
     witness: str
 
     @classmethod
+    def parse(cls, value: Json) -> LifetimeSnapshot:
+        row = object_fields(value, {"subscription", "generation", "witness"})
+        if not isinstance(row["subscription"], str):
+            raise invalid()
+        return cls(canonical_id(row["subscription"]), token(row["generation"]), token(row["witness"]))
+
+    def document(self) -> Object:
+        value: Object = {"subscription": self.subscription, "generation": self.generation, "witness": self.witness}
+        self.parse(value)
+        return value
+
+    @classmethod
     def capture(cls, state: IdentityState, identifier: str) -> LifetimeSnapshot | None:
         # Caller validates the local record and holds its short lock.
         state.check()
@@ -389,6 +401,8 @@ def lifetime_matches(state: IdentityState, identifier: str, snapshot: LifetimeSn
             if IdentityJournal._pending(directory) is not None:
                 return False
             sidecar = subscription_sidecar(directory)
+            if identifier != "chatgpt" and not IdentityJournal._record_present(directory):
+                return False
             return sidecar is not None and sidecar["state"] == "active" and sidecar["witness"] == snapshot.witness
     except FileNotFoundError:
         return False
