@@ -9,7 +9,11 @@ import platform
 import re
 import subprocess
 import sys
+import tarfile
+import tempfile
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +55,28 @@ def source_provenance(root: Path = ROOT) -> dict[str, str | bool]:
 
     return {"repository": str(root.resolve()), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
             "commit": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}"), "uncommittedChanges": bool(git("status", "--porcelain"))}
+
+
+@contextmanager
+def committed_snapshot(root: Path, source: dict[str, str | bool]) -> Iterator[Path]:
+    commit, tree = source.get("commit"), source.get("tree")
+    if (source.get("uncommittedChanges") is not False or not isinstance(commit, str) or not isinstance(tree, str)
+            or re.fullmatch(r"[0-9a-f]{40}", commit) is None or re.fullmatch(r"[0-9a-f]{40}", tree) is None):
+        raise ValueError("Packaging requires exact clean committed source.")
+    actual = subprocess.run(["git", "rev-parse", commit + "^{tree}"], cwd=root, check=True,
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+    if actual != tree:
+        raise ValueError("Source commit and tree do not agree.")
+    with tempfile.TemporaryDirectory(prefix="arbol-codex-source-") as temporary:
+        directory = Path(temporary)
+        archive = directory / "source.tar"
+        subprocess.run(["git", "archive", "--format=tar", "--output", str(archive), commit],
+                       cwd=root, check=True, timeout=60)
+        snapshot = directory / "source"
+        snapshot.mkdir(mode=0o700)
+        with tarfile.open(archive, "r:") as bundle:
+            bundle.extractall(snapshot, filter="data")
+        yield snapshot
 
 
 def target() -> str:
