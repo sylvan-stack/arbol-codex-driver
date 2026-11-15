@@ -315,3 +315,167 @@ class IdentityState:
             self.check()
             self.closed = True
             os.close(self.descriptor)  # Never LOCK_UN a shared description.
+
+
+@dataclass(frozen=True)
+class PendingIdentity:
+    """Exact local settlement journal, never an auth or process receipt."""
+
+    operation: str
+    witness: str
+    phase: str
+
+    @classmethod
+    def parse(cls, value: Object) -> PendingIdentity:
+        row = object_fields(value, {"version", "operation", "witness", "phase"})
+        if (
+            type(row["version"]) is not int or row["version"] != 1
+            or row["operation"] not in ("create", "remove") or row["phase"] not in ("prepared", "committed")
+        ):
+            raise invalid()
+        return cls(str(row["operation"]), token(row["witness"]), str(row["phase"]))
+
+    def document(self) -> Object:
+        value: Object = {"version": 1, "operation": self.operation, "witness": self.witness, "phase": self.phase}
+        self.parse(value)
+        return value
+
+
+def subscription_sidecar(directory: PrivateDirectory) -> Object | None:
+    raw = directory.read("identity.json")
+    if raw is None:
+        return None
+    value = object_fields(parse_bytes(raw), {"version", "witness", "state"})
+    if type(value["version"]) is not int or value["version"] != 1 or value["state"] not in ("active", "retired"):
+        raise invalid()
+    token(value["witness"])
+    return value
+
+
+@dataclass(frozen=True)
+class IdentityJournal:
+    """Caller holds the canonical short Subscription lock throughout a method.
+
+    Record validation and original owner/attempt cleanup evidence belong to the
+    caller. A journal alone never proves prepared remove cleanup succeeded.
+    """
+
+    state: IdentityState
+    identifier: str
+
+    def _directory(self) -> PrivateDirectory:
+        self.state.require_proof()
+        return PrivateDirectory(self.state.directory / "subscriptions" / canonical_id(self.identifier))
+
+    @staticmethod
+    def _pending(directory: PrivateDirectory) -> PendingIdentity | None:
+        raw = directory.read("identity-pending.json")
+        if raw is None:
+            return None
+        value = parse_bytes(raw)
+        assert isinstance(value, dict)
+        return PendingIdentity.parse(value)
+
+    def pending(self) -> PendingIdentity | None:
+        with self._directory() as directory:
+            return self._pending(directory)
+
+    @staticmethod
+    def _same(directory: PrivateDirectory, pending: PendingIdentity) -> None:
+        pending.document()
+        if IdentityJournal._pending(directory) != pending:
+            raise invalid()
+
+    @staticmethod
+    def _matching_sidecar(directory: PrivateDirectory, witness: str) -> Object | None:
+        value = subscription_sidecar(directory)
+        if value is not None and value["witness"] != token(witness):
+            raise invalid()
+        return value
+
+    @staticmethod
+    def _record_present(directory: PrivateDirectory) -> bool:
+        try:
+            info = os.stat("record.json", dir_fd=directory.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        private_stat(info)
+        return True
+
+    def begin_remove(self, witness: str) -> PendingIdentity:
+        if self.identifier == "chatgpt":
+            raise Failure("invalid_input", "The native chatgpt Subscription cannot be removed.")
+        pending = PendingIdentity("remove", token(witness), "prepared")
+        with self._directory() as directory:
+            if self._pending(directory) is not None:
+                raise invalid()
+            sidecar = self._matching_sidecar(directory, pending.witness)
+            if sidecar is None or sidecar["state"] != "active" or not self._record_present(directory):
+                raise invalid()
+            directory.publish("identity-pending.json", canonical_bytes(pending.document()))
+            self.state.check()
+        return pending
+
+    def cancel_remove(self, pending: PendingIdentity) -> None:
+        """Only the original live operation, before any cleanup effect, calls this."""
+        if pending.operation != "remove" or pending.phase != "prepared" or self.identifier == "chatgpt":
+            raise invalid()
+        with self._directory() as directory:
+            self._same(directory, pending)
+            sidecar = self._matching_sidecar(directory, pending.witness)
+            if sidecar is None or sidecar["state"] != "active" or not self._record_present(directory):
+                raise invalid()
+            directory.delete("identity-pending.json")
+            self.state.check()
+
+    def complete_remove(self, pending: PendingIdentity) -> None:
+        """Caller proves original cleanup/receipt success, or a committed journal.
+
+        Any current record must have been validated by the caller. Retirement,
+        deletion and the committed phase are durable before pending is cleared.
+        """
+        if pending.operation != "remove" or self.identifier == "chatgpt":
+            raise invalid()
+        with self._directory() as directory:
+            self._same(directory, pending)
+            self._matching_sidecar(directory, pending.witness)
+            directory.publish("identity.json", canonical_bytes({
+                "version": 1, "witness": pending.witness, "state": "retired",
+            }))
+            directory.delete("record.json")
+            committed = PendingIdentity("remove", pending.witness, "committed")
+            directory.publish("identity-pending.json", canonical_bytes(committed.document()))
+            directory.delete("identity-pending.json")
+            self.state.check()
+
+    def settle(self, *, record_present: bool) -> str | None:
+        """Caller has validated a present real record; malformed input refuses.
+
+        A dead process, missing progress or an absent record cannot turn a
+        prepared remove into success. Explicit conservative maintenance owns it.
+        """
+        if type(record_present) is not bool:
+            raise invalid()
+        with self._directory() as directory:
+            pending = self._pending(directory)
+            if pending is None:
+                return None
+            if self._record_present(directory) != record_present:
+                raise invalid()
+            sidecar = self._matching_sidecar(directory, pending.witness)
+            if pending.operation == "remove":
+                if pending.phase != "committed" or self.identifier == "chatgpt":
+                    raise invalid()
+            else:
+                active = record_present and (sidecar is None or sidecar["state"] == "active")
+                state = "active" if active else "retired"
+                directory.publish("identity.json", canonical_bytes({
+                    "version": 1, "witness": pending.witness, "state": state,
+                }))
+                committed = PendingIdentity("create", pending.witness, "committed")
+                directory.publish("identity-pending.json", canonical_bytes(committed.document()))
+                directory.delete("identity-pending.json")
+                self.state.check()
+                return state
+        self.complete_remove(pending)
+        return "retired"
