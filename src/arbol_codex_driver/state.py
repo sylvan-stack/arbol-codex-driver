@@ -11,15 +11,14 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from .errors import Failure
+from .identity import DATA_FORMAT as DATA_FORMAT
+from .identity import IdentityState
 from .json_types import Json, dumps, iso, loads, timestamp
 
 
 class Owner(TypedDict):
     pid: int
     startedAt: str
-
-
-DATA_FORMAT = 1
 
 
 def default_state_directory(home: str) -> Path:
@@ -188,46 +187,32 @@ async def reclaim_dead_file(path: Path, snapshot: os.stat_result, temporary: Pat
 class State:
     def __init__(self, directory: Path | str) -> None:
         self.directory = Path(os.path.abspath(directory))
+        self.identity: IdentityState | None = None
 
     def initialize(self) -> None:
-        path = self.directory / "format"
+        if self.identity is None:
+            self.identity = IdentityState.open(self.directory)
+        else:
+            self.identity.check()
 
-        def check() -> bool:
-            try:
-                content = path.read_text().strip()
-            except FileNotFoundError:
-                return False
-            if not re.fullmatch(r"[1-9][0-9]*", content):
-                raise Failure("internal", f"State format in {path} is malformed.")
-            value = int(content)
-            if value > DATA_FORMAT:
-                raise Failure(
-                    "state_newer",
-                    f"State format {value} is newer than supported format {DATA_FORMAT}.",
-                    {"remedy": "Run the Build that wrote this state, or a newer one."},
-                )
-            return True
+    def assert_admitted(self) -> IdentityState:
+        if self.identity is None:
+            raise Failure("internal", "Driver state has not been admitted.")
+        self.identity.check()
+        return self.identity
 
-        if check():
-            private_directory(self.directory)
-            path.chmod(0o600)
-            return
-        private_directory(self.directory)
-        temporary = prepare_file(path, f"{DATA_FORMAT}\n")
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            pass
-        finally:
-            remove_file(temporary)
-        check()
+    def close(self) -> None:
+        if self.identity is not None:
+            self.identity.close()
 
     def subscription(self, id_: str) -> Path:
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", id_):
             raise Failure("invalid_input", "The Subscription identifier is not a safe file name.")
+        self.assert_admitted()
         return self.directory / "subscriptions" / id_
 
     def clear_unfinished_writes(self) -> None:
+        self.assert_admitted()
         def visit(directory: Path, depth: int) -> None:
             if not directory.exists():
                 return
