@@ -455,141 +455,82 @@ class Session:
         if current != self.authority:
             raise invalid()
 
+    def _end_spawn(self) -> None:
+        with self._activity:
+            if self._spawning <= 0:
+                raise invalid()
+            self._spawning -= 1
+            self._activity.notify_all()
+            if self._abandon_complete and self._spawning == 0:
+                self._close_owned()
+
+    def prepare_helper(self, entry: str) -> HelperHandoff:
+        """Preregister one exact direct child; keep activity until ACK/close.
+
+        Callers own their child/streams and must join acknowledge before close.
+        Explicit nonauthority control fds may accompany pass_fds in that spawn;
+        the ticket itself supplies only its one-use admission socket.
+        """
+        with self._activity:
+            if self._closing or self.lease < 0:
+                raise invalid()
+            self._spawning += 1
+        registered = False
+        frames: Frames | None = None
+        child_socket: socket.socket | None = None
+        try:
+            entry = relative_path(entry)
+            if entry not in self.authority.producer.declaration.helpers:
+                raise invalid()
+            handoff, writer, nonce = fresh_token(), fresh_token(), fresh_token()
+            pending: Object = {
+                "version": 1, "handoff": handoff, "component": COMPONENT, "invocation": self.context["invocation"],
+                "parent": self.context["writer"], "child": writer, "epoch": self.context["epoch"],
+                "payloadSha256": self.context["payloadSha256"], "phase": "pending", "nonce": nonce,
+                "contextSha256": None, "role": "helper", "entry": entry,
+                "acceptanceSha256": self.context["acceptanceSha256"],
+            }
+            with self.registry.mutex():
+                self._check()
+                _publish(self.registry.handoff_path(handoff), pending, absent=True)
+                self.handoffs[handoff] = pending
+                registered = True
+            parent_socket, child_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            frames = Frames(parent_socket.detach())
+            integer(child_socket.fileno(), 3)
+            return HelperHandoff(self, pending, frames, child_socket)
+        except BaseException:
+            try:
+                if registered:
+                    with self.registry.mutex():
+                        self.registry.custody_loss(self.context)
+            finally:
+                try:
+                    if child_socket is not None:
+                        child_socket.close()
+                    if frames is not None:
+                        frames.close()
+                finally:
+                    self._end_spawn()
+            raise
+
     def spawn_helper(
         self, arguments: list[str], *, entry: str, environment: dict[str, str] | None = None,
         cwd: Path | None = None, stdin: int | IO[bytes] | None = None,
         stdout: int | IO[bytes] | None = None, stderr: int | IO[bytes] | None = None,
         start_new_session: bool = True,
     ) -> subprocess.Popen[bytes]:
-        with self._activity:
-            if self._closing or self.lease < 0:
-                raise invalid()
-            self._spawning += 1
+        ticket = self.prepare_helper(entry)
         try:
-            return self._spawn_helper(
-                arguments, entry=entry, environment=environment, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr,
+            child = subprocess.Popen(
+                [*ticket.prefix, *arguments], env=ticket.environment(dict(os.environ) if environment is None else environment),
+                cwd=cwd, pass_fds=ticket.pass_fds, close_fds=True, stdin=stdin, stdout=stdout, stderr=stderr,
                 start_new_session=start_new_session,
             )
-        finally:
-            with self._activity:
-                self._spawning -= 1
-                self._activity.notify_all()
-                # An uncertain process cannot release admission while another
-                # spawning thread can still publish registry metadata.
-                if self._abandon_complete and self._spawning == 0:
-                    self._close_owned()
-
-    def _spawn_helper(
-        self, arguments: list[str], *, entry: str, environment: dict[str, str] | None = None,
-        cwd: Path | None = None, stdin: int | IO[bytes] | None = None,
-        stdout: int | IO[bytes] | None = None, stderr: int | IO[bytes] | None = None,
-        start_new_session: bool = True,
-    ) -> subprocess.Popen[bytes]:
-        """Transfer one same-invocation helper without retaining argv/account data.
-
-        Runner callers must retain their existing stream/cancellation/cleanup
-        responsibilities and join their spawning task before terminal settlement.
-        """
-        entry = relative_path(entry)
-        payload = self.authority.producer
-        if entry not in payload.declaration.helpers:
-            raise invalid()
-        handoff, writer, nonce = fresh_token(), fresh_token(), fresh_token()
-        path = self.registry.handoff_path(handoff)
-        context_path = self.registry.folder / "handoffs" / (handoff + ".context.json")
-        pending: Object = {
-            "version": 1, "handoff": handoff, "component": COMPONENT, "invocation": self.context["invocation"],
-            "parent": self.context["writer"], "child": writer, "epoch": self.context["epoch"],
-            "payloadSha256": self.context["payloadSha256"], "phase": "pending", "nonce": nonce,
-            "contextSha256": None, "role": "helper", "entry": entry,
-            "acceptanceSha256": self.context["acceptanceSha256"],
-        }
-        frames: Frames | None = None
-        child_socket: socket.socket | None = None
-        registered = False
-        try:
-            with self.registry.mutex():
-                self._check()
-                _publish(path, pending, absent=True)
-                self.handoffs[handoff] = pending
-                registered = True
-            parent_socket, child_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-            frames = Frames(parent_socket.detach())
-            child_fd = child_socket.fileno()
-            integer(child_fd, 3)
-            inherited = dict(os.environ) if environment is None else dict(environment)
-            for key in AUTHORITY_ENV:
-                inherited.pop(key, None)
-            inherited[NORMAL_FD], inherited[NORMAL_CONTEXT] = str(child_fd), str(context_path)
-            child = subprocess.Popen(
-                [str(payload.regular_file(payload.declaration.interpreter)), "-ISB", str(payload.regular_file(entry)),
-                 *arguments],
-                env=inherited, cwd=cwd, pass_fds=(child_fd,), close_fds=True,
-                stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=start_new_session,
-            )
-            child_socket.close()
-            child_socket = None
-            child_identity = process_identity(child.pid)
-            if not matches(child_identity, parent=os.getpid()):
-                raise invalid()
-            own = identity_record(self.context["process"])
-            context: Object = {
-                **self.context, "role": "helper", "writer": writer, "handoff": handoff, "nonce": nonce,
-                "entry": entry, "parent": {"writer": self.context["writer"], "pid": own["pid"], "startedAt": own["startedAt"]},
-                "process": {"pid": child_identity["pid"], "startedAt": child_identity["startedAt"]},
-            }
-            _context(context)
-            context_hash = sha256(canonical_bytes(context))
-            with self.registry.mutex(frames.deadline):
-                self._check()
-                if _handoff(_read(path)) != pending or not matches(child_identity, parent=os.getpid()):
-                    raise invalid()
-                _publish(context_path, context, absent=True)
-                pending = {**pending, "contextSha256": context_hash}
-                _publish(path, pending)
-                self.handoffs[handoff] = pending
-            frames.send({"version": 1, "type": "offer", "contextSha256": context_hash})
-            ready = object_fields(frames.receive(), {"version", "type", "handoff", "nonce", "contextSha256", "challenge"})
-            _version(ready)
-            challenge = token(ready["challenge"])
-            frame: Object = {"version": 1, "handoff": handoff, "nonce": nonce,
-                             "contextSha256": context_hash, "challenge": challenge}
-            if ready != {**frame, "type": "ready"}:
-                raise invalid()
-            expected = _own_writer(context, context_hash)
-            accepted = {**pending, "phase": "accepted", "challenge": challenge}
-            with self.registry.mutex(frames.deadline):
-                self._check()
-                if (
-                    _handoff(_read(path)) != pending
-                    or self.registry.writer(context["invocation"], writer) != expected
-                    or not matches(child_identity, parent=os.getpid())
-                ):
-                    raise invalid()
-                _publish(path, _handoff(accepted))
-            frames.send({**frame, "type": "go"})
-            started = frames.receive()
-            _version(started)
-            if started != {**frame, "type": "started"}:
-                raise invalid()
-            frames.no_extra()
-            with self.registry.mutex(frames.deadline):
-                self._check()
-                current = self.registry.writer(context["invocation"], writer)
-                if _handoff(_read(path)) != accepted or current not in (expected, {**expected, "phase": "terminal"}):
-                    raise invalid()
-                self.handoffs[handoff] = accepted
+            ticket.acknowledge(child.pid)
             return child
-        except BaseException:
-            if registered:
-                with self.registry.mutex():
-                    self.registry.custody_loss(self.context)
-            raise
         finally:
-            if child_socket is not None:
-                child_socket.close()
-            if frames is not None:
-                frames.close()
+            ticket.close()
 
     def _close_owned(self) -> None:
         if self.lease >= 0:
@@ -659,6 +600,143 @@ class Session:
                 # If a timed-out spawning thread remains, retain this process's
                 # lease until that thread's last protocol effect, or process
                 # death. Its active record and taint remain unresolved.
+
+
+@dataclass
+class HelperHandoff:
+    """Exact one-use direct-child ticket; an idle close preserves uncertainty."""
+
+    parent: Session
+    pending: Object
+    frames: Frames
+    child_socket: socket.socket
+    completed: bool = False
+    _closed: bool = False
+    _busy: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def context_path(self) -> Path:
+        return self.parent.registry.folder / "handoffs" / (token(self.pending["handoff"]) + ".context.json")
+
+    @property
+    def prefix(self) -> list[str]:
+        payload = self.parent.authority.producer
+        entry = relative_path(self.pending["entry"])
+        if self._closed or entry not in payload.declaration.helpers:
+            raise invalid()
+        return [str(payload.regular_file(payload.declaration.interpreter)), "-ISB", str(payload.regular_file(entry))]
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        if self._closed:
+            raise invalid()
+        descriptor = self.child_socket.fileno()
+        integer(descriptor, 3)
+        return (descriptor,)
+
+    def environment(self, inherited: dict[str, str]) -> dict[str, str]:
+        environment = {key: value for key, value in inherited.items() if key not in AUTHORITY_ENV}
+        environment[NORMAL_FD] = str(self.pass_fds[0])
+        environment[NORMAL_CONTEXT] = str(self.context_path)
+        return environment
+
+    def _release(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self.child_socket.close()
+        finally:
+            try:
+                self.frames.close()
+            finally:
+                self.parent._end_spawn()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if self._busy:
+                raise invalid()  # Join the registry-writing worker before closing.
+            self._busy = True
+        try:
+            if not self.completed:
+                with self.parent.registry.mutex():
+                    self.parent.registry.custody_loss(self.parent.context)
+        finally:
+            self._release()
+
+    def acknowledge(self, pid: int) -> None:
+        with self._lock:
+            if self._closed or self._busy:
+                raise invalid()
+            self._busy = True
+        parent, pending, frames = self.parent, self.pending, self.frames
+        try:
+            handoff, writer, nonce = (token(pending[key]) for key in ("handoff", "child", "nonce"))
+            entry = relative_path(pending["entry"])
+            path, context_path = parent.registry.handoff_path(handoff), self.context_path
+            self.child_socket.close()
+            child_identity = process_identity(pid)
+            if not matches(child_identity, parent=os.getpid()):
+                raise invalid()
+            own = identity_record(parent.context["process"])
+            context: Object = {
+                **parent.context, "role": "helper", "writer": writer, "handoff": handoff, "nonce": nonce,
+                "entry": entry, "parent": {"writer": parent.context["writer"], "pid": own["pid"], "startedAt": own["startedAt"]},
+                "process": {"pid": child_identity["pid"], "startedAt": child_identity["startedAt"]},
+            }
+            _context(context)
+            context_hash = sha256(canonical_bytes(context))
+            with parent.registry.mutex(frames.deadline):
+                parent._check()
+                if _handoff(_read(path)) != pending or not matches(child_identity, parent=os.getpid()):
+                    raise invalid()
+                _publish(context_path, context, absent=True)
+                pending = {**pending, "contextSha256": context_hash}
+                _publish(path, pending)
+                parent.handoffs[handoff] = pending
+            frames.send({"version": 1, "type": "offer", "contextSha256": context_hash})
+            ready = object_fields(frames.receive(), {"version", "type", "handoff", "nonce", "contextSha256", "challenge"})
+            _version(ready)
+            challenge = token(ready["challenge"])
+            frame: Object = {"version": 1, "handoff": handoff, "nonce": nonce,
+                             "contextSha256": context_hash, "challenge": challenge}
+            if ready != {**frame, "type": "ready"}:
+                raise invalid()
+            expected = _own_writer(context, context_hash)
+            accepted = {**pending, "phase": "accepted", "challenge": challenge}
+            with parent.registry.mutex(frames.deadline):
+                parent._check()
+                if (
+                    _handoff(_read(path)) != pending
+                    or parent.registry.writer(context["invocation"], writer) != expected
+                    or not matches(child_identity, parent=os.getpid())
+                ):
+                    raise invalid()
+                _publish(path, _handoff(accepted))
+            frames.send({**frame, "type": "go"})
+            started = frames.receive()
+            _version(started)
+            if started != {**frame, "type": "started"}:
+                raise invalid()
+            frames.no_extra()
+            with parent.registry.mutex(frames.deadline):
+                parent._check()
+                current = parent.registry.writer(context["invocation"], writer)
+                if _handoff(_read(path)) != accepted or current not in (expected, {**expected, "phase": "terminal"}):
+                    raise invalid()
+                parent.handoffs[handoff] = accepted
+            self.pending = accepted
+            self.completed = True
+        except BaseException:
+            with parent.registry.mutex():
+                parent.registry.custody_loss(parent.context)
+            raise
+        finally:
+            self._release()
 
 
 _CURRENT: ContextVar[Session | None] = ContextVar("codex_driver_admission", default=None)
