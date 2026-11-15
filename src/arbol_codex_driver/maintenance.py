@@ -224,6 +224,13 @@ class Maintenance:
         self.registry.check_lock("admission.lock", self.descriptor)
         return operation
 
+    def recheck(self) -> Object:
+        """Local algorithms may use only this invocation's entered handoff."""
+        if current_maintenance() is not self:
+            raise invalid()
+        with self.registry.mutex():
+            return self.check()
+
     def __enter__(self) -> Maintenance:
         if self._entered or self.descriptor < 0 or _CURRENT.get() is not None:
             raise invalid()
