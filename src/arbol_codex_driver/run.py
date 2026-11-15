@@ -201,6 +201,8 @@ async def run(
         )
 
         async def spawned(owner: Owner) -> None:
+            # The admitted parent completes this durable run evidence before
+            # AppServer releases its notification-only vendor exec barrier.
             record["tool"] = owner_json(owner)
             runs.save(record)
 

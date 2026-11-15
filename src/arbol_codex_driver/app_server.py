@@ -1,22 +1,29 @@
 import asyncio
 import codecs
+import fcntl
 import json
 import math
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
+from .admission import current_session
 from .build import build_identity
 from .cancellation import Cancellation, interruptible
 from .environment import clean_environment
 from .errors import Failure, safe_text
+from .identity_protocol import PrivateDirectory
 from .json_types import Json, Object, dumps, loads, object_value, string
 from .owner_setup import DiagnosticScrubber, sanitize_diagnostic
 from .process_groups import collect_process_groups, end_process_groups, force_process_groups
-from .state import Owner, fixed_wait, owner_json, private_directory, process_owner
+from .process_identity import matches as admission_matches
+from .process_identity import process_identity as admission_process_identity
+from .state import Owner, fixed_wait, owner_json, private_directory, process_owner, ps_time
 from .tool import OLDEST_SUPPORTED, supported_version
 
 APP_SERVER_OPTIONS = (
@@ -25,6 +32,27 @@ APP_SERVER_OPTIONS = (
     "-c", "analytics.enabled=false",
     "-c", 'web_search="live"',
 )
+
+
+# The shell reads only the private pipe, closes its inherited barrier, then
+# execs the exact existing positional vendor argv. It never writes Driver state.
+_EXEC_BARRIER = (
+    'barrier="$1"; shift; case "$barrier" in ""|*[!0-9]*) exit 1;; esac; '
+    'IFS= read -r release <&"$barrier" || exit 1; [ "$release" = go ] || exit 1; '
+    'eval "exec ${barrier}<&-"; exec "$@"'
+)
+
+
+def startup_ledger(owner: Owner) -> bytes:
+    """Retain the existing PID + C-locale lstart reader, without float time."""
+    value = datetime.fromisoformat(owner["startedAt"]).astimezone(UTC)
+    days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    line = (f"{days[value.weekday()]} {months[value.month - 1]} {value.day:2d} "
+            f"{value.hour:02d}:{value.minute:02d}:{value.second:02d} {value.year:04d}")
+    if ps_time(line) != owner["startedAt"]:
+        raise Failure("internal", "Cannot preserve the tool process identity.")
+    return f"{owner['pid']}\n{line}\n".encode("ascii")
 
 
 def validate_driver_config(value: Json) -> Object:
@@ -150,15 +178,33 @@ class AppServer:
             private_directory(isolated_home)
         identity = build_identity()
         arguments = [tool_path, "app-server", *APP_SERVER_OPTIONS]
+        barrier_read, barrier_write = -1, -1
+
+        def close_barrier() -> None:
+            nonlocal barrier_read, barrier_write
+            owned = (barrier_read, barrier_write)
+            barrier_read, barrier_write = -1, -1
+            for descriptor in owned:
+                if descriptor >= 0:
+                    os.close(descriptor)
+
         if launch_identity_path is not None:
-            arguments = [
-                "/bin/sh",
-                "-c",
-                'umask 077; ledger="$1.write"; { printf "%s\\n" "$$"; TZ=UTC LC_ALL=C /bin/ps -p "$$" -o lstart=; } > "$ledger" && /bin/mv -f "$ledger" "$1" || exit 1; shift; exec "$@"',
-                "arbol-codex-launch",
-                str(launch_identity_path),
-                *arguments,
-            ]
+            session = current_session()
+            with session.registry.mutex():
+                session._check()
+            raw_read, raw_write = os.pipe()
+            try:
+                # Keep the private barrier distinct from child stdio even if
+                # the caller originally closed descriptor 0, 1 or 2.
+                barrier_read = fcntl.fcntl(raw_read, fcntl.F_DUPFD_CLOEXEC, 3)
+                barrier_write = fcntl.fcntl(raw_write, fcntl.F_DUPFD_CLOEXEC, 3)
+            except BaseException:
+                close_barrier()
+                raise
+            finally:
+                os.close(raw_read)
+                os.close(raw_write)
+            arguments = ["/bin/sh", "-c", _EXEC_BARRIER, "arbol-codex-launch", str(barrier_read), *arguments]
         # The clean environment excludes inherited Arbol identity.
         child_env = clean_environment(env, owner_home, str(isolated_home) if isolated_home is not None else None)
         if arbol_chat_id is not None:
@@ -172,9 +218,17 @@ class AppServer:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                pass_fds=(barrier_read,) if barrier_read >= 0 else (),
+                close_fds=True,
             )
-        except OSError:
-            raise Failure("tool_failed", "Cannot start the codex app-server.") from None
+            if barrier_read >= 0:
+                descriptor, barrier_read = barrier_read, -1
+                os.close(descriptor)
+        except BaseException as error:
+            close_barrier()
+            if isinstance(error, OSError):
+                raise Failure("tool_failed", "Cannot start the codex app-server.") from None
+            raise
         from .json_types import now
 
         server = cls(
@@ -190,10 +244,33 @@ class AppServer:
             owner = await process_owner(child.pid)
             if owner is None:
                 raise Failure("tool_failed", "Cannot identify the codex app-server process.")
+            blocked_identity = admission_process_identity(child.pid) if launch_identity_path is not None else None
             server.owner = owner
             server.groups[owner["pid"]] = owner
+            if launch_identity_path is not None:
+                assert blocked_identity is not None
+                if (
+                    not admission_matches(blocked_identity, parent=os.getpid())
+                    or await process_owner(child.pid) != owner or child.returncode is not None
+                ):
+                    raise Failure("tool_failed", "The app-server startup process changed.")
+                with PrivateDirectory(launch_identity_path.parent) as directory:
+                    directory.publish(launch_identity_path.name, startup_ledger(owner))
             if on_spawn is not None:
                 await on_spawn(owner)
+            if launch_identity_path is not None:
+                assert blocked_identity is not None
+                if cancellation is not None:
+                    cancellation.check()
+                if (
+                    not admission_matches(blocked_identity, parent=os.getpid())
+                    or await process_owner(child.pid) != owner or child.returncode is not None
+                ):
+                    raise Failure("tool_failed", "The app-server startup process changed.")
+                current_session().registry.check_lock("admission.lock", current_session().lease)
+                if os.write(barrier_write, b"go\n") != 3:
+                    raise Failure("tool_failed", "Cannot release the app-server startup barrier.")
+                close_barrier()
             answer = object_value(
                 await server.request(
                     "initialize",
@@ -228,12 +305,15 @@ class AppServer:
             )
             return server
         except BaseException:
+            close_barrier()  # EOF prevents vendor exec before bounded cleanup.
             stopped = cancellation.stopped_at if cancellation is not None else None
             await server.end(
                 None if stopped is None else stopped + fixed_wait(15000, env),
                 None if stopped is None else stopped + fixed_wait(2000, env),
             )
             raise
+        finally:
+            close_barrier()
 
     async def send(self, value: Json) -> None:
         if self.failure is not None:
