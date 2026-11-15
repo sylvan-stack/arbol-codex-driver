@@ -421,6 +421,45 @@ class Operation:
         self.check()
         return source
 
+    async def restore(self) -> Object:
+        source = await self.prepare_restore()
+        conversion_path = self.maintenance.request.backup / "conversion-before"
+        if source.format == 1:
+            if read_bytes(conversion_path / "manifest.json") is not None:
+                conversion = Archive.load(conversion_path)
+            else:
+                if state_format(self.directory) != 1:
+                    raise invalid()
+                conversion = preserve_entry(conversion_path, snapshot(self.directory, metadata_names(self.directory)))
+            if (
+                conversion.format != 1 or conversion.content("identity-upgrade.json") is not None
+                or conversion.content("identity-maintenance.json") != canonical_bytes(self.marker("pending"))
+            ):
+                raise invalid()
+            # This remains operation=restore under the same exclusive context.
+            # The internal journal has its own immutable conversion-before hash.
+            await self.convert(conversion, conversion_path)
+        elif source.format == 2:
+            if os.path.lexists(conversion_path):
+                raise invalid()
+            original = source.content("identity.json")
+            if original is None:
+                raise invalid()
+            value = parse_bytes(original)
+            assert isinstance(value, dict)
+            restored_generation = token(value["generation"])
+            if state_format(self.directory) != 2 or root_generation(self.directory) not in (
+                restored_generation, self.generation,
+            ):
+                raise invalid()
+            self.validate_metadata()
+            if self.read_marker() != self.marker("complete"):
+                self.write("identity.json", canonical_bytes({"version": 1, "generation": self.generation}))
+        else:
+            raise invalid()
+        await self.validate_records()
+        return self.complete()
+
     def validate_settled(self, *, complete: bool) -> None:
         operation = self.check()
         if self.before is None or self.source_hash != operation["sourceSha256"]:
