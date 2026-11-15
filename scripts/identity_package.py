@@ -24,6 +24,8 @@ MAXIMUM = 32 * 1024 * 1024
 ENTRIES = 100000
 INTERPRETER = "runtime/python/bin/python3.14"
 ENTRY = "bin/entry.py"
+# Reserved exact files; ABR-38 must author/admit runner/actor bodies before use.
+HELPERS = [ENTRY, "scripts/check_build.py", "tests/identity_actor.py"]
 IMPORT_ROOTS = ["runtime/python/lib/python3.14", "runtime/python/lib/python3.14/lib-dynload", "src"]
 
 
@@ -206,7 +208,7 @@ def emit(root: Path, build: str, source: dict[str, Any]) -> None:
     rows = inventory(root)
     validate_links(rows)
     indexed = {str(row["path"]): row for row in rows}
-    for name in (INTERPRETER, ENTRY):
+    for name in (INTERPRETER, ENTRY, *HELPERS):
         if name not in indexed or indexed[name]["type"] != "file":
             raise ValueError("Declared interpreter and entry must be inventoried regular files.")
     if not indexed[INTERPRETER]["mode"] & 0o111:
@@ -218,7 +220,7 @@ def emit(root: Path, build: str, source: dict[str, Any]) -> None:
     declaration = canonical({
         "version": 1, "kind": "driver-capability", "component": COMPONENT, "build": build,
         "source": {"commit": commit, "tree": tree}, "interpreter": INTERPRETER, "entry": ENTRY,
-        "helpers": [ENTRY], "importRoots": IMPORT_ROOTS,
+        "helpers": HELPERS, "importRoots": IMPORT_ROOTS,
         "payloadManifestSha256": hashlib.sha256(manifest).hexdigest(),
         "capabilities": {"subscriptionIdentity": 1, "driverMaintenance": 1},
     }, 4096)
