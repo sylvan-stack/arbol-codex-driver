@@ -14,18 +14,21 @@ from .errors import Failure
 from .identity import IdentityState, PendingIdentity, canonical_id, retire_pending, root_generation, state_format
 from .identity_backup import (
     Archive,
+    archive_parent,
     local_marker,
     metadata_name,
     metadata_names,
     preserve,
+    preserve_entry,
     private_directory,
     publish_bytes,
     raw_format,
     read_bytes,
+    snapshot,
     sync_directory,
     validate_source,
 )
-from .identity_protocol import PrivateDirectory, canonical_bytes, invalid, parse_bytes, sha256, token
+from .identity_protocol import MANIFEST_LIMIT, PrivateDirectory, canonical_bytes, invalid, parse_bytes, sha256, token
 from .json_types import Object, timestamp
 from .maintenance import Maintenance, current_maintenance
 from .state import owner_alive, parse_owner, prepare_file, read_json, with_subscription_directory_lock
@@ -61,9 +64,13 @@ class Operation:
         if self.guard is not None:
             raise invalid()
         private_directory(self.directory)
-        number = raw_format(read_bytes(self.directory / "format", limit=4096))
+        restoring = self.context["operation"] == "restore"
+        number = raw_format(read_bytes(self.directory / "format", limit=MANIFEST_LIMIT if restoring else 4096))
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-        if number == 1:
+        fresh_restore = restoring and number is None and not any(self.directory.iterdir())
+        if fresh_restore:
+            flags |= os.O_CREAT | os.O_EXCL
+        elif number == 1:
             # Pre-identity format1 may lack a guard. The component has already
             # drained old writers; existing format2 never recreates its inode.
             flags |= os.O_CREAT
@@ -312,6 +319,107 @@ class Operation:
 
         await self.short_lock(identifier, change)
         return self.complete()
+
+    def restored_conversion(self, source: Archive) -> bool:
+        """Recognize only this attempt's post-staging conversion/rotation.
+
+        Never reapply format1 after its format2 fence. The conversion entry
+        contains the exact current pending restore marker, not old authority.
+        """
+        backup = self.maintenance.request.backup / "conversion-before"
+        complete_root = read_bytes(self.directory / "identity.json", limit=MANIFEST_LIMIT) == canonical_bytes({
+            "version": 1, "generation": self.generation,
+        }) and read_bytes(self.directory / "format", limit=MANIFEST_LIMIT) == b"2\n"
+        if os.path.lexists(backup):
+            if source.format != 1:
+                raise invalid()
+            private_directory(backup)
+            if read_bytes(backup / "manifest.json") is None:
+                # Preservation may have died before its manifest publication.
+                # No conversion effect is allowed until that entry is complete.
+                if complete_root or read_bytes(self.directory / "identity-upgrade.json") is not None:
+                    raise invalid()
+                return False
+            conversion = Archive.load(backup)
+            if (
+                conversion.format != 1 or conversion.content("identity-upgrade.json") is not None
+                or conversion.content("identity-maintenance.json") != canonical_bytes(self.marker("pending"))
+            ):
+                raise invalid()
+            raw = read_bytes(self.directory / "identity-upgrade.json", limit=4096)
+            if raw is not None:
+                expected: Object = {"version": 1, "from": 1, "to": 2, "generation": self.generation,
+                                    "backup": str(backup), "backupSha256": conversion.digest}
+                if parse_bytes(raw) != expected:
+                    raise invalid()
+            elif not complete_root:
+                names = metadata_names(self.directory, list(conversion.rows))
+                if snapshot(self.directory, names) != {name: conversion.content(name) for name in names}:
+                    raise invalid()
+            return True
+        if complete_root:
+            if source.format != 2:
+                raise invalid()  # Missing format1 conversion preservation.
+            return True
+        return False
+
+    async def prepare_restore(self) -> Archive:
+        if self.context["operation"] != "restore" or self.maintenance.request.source is None:
+            raise invalid()
+        operation = self.check()
+        source = Archive.load(self.maintenance.request.source, source=True)
+        if source.digest != operation["sourceSha256"]:
+            raise invalid()
+        # Restore does not invent successful cleanup for a backed-up pending
+        # Subscription transaction. Use clean metadata or conservative retire.
+        if any(entry.present and entry.path.endswith("/identity-pending.json") for entry in source.entries):
+            raise invalid()
+        await self.validate_records()
+        before = preserve(self.directory, self.maintenance.request.backup, self.context, source.digest,
+                          extra=list(source.rows))
+        if operation["backupSha256"] not in (None, before.digest):
+            raise invalid()
+        self.before, self.source_hash = before, source.digest
+        desired = canonical_bytes({"version": 1, "generation": self.generation})
+        if source.content("identity.json") == desired or before.content("identity.json") == desired:
+            raise invalid()  # A supported new restore must rotate the key.
+        raw = read_bytes(self.directory / "identity-maintenance.json")
+        own = (canonical_bytes(self.marker("pending")), canonical_bytes(self.marker("complete")))
+        if raw not in own:
+            if raw != before.content("identity-maintenance.json"):
+                raise invalid()
+            self.write("identity-maintenance.json", own[0])
+        if raw == own[1]:
+            self.validate_settled(complete=True)
+            return source
+        # Historical source journals are preserved as bounded metadata evidence,
+        # never copied into the active maintenance/upgrade authority paths.
+        preserve_entry(self.maintenance.request.backup / "source-journals", {
+            "format": source.content("format"),
+            "identity-upgrade.json": source.content("identity-upgrade.json"),
+            "identity-maintenance.json": source.content("identity-maintenance.json"),
+        })
+        if self.restored_conversion(source):
+            return source
+        self.delete("identity-upgrade.json")
+        format_bytes = source.content("format")
+        if format_bytes is None:
+            raise invalid()
+        self.write("format", format_bytes)
+        names = metadata_names(self.directory, list(set(before.rows) | set(source.rows)))
+        for name in names:
+            if name in ("format", "identity-maintenance.json", "identity-upgrade.json"):
+                continue
+            data = source.content(name)
+            path = self.directory / name
+            if data is None:
+                if read_bytes(path) is not None:
+                    self.delete(name)
+            else:
+                archive_parent(self.directory, name)
+                self.write(name, data)
+        self.check()
+        return source
 
     def validate_settled(self, *, complete: bool) -> None:
         operation = self.check()

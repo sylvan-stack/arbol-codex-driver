@@ -253,7 +253,7 @@ class Archive:
         result = cls(directory, number, entries, sha256(raw))
         if actual != expected or raw_format(result.content("format")) != number:
             raise invalid()
-        if source and (number not in (1, 2) or number == 2 and (
+        if source and (number not in (1, 2) or len(result.content("format") or b"") > 4096 or number == 2 and (
             result.content("identity.json") is None or result.content("format") != b"2\n"
         )):
             raise invalid()
