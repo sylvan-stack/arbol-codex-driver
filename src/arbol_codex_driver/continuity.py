@@ -6,6 +6,8 @@ from typing import TypedDict, cast
 
 from .errors import Failure
 from .history import images
+from .identity import LifetimeSnapshot, lifetime_matches
+from .identity_protocol import PrivateDirectory, fresh_token, token
 from .json_types import Object, dumps, now, timestamp, utf8
 from .run_request import RunRequest
 from .state import State, owner_alive, parse_owner, read_json, write_json
@@ -80,6 +82,11 @@ def message_digest(items: list[Object]) -> Fingerprint:
     return stream.snapshot()
 
 
+def string_revision(entry: Object) -> str | None:
+    value = entry.get("revision")
+    return value if isinstance(value, str) else None
+
+
 class Chats:
     def __init__(self, state: State) -> None:
         self.state = state
@@ -111,30 +118,60 @@ class Chats:
             or timestamp(value.get("writtenAt")) is None
         ):
             raise Failure("internal", "Malformed chat map entry.")
-        return {
-            key: value[key]
-            for key in (
-                "chatSessionId",
-                "conversation",
-                "workingDirectory",
-                "messages",
-                "digest",
-                "systemPromptDigest",
-                "writtenAt",
-            )
-        }
+        if "lifetime" in value:
+            LifetimeSnapshot.parse(value["lifetime"])
+        if "revision" in value:
+            token(value["revision"])
+        fields = (
+            "chatSessionId", "conversation", "workingDirectory", "messages", "digest",
+            "systemPromptDigest", "writtenAt", "lifetime", "revision",
+        )
+        return {key: value[key] for key in fields if key in value}
 
-    async def select(self, request: RunRequest) -> Object:
+    def matches(
+        self, subscription_id: str, entry: Object, lifetime: LifetimeSnapshot | None, revision: str | None,
+    ) -> bool:
+        if not lifetime_matches(self.state.assert_admitted(), subscription_id, lifetime):
+            return False
+        if self.state.assert_admitted().format == 1:
+            return True
+        return (
+            lifetime is not None and entry.get("lifetime") == lifetime.document()
+            and revision is not None and entry.get("revision") == token(revision)
+        )
+
+    def remove(self, subscription_id: str, key: str) -> None:
+        path = self.path(subscription_id, key)
+        if self.state.assert_admitted().format == 1:
+            path.unlink(missing_ok=True)
+        else:
+            with PrivateDirectory(path.parent) as directory:
+                directory.delete(path.name)
+
+    async def select(self, request: RunRequest, *, lifetime: LifetimeSnapshot | None = None) -> Object:
+        # Caller holds the same short Subscription lock as run reservation.
+        if not lifetime_matches(self.state.assert_admitted(), request.subscription_id, lifetime):
+            raise Failure("in_use", "The Subscription lifetime changed before run reservation.")
+        if self.state.assert_admitted().format == 1:
+            # Preserve the legacy no-history/no-session paths without reading
+            # an unused map or inventing identity for that old entry.
+            if not request.history:
+                return {"continuity": "fresh"}
+            if request.chat_session_id is None or request.working_directory is None:
+                return {"continuity": "rebuilt", "rebuildReason": "no_chat_session"}
+        entry = None if request.chat_session_id is None else self.entry(
+            request.subscription_id, digest(request.chat_session_id),
+        )
+        base: Object = {"initialMap": entry} if self.state.assert_admitted().format == 2 else {}
         if not request.history:
-            return {"continuity": "fresh"}
+            return {**base, "continuity": "fresh"}
 
         def rebuilt(reason: str) -> Object:
-            return {"continuity": "rebuilt", "rebuildReason": reason}
+            return {**base, "continuity": "rebuilt", "rebuildReason": reason}
 
         if request.chat_session_id is None or request.working_directory is None:
             return rebuilt("no_chat_session")
-        entry = self.entry(request.subscription_id, digest(request.chat_session_id))
-        if entry is None:
+        if entry is None or not self.matches(request.subscription_id, entry, lifetime, string_revision(entry)):
             return rebuilt("first_run")
         fingerprint = message_digest(request.history)
         if entry["messages"] != fingerprint["messages"] or entry["digest"] != fingerprint["digest"]:
@@ -164,22 +201,32 @@ class Chats:
             ):
                 return rebuilt("in_use")
         return {
+            **base,
+            **({"continuedMapRevision": entry["revision"]} if "revision" in entry else {}),
             "continuity": "resumed",
             "conversation": entry["conversation"],
             "continuedConversation": entry["conversation"],
         }
 
     async def settle(
-        self, request: RunRequest, plan: Object, conversation: str | None, fingerprint: Fingerprint, completed: bool
+        self, request: RunRequest, plan: Object, conversation: str | None, fingerprint: Fingerprint, completed: bool,
+        *, lifetime: LifetimeSnapshot | None = None,
     ) -> None:
         if request.chat_session_id is None or request.working_directory is None:
             return
         key = digest(request.chat_session_id)
 
         async def change() -> None:
+            state = self.state.assert_admitted()
+            if not lifetime_matches(state, request.subscription_id, lifetime):
+                return
             if completed:
+                if state.format == 2 and self.entry(request.subscription_id, key) != plan.get("initialMap"):
+                    return  # Another admitted run has published a newer map.
+
                 if not conversation:
                     raise Failure("internal", "A completed saved run has no conversation.")
+                revision = fresh_token() if state.format == 2 else None
                 write_json(
                     self.path(request.subscription_id, key),
                     {
@@ -190,11 +237,19 @@ class Chats:
                         "digest": fingerprint["digest"],
                         "systemPromptDigest": digest(request.system_prompt or ""),
                         "writtenAt": now(),
+                        **({"lifetime": lifetime.document(), "revision": revision} if lifetime is not None else {}),
                     },
                 )
+                if revision is not None:
+                    plan["writtenMapRevision"] = revision
             elif "continuedConversation" in plan:
                 entry = self.entry(request.subscription_id, key)
-                if entry is not None and entry["conversation"] == plan["continuedConversation"]:
-                    self.path(request.subscription_id, key).unlink(missing_ok=True)
+                expected = plan.get("writtenMapRevision", plan.get("continuedMapRevision"))
+                revision = expected if isinstance(expected, str) else None
+                if (
+                    entry is not None and entry["conversation"] == plan["continuedConversation"]
+                    and self.matches(request.subscription_id, entry, lifetime, revision)
+                ):
+                    self.remove(request.subscription_id, key)
 
         await self.state.with_subscription_lock(request.subscription_id, change)

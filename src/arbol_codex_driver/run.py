@@ -13,6 +13,7 @@ from .continuity import Chats, MessageDigest
 from .errors import Failure, redact
 from .event_stream import EventStream
 from .history import history_items, labelled_history_input, prepare_turn_input
+from .identity import LifetimeSnapshot, lifetime_matches
 from .input_stream import Input
 from .json_types import Json, Object, loads, object_value, string
 from .owner_setup import diagnostic_values, owner_mcp_config, sanitize_diagnostic
@@ -89,6 +90,8 @@ async def run(
     stop_error: Failure | None = None
     clock_task: asyncio.Task[None] | None = None
     subscription: Object | None = None
+    lifetime: LifetimeSnapshot | None = None
+    reservation: Object | None = None
     limits: RunLimits | None = None
 
     def emit(type_: str, data: Object) -> None:
@@ -128,21 +131,26 @@ async def run(
         fingerprint.add({**request.input, "type": "message"})
         if not request.control and input_ is not None:
             input_.close()
-        subscription = await subscriptions.require_signed_in(request.subscription_id)
+        subscription, lifetime = await subscriptions.observe(request.subscription_id, signed_in=True)
         limits = RunLimits(object_value(subscription.get("lastUsage")))
         parsed = request
 
         async def reserve() -> Object:
-            nonlocal reserved_id, plan
+            nonlocal reserved_id, plan, reservation
+            if not lifetime_matches(subscriptions.state.assert_admitted(), parsed.subscription_id, lifetime):
+                raise Failure("in_use", "The Subscription lifetime changed before run reservation.")
             current = subscriptions.record(str(subscription["id"]))
             if current["state"] != "signed_in":
                 raise Failure("not_signed_in", "Sign in to this Subscription first.")
             if read_json(subscriptions.file(parsed.subscription_id, "sign-in.json")) is not None:
                 raise Failure("in_use", "An account operation is still in progress.")
-            record = await runs.reserve(parsed.run_id, parsed.subscription_id, parsed.labels, parsed.chat_session_id)
+            record = await runs.reserve(
+                parsed.run_id, parsed.subscription_id, parsed.labels, parsed.chat_session_id, lifetime=lifetime,
+            )
+            reservation = record
             reserved_id = parsed.run_id
-            plan = await chats.select(parsed)
-            for key in ("conversation", "continuedConversation"):
+            plan = await chats.select(parsed, lifetime=lifetime)
+            for key in ("conversation", "continuedConversation", "continuedMapRevision"):
                 if key in plan:
                     record[key] = plan[key]
             runs.save(record)
@@ -204,7 +212,7 @@ async def run(
             # The admitted parent completes this durable run evidence before
             # AppServer releases its notification-only vendor exec barrier.
             record["tool"] = owner_json(owner)
-            runs.save(record)
+            await runs.update(record)
 
         def notification(method: str, value: Json) -> None:
             nonlocal stop_error
@@ -276,6 +284,7 @@ async def run(
                 Failure(
                     "credential_rejected", "The Codex home has no ChatGPT account.", {"remedy": "Sign in again."}
                 ).result,
+                lifetime=lifetime,
             )
             raise Failure("not_signed_in", "The Codex home has no ChatGPT account.", {"remedy": "Sign in again."})
 
@@ -362,7 +371,7 @@ async def run(
         )
         conversation, current_model = str(native_thread["id"]), str(thread_record["model"])
         record["conversation"] = conversation
-        runs.save(record)
+        await runs.update(record)
         turn_input = request.input
         if plan["continuity"] == "rebuilt" and request.history:
             try:
@@ -583,9 +592,9 @@ async def run(
         if subscription is not None:
             try:
                 if limits is not None and limits.report is not None:
-                    await subscriptions.store_run_usage(subscription, limits.report)
+                    await subscriptions.store_run_usage(subscription, limits.report, lifetime=lifetime)
                 if isinstance(error, Failure):
-                    await subscriptions.run_report(subscription, error.result)
+                    await subscriptions.run_report(subscription, error.result, lifetime=lifetime)
             except Failure as failure:
                 # A newer sign-in or sign-out owns its account state.
                 if failure.result["code"] != "in_use":
@@ -602,6 +611,7 @@ async def run(
                 conversation,
                 fingerprint.snapshot(),
                 error is None and not cancellation.aborted and mapper is not None and mapper.outcome == "completed",
+                lifetime=lifetime,
             )
         except Exception as failure:
             error = error or failure
@@ -643,13 +653,15 @@ async def run(
             and conversation is not None
         ):
             await chats.settle(
-                request, {**plan, "continuedConversation": conversation}, conversation, fingerprint.snapshot(), False
+                request, {**plan, "continuedConversation": conversation}, conversation, fingerprint.snapshot(), False,
+                lifetime=lifetime,
             )
         return code
     except Exception:
         if request is not None and plan is not None and reserved_id is not None and conversation is not None:
             await chats.settle(
-                request, {**plan, "continuedConversation": conversation}, conversation, fingerprint.snapshot(), False
+                request, {**plan, "continuedConversation": conversation}, conversation, fingerprint.snapshot(), False,
+                lifetime=lifetime,
             )
         return 2 if cancellation.aborted and stop_error is None else 1
     finally:
@@ -657,5 +669,5 @@ async def run(
         if clock_task is not None:
             clock_task.cancel()
             await asyncio.gather(clock_task, return_exceptions=True)
-        if reserved_id is not None:
-            runs.remove(reserved_id)
+        if reservation is not None:
+            await runs.finish(reservation)

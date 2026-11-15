@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .continuity import Chats, digest
 from .errors import Failure
+from .identity import LifetimeSnapshot, lifetime_matches
+from .identity_protocol import token
 from .json_types import Object, dumps, now, timestamp
 from .process_groups import collect_process_groups, end_process_groups
 from .state import (
@@ -27,7 +29,7 @@ from .state import (
 
 
 def same_reservation(a: Object, b: Object) -> bool:
-    return all(a.get(key) == b.get(key) for key in ("runId", "subscriptionId", "startedAt", "owner"))
+    return all(a.get(key) == b.get(key) for key in ("runId", "subscriptionId", "startedAt", "owner", "lifetime"))
 
 
 class Runs:
@@ -62,6 +64,12 @@ class Runs:
             not isinstance(value["continuedConversation"], str) or not value["continuedConversation"]
         ):
             raise Failure("internal", "Malformed run conversation.")
+        if "lifetime" in value:
+            lifetime = LifetimeSnapshot.parse(value["lifetime"])
+            if lifetime.subscription != value["subscriptionId"]:
+                raise Failure("internal", "Run lifetime names another Subscription.")
+        if "continuedMapRevision" in value:
+            token(value["continuedMapRevision"])
         return value
 
     async def list(self) -> list[Object]:
@@ -160,12 +168,21 @@ class Runs:
                     current = self.record(id_)
                     if not owned(current) or current is None or await owner_alive(parse_owner(current.get("owner"))):
                         return
-                    if "chatKey" in claimed and "continuedConversation" in claimed:
+                    lifetime = LifetimeSnapshot.parse(claimed["lifetime"]) if "lifetime" in claimed else None
+                    if (
+                        "chatKey" in claimed and "continuedConversation" in claimed
+                        and lifetime_matches(self.state.assert_admitted(), subscription_id, lifetime)
+                    ):
                         chats = Chats(self.state)
                         entry = chats.entry(subscription_id, str(claimed["chatKey"]))
-                        if entry is not None and entry["conversation"] == claimed["continuedConversation"]:
-                            chats.path(subscription_id, str(claimed["chatKey"])).unlink(missing_ok=True)
-                    self.remove(id_)
+                        expected = claimed.get("continuedMapRevision")
+                        revision = expected if isinstance(expected, str) else None
+                        if (
+                            entry is not None and entry["conversation"] == claimed["continuedConversation"]
+                            and chats.matches(subscription_id, entry, lifetime, revision)
+                        ):
+                            chats.remove(subscription_id, str(claimed["chatKey"]))
+                    self.remove(id_, claimed)
 
                 await self.state.with_subscription_lock(subscription_id, remove, self.env)
             except Exception:
@@ -181,8 +198,11 @@ class Runs:
             return
 
     async def reserve(
-        self, run_id: str, subscription_id: str, labels: Object | None = None, chat_session_id: str | None = None
+        self, run_id: str, subscription_id: str, labels: Object | None = None, chat_session_id: str | None = None,
+        *, lifetime: LifetimeSnapshot | None = None,
     ) -> Object:
+        if not lifetime_matches(self.state.assert_admitted(), subscription_id, lifetime):
+            raise Failure("in_use", "The Subscription lifetime changed before run reservation.")
         owner = await process_owner(os.getpid())
         if owner is None:
             raise Failure("internal", "Cannot identify the run owner.")
@@ -192,6 +212,8 @@ class Runs:
             "owner": owner_json(owner),
             "startedAt": now(),
         }
+        if lifetime is not None:
+            record["lifetime"] = lifetime.document()
         if labels is not None:
             record["labels"] = labels
         if chat_session_id is not None:
@@ -207,10 +229,29 @@ class Runs:
         return record
 
     def save(self, record: Object) -> None:
+        # Caller holds the short lock. Exact reservation bookkeeping survives
+        # lifetime retirement so orphan process cleanup remains possible.
+        current = self.record(str(record["runId"]))
+        if current is None or not same_reservation(current, record):
+            raise Failure("in_use", "Another run reservation took its place.")
         write_json(self.path(str(record["runId"])), record)
 
-    def remove(self, id_: str) -> None:
-        self.path(id_).unlink(missing_ok=True)
+    async def update(self, record: Object) -> None:
+        async def change() -> None:
+            self.save(record)
+
+        await self.state.with_subscription_lock(str(record["subscriptionId"]), change, self.env)
+
+    def remove(self, id_: str, reservation: Object) -> None:
+        current = self.record(id_)
+        if current is not None and same_reservation(current, reservation):
+            self.path(id_).unlink(missing_ok=True)
+
+    async def finish(self, reservation: Object) -> None:
+        async def change() -> None:
+            self.remove(str(reservation["runId"]), reservation)
+
+        await self.state.with_subscription_lock(str(reservation["subscriptionId"]), change, self.env)
 
     async def stop(self, id_: str) -> None:
         self.path(id_)
