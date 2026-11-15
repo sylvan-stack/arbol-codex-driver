@@ -159,9 +159,15 @@ async def owner_alive(owner: Owner) -> bool:
 
 def read_lock(path: Path) -> tuple[os.stat_result, Owner] | None:
     try:
-        with path.open() as file:
-            snapshot = os.fstat(file.fileno())
-            value = loads(file.read())
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            snapshot = os.fstat(descriptor)
+            if not stat.S_ISREG(snapshot.st_mode):
+                raise ValueError("Lock owner text is not a regular file")
+            with os.fdopen(descriptor, "r", closefd=False) as file:
+                value = loads(file.read())
+        finally:
+            os.close(descriptor)
     except FileNotFoundError:
         return None
     except (OSError, ValueError):

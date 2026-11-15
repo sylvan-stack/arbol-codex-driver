@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import time
 from pathlib import Path
 
@@ -91,7 +92,15 @@ class Runs:
         tool = parse_owner(record["tool"]) if "tool" in record else None
         if tool is None:
             try:
-                lines = (directory / "tool-owner.txt").read_text().strip().splitlines()
+                descriptor = os.open(directory / "tool-owner.txt",
+                                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                try:
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise OSError("Tool owner text is not a regular file")
+                    with os.fdopen(descriptor, "r", closefd=False) as file:
+                        lines = file.read().strip().splitlines()
+                finally:
+                    os.close(descriptor)
             except FileNotFoundError:
                 lines = []
             if lines:
