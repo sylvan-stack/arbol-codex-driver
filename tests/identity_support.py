@@ -272,12 +272,16 @@ class CodexH1Support:
         self.selector: selectors.BaseSelector | None = None
         self.buffers = {name: bytearray() for name in ("stdout", "stderr", "actor", "suite")}
         self.reads: set[str] = set()
+        self.pipe_eof: set[str] = set()
         self.completed = False
         self.h1_started = False
         self.end = 0.0
         self.actor_consumed = False
         self.suite_consumed = False
         self.failure_preservation_attempted = False
+        self.cleanup_finished = False
+        self.cleanup_errors: list[str] = []
+        self.failed_output: dict[str, Object] = {}
         self.short_lock_origins: tuple[tuple[str, int, int, int, int], ...] | None = None
         self.console = SuiteControl(self.fixture)  # Last owned-resource setup.
 
@@ -334,6 +338,8 @@ class CodexH1Support:
             except BlockingIOError:
                 continue
             if not raw:
+                if name in ("stdout", "stderr"):
+                    self.pipe_eof.add(name)
                 self.selector.unregister(key.fileobj)
                 self.reads.discard(name)
                 require(name != "suite" or b"\n" in self.buffers[name], "Suite EOF is failure, not continue.")
@@ -588,15 +594,34 @@ class CodexH1Support:
             "ackPath": "synchronous-acknowledge-returned-before-ticket-close"}))
 
     def _cleanup(self) -> list[str]:
-        errors: list[str] = []
+        # One transaction, including repeated abort/context-finalizer calls.
+        # In particular, a second caller cannot restart a fresh twenty seconds.
+        if self.cleanup_finished:
+            return list(self.cleanup_errors)
+        self.cleanup_finished = True
+        errors = self.cleanup_errors
+        deadline = min(self.end, time.monotonic() + 20) if self.h1_started else time.monotonic() + 20
         if self.channel is not None:
             try:
-                self.channel.close()
+                self.channel.close()  # EOF is failure, never an actor continue.
             except BaseException as error:
                 errors.append("control:" + type(error).__name__)
         if self.ticket is not None:
             try:
-                self.ticket.close()  # Synchronous acknowledge already returned/raised.
+                # The real synchronous ACK always releases its ticket in its
+                # finally. A pre-ACK spawn failure may instead need the actual
+                # public close (whose default mutex has no caller deadline).
+                # It cannot fit our strict shared budget by assumption. Preserve
+                # pending custody/activity instead; never privately end them.
+                if self.ticket._closed:
+                    self.ticket.close()
+                else:
+                    errors.append("ticket-close-unavailable-within-shared-budget:activity-and-custody-unresolved")
+                    for endpoint in (self.ticket.child_socket, self.ticket.frames):
+                        try:
+                            endpoint.close()
+                        except BaseException as error:
+                            errors.append("ticket-endpoint:" + type(error).__name__)
             except BaseException as error:
                 errors.append("ticket:" + type(error).__name__)
         if self.child is not None:
@@ -610,8 +635,78 @@ class CodexH1Support:
                         errors.append("live-child-ownership-unverified")
             except BaseException as error:
                 errors.append("owned-stop:" + type(error).__name__)
+            # Independently drain BOTH actual owned pipes, including failures
+            # before the normal selector/ACK existed. Waiting first can deadlock
+            # a full diagnostic pipe; closing first would discard its evidence.
+            # Retain the first 4097 bytes (4096 + overflow witness), read at most
+            # 128 KiB per pipe, and distinguish real EOF from every failure/cap.
+            pending: dict[int, str] = {}
+            drain: selectors.BaseSelector | None = None
             try:
-                self.child.wait(timeout=max(.001, min(20, self.end - time.monotonic())))
+                drain = selectors.DefaultSelector()
+                for name, stream in (("stdout", self.child.stdout), ("stderr", self.child.stderr)):
+                    self.failed_output[name] = {"alreadyObserved": len(self.buffers[name]), "cleanupRead": 0,
+                                                "eofObserved": name in self.pipe_eof,
+                                                "discardedAfterPrefix": 0}
+                    if stream is None:
+                        errors.append(name + ":missing-owned-pipe")
+                        continue
+                    try:
+                        os.set_blocking(stream.fileno(), False)
+                        drain.register(stream, selectors.EVENT_READ, name)
+                        pending[stream.fileno()] = name
+                    except BaseException as error:
+                        errors.append(name + "-drain-setup:" + type(error).__name__)
+                while pending and time.monotonic() < deadline:
+                    for key, events in drain.select(min(.05, max(0, deadline - time.monotonic()))):
+                        if not events & selectors.EVENT_READ:
+                            continue
+                        name = pending[key.fd]
+                        facts = self.failed_output[name]
+                        try:
+                            raw = os.read(key.fd, min(8192, 128 * 1024 - facts["cleanupRead"]))
+                        except BlockingIOError:
+                            continue
+                        except BaseException as error:
+                            errors.append(name + "-drain-read:" + type(error).__name__)
+                            drain.unregister(key.fileobj)
+                            del pending[key.fd]
+                            continue
+                        if not raw:
+                            facts["eofObserved"] = True
+                            self.pipe_eof.add(name)
+                            drain.unregister(key.fileobj)
+                            del pending[key.fd]
+                            continue
+                        facts["cleanupRead"] += len(raw)
+                        room = max(0, 4097 - len(self.buffers[name]))
+                        self.buffers[name].extend(raw[:room])
+                        facts["discardedAfterPrefix"] += max(0, len(raw) - room)
+                        if len(self.buffers[name]) > 4096 and not facts.get("prefixOverflow"):
+                            facts["prefixOverflow"] = True
+                            errors.append(name + "-output-overflow:retained-prefix")
+                        if facts["cleanupRead"] >= 128 * 1024:
+                            errors.append(name + "-drain-byte-cap:unread-output-unresolved")
+                            drain.unregister(key.fileobj)
+                            del pending[key.fd]
+                    # Poll only our actual Popen; never reap an adopted child.
+                    self.child.poll()
+                errors.extend(name + "-drain-deadline:unread-output-unresolved" for name in pending.values())
+            except BaseException as error:
+                errors.append("owned-output-drain:" + type(error).__name__)
+            finally:
+                if drain is not None:
+                    try:
+                        drain.close()
+                    except BaseException as error:
+                        errors.append("cleanup-selector:" + type(error).__name__)
+            try:
+                if self.child.poll() is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        errors.append("owned-wait-deadline:process-unresolved")
+                    else:
+                        self.child.wait(timeout=remaining)
             except BaseException as error:
                 errors.append("owned-wait:" + type(error).__name__)
             for stream in (self.child.stdout, self.child.stderr):
@@ -625,7 +720,7 @@ class CodexH1Support:
                 self.selector.close()
             except BaseException as error:
                 errors.append("selector:" + type(error).__name__)
-        return errors
+        return list(errors)
 
     def abort_before_session_finish(self) -> list[str]:
         failures = self._cleanup()
@@ -637,6 +732,7 @@ class CodexH1Support:
                     "pendingExternal": list(self.pending), "child": self.child_owner,
                     "childReturncode": None if self.child is None else self.child.returncode,
                     "actualOutputHex": {name: bytes(raw).hex() for name, raw in self.buffers.items()},
+                    "failedOutputObservation": self.failed_output,
                     "cleanupErrors": failures, "terminalOrGatePassClaimed": False}, limit=4 * 1024 * 1024))
             except BaseException as error:
                 failures.append("failed-evidence:" + type(error).__name__)
