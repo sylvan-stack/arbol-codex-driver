@@ -44,8 +44,8 @@ this source change. [The Beat](https://github.com/sylvan-stack/forester-artifact
 records exact source checkpoints and the remaining qualification routes.
 
 A qualified invocation uses the registered launcher/provider and exact immutable
-payload. Direct new source entry, copied binaries and unadmitted children refuse
-before Driver state access, including for format1. Normal commands and helpers
+payload. Direct invocation of the new source or copied new entry without live
+admission refuses before Driver state access, including for format1. Normal commands and helpers
 hold their independent component admission; state admission survives final
 output and task/executor cleanup. The generic helper API is implemented, while
 retained dev/archived qualification runner wiring belongs to ABR-38. No testing
@@ -82,9 +82,10 @@ remain as described above.
 Offline operations are the four fixed Driver child commands `state upgrade`,
 `state identity-reset`, `state restore` and `state identity-recover`, dispatched
 only by the shared `arbol-builds driver-state execute` provider under closed,
-drained, exclusive admission. Every child requires absolute canonical
-`--state-dir`, `--maintenance`, `--backup` and `--confirm-quiescent`; upgrade also
-requires `--from-format 1`, restore alone requires `--source`, and targeted
+drained, exclusive admission. Every child requires `--confirm-quiescent` and
+absolute canonical paths for `--state-dir`, `--maintenance` and `--backup`;
+upgrade also requires `--from-format 1`, restore alone requires an absolute
+canonical `--source`, and targeted
 recovery alone requires `--subscription <canonical-id> --retire`. A copied
 receipt, environment pair or quiescence assertion alone cannot grant authority.
 The exact live descriptor/context, epoch, payload and attempt must match.
