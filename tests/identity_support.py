@@ -278,6 +278,7 @@ class CodexH1Support:
         self.actor_consumed = False
         self.suite_consumed = False
         self.failure_preservation_attempted = False
+        self.short_lock_origins: tuple[tuple[str, int, int, int, int], ...] | None = None
         self.console = SuiteControl(self.fixture)  # Last owned-resource setup.
 
     def __enter__(self) -> CodexH1Support:
@@ -383,6 +384,74 @@ class CodexH1Support:
             self.selector.register(stream, selectors.EVENT_READ, name)
             self.reads.add(name)
 
+    def _observe_short_lock_origins(self) -> tuple[bytes, bytes]:
+        """Actual ready-return origins, not a future recapture or lock inode.
+
+        These raw directory descriptions hold NO flock. Never open/create,
+        delete, acquire or reclaim the ephemeral Subscription lock itself.
+        """
+        require(self.short_lock_origins is None, "Short-lock origins cannot be refreshed.")
+        self.fixture.check()
+        opened: list[PrivateDirectory] = []
+        original: BaseException | None = None
+        try:
+            parent = PrivateDirectory(self.fixture.path)
+            opened.append(parent)
+            origins: list[tuple[str, int, int, int, int]] = []
+            for name, relative in (("state", "state"), ("subscriptions", "state/subscriptions"),
+                                   ("chatgpt", "state/subscriptions/chatgpt")):
+                parent.check()
+                current = PrivateDirectory(parent.path / name)
+                opened.append(current)
+                named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+                info = current.info
+                require((info.st_dev, info.st_ino) == (named.st_dev, named.st_ino)
+                        and stat.S_ISDIR(named.st_mode) and info.st_uid == named.st_uid == os.getuid()
+                        and stat.S_IMODE(info.st_mode) == stat.S_IMODE(named.st_mode) == 0o700,
+                        "Original physical short-lock directory/parent relationship changed.")
+                origins.append((relative, info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)))
+                parent.check()
+                current.check()
+                parent = current
+            root_raw = opened[1].read("identity.json")
+            sidecar_raw = opened[3].read("identity.json")
+            require(root_raw is not None and sidecar_raw is not None, "Real H1 local proof is absent.")
+            for directory in opened:
+                directory.check()
+            # Retain all THREE original identities before closing observers.
+            # Later checks compare these values; they may never replace them.
+            self.short_lock_origins = tuple(origins)
+            assert root_raw is not None and sidecar_raw is not None
+            return root_raw, sidecar_raw
+        except BaseException as error:
+            original = error
+            raise
+        finally:
+            failures: list[BaseException] = []
+            for directory in reversed(opened):
+                try:
+                    directory.__exit__(None, None, None)
+                except BaseException as error:
+                    failures.append(error)
+            if failures:
+                if original is not None:
+                    for cleanup_error in failures:
+                        original.add_note("Short-lock origin observer close: " + type(cleanup_error).__name__)
+                else:
+                    raise BaseExceptionGroup("Short-lock origin observer cleanup failed.", failures)
+
+    def _recheck_short_lock_origins(self) -> None:
+        require(self.short_lock_origins is not None, "No actual readiness directory origins exist.")
+        assert self.short_lock_origins is not None
+        self.fixture.check()
+        for relative, device, inode, uid, mode in self.short_lock_origins:
+            # relative is retained from the fixed literal three-element list;
+            # no control/frame/evidence document can select an observer path.
+            with PrivateDirectory(self.fixture.path / relative) as directory:
+                info = directory.info
+                require((info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode))
+                        == (device, inode, uid, mode), "Original readiness directory was replaced or re-owned.")
+
     def run_h1(self) -> None:
         require(not self.h1_started and len(self.rows) == len(self.ordered) - 1
                 and all(row["localStatus"] == "passed" for row in self.rows),
@@ -419,11 +488,7 @@ class CodexH1Support:
             # Independently observe actual local proof persistence while our
             # parent Session is still genuinely admitted. These are exact owned
             # fixture paths, not native/profile inputs or actor-trusted proofs.
-            self.fixture.check()
-            with PrivateDirectory(self.fixture.path / "state") as directory:
-                root_raw = directory.read("identity.json")
-            with PrivateDirectory(self.fixture.path / "state/subscriptions/chatgpt") as directory:
-                sidecar_raw = directory.read("identity.json")
+            root_raw, sidecar_raw = self._observe_short_lock_origins()
             require(root_raw is not None and sidecar_raw is not None, "Actual H1 capture did not persist local proof.")
             assert root_raw is not None and sidecar_raw is not None
             token(document(root_raw)["generation"])
@@ -434,7 +499,9 @@ class CodexH1Support:
                         and matches(self.child_owner, parent=os.getpid()), "H1 already stopped writing/exited before readiness.")
             preconditions = canonical({"version": 1, "kind": "abr38-H1-local-preconditions", "case": self.fixture.case,
                 "actorReadySha256": sha(ready), "helperContextSha256": sha(context_raw),
-                "persistedRootSha256": sha(root_raw), "persistedSidecarSha256": sha(sidecar_raw)})
+                "persistedRootSha256": sha(root_raw), "persistedSidecarSha256": sha(sidecar_raw),
+                "shortLockDirectories": [{"relative": relative, "device": device, "inode": inode, "uid": uid, "mode": mode}
+                                         for relative, device, inode, uid, mode in self.short_lock_origins or ()]})
             self.fixture.publish("h1-preconditions.json", preconditions)
             self.rows.append({"id": H1_ID, "localStatus": "h1-preconditions-done", "helperSpanStatus": "pending",
                               "resultSha256": sha(preconditions)})
@@ -463,8 +530,10 @@ class CodexH1Support:
                     **self.child_owner}, "actorReadySha256": sha(ready),
                 "admissionLock": {"device": held.st_dev, "inode": held.st_ino}, "pendingExternal": list(self.pending)},
                 limit=16 * 1024)
+            self._recheck_short_lock_origins()
             for name, raw in (("phase-report.json", base_raw), ("local-results.json", local_raw), ("helper-span.json", report_raw)):
                 self.fixture.publish(name, raw, limit=16 * 1024 if name == "helper-span.json" else 1024 * 1024)
+            self._recheck_short_lock_origins()
             latch = min(self.end - 20, ready_at + 8)
             self.console.ready(sha(report_raw), deadline=latch)
             assert self.selector is not None
