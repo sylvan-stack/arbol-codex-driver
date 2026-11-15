@@ -33,7 +33,91 @@ observations below retain their historical scope.
 | Package | `@sylvan-stack/arbol-codex-driver` 1.0.0 |
 | Artifact corpus | `~/Artifacts/arbol-codex-driver` (GitHub `sylvan-stack/arbol-codex-driver-artifacts`) |
 
-## Numbered Builds
+## Identity source and qualification (15 November 2026)
+
+ABR-34 implements the Browser Subscription identity producer in source. Its
+implementation checks are static. Registered payload construction, complete
+ordinary Build gates, native/provider behavior, independent final review and
+ABR-38's shared qualification are still required before installed or Browser
+use. No gate, state migration, accepted payload or runtime pass follows from
+this source change. [The Beat](https://github.com/sylvan-stack/forester-artifacts/blob/main/sagas/sylvan-stack/arbol-browser/driver-subscription-identity/ABR-34.md)
+records exact source checkpoints and the remaining qualification routes.
+
+A qualified invocation uses the registered launcher/provider and exact immutable
+payload. Direct new source entry, copied binaries and unadmitted children refuse
+before Driver state access, including for format1. Normal commands and helpers
+hold their independent component admission; state admission survives final
+output and task/executor cleanup. The generic helper API is implemented, while
+retained dev/archived qualification runner wiring belongs to ABR-38. No testing
+workaround supplies production authority.
+
+The exact local operation is:
+
+```text
+subscriptions identity <canonical-id> [--expect <generation>.<witness>]
+```
+
+The canonical native selector is `chatgpt`. Identity uses only the validated
+local record or implicit built-in and format2 sidecars. It works independently
+of sign-in and reads no native account, settings contents or application
+database; it performs no run reaping or app-server request. Its revision1 proof
+contains driver, canonical subscription, root generation and lifetime witness.
+The tokens are independent of IDs, timestamps and auth changes. `--expect`
+requires the exact captured pair; a mismatch requires explicit selection and
+rebind. Arbol alone owns application UUIDs. Qualified `info` adds
+`capabilities.subscriptionIdentity: 1` while retaining contract1, package
+version and Build reporting without another tool check solely for capability.
+
+New admitted state starts at format2. Existing format1 retains its legacy
+record behavior and has no positive identity proof or automatic conversion.
+The normal default remains `~/Library/Application Support/Arbol/drivers/codex`;
+`--state-dir` selects another state directory under the same component gate.
+Root/per-Subscription evidence is separate from record.json. Relabeling and auth
+changes preserve proof; removal/retirement and delayed writes use canonical
+short locks, journals and captured lifetime checks. Pending or unsafe metadata
+refuses proof instead of guessing continuity. Native HOME/configuration,
+account-read/sign-in cancellation and chatgpt create/sign-out/remove refusals
+remain as described above.
+
+Offline operations are the four fixed Driver child commands `state upgrade`,
+`state identity-reset`, `state restore` and `state identity-recover`, dispatched
+only by the shared `arbol-builds driver-state execute` provider under closed,
+drained, exclusive admission. Every child requires absolute canonical
+`--state-dir`, `--maintenance`, `--backup` and `--confirm-quiescent`; upgrade also
+requires `--from-format 1`, restore alone requires `--source`, and targeted
+recovery alone requires `--subscription <canonical-id> --retire`. A copied
+receipt, environment pair or quiescence assertion alone cannot grant authority.
+The exact live descriptor/context, epoch, payload and attempt must match.
+
+Archives contain only declared format/identity/journal metadata with explicit
+absence and immutable `before/manifest.json`; format1 restore also has
+`conversion-before/manifest.json`. They contain no record/account/auth/home/chat
+or guard/registry bytes. Upgrade publishes the format2 fence before proof and
+resumes its journaled generation. Reset and supported restore settle the same
+fresh context generation across retries. Targeted conservative retirement
+leaves record/credential references unchanged and makes no claim that native
+cleanup succeeded. The provider alone acknowledges the result and reopens
+admission. Known restores invalidate previous bindings; unknown complete file
+rollback has no stronger detection claim.
+
+A registered Build stages the original pinned CPython3.14.8 runtime and exact
+clean committed source under `<Build>/driver-payload`. Complete M
+(`driver-payload-manifest.json`) inventories every descendant except its own
+root M and D; D (`driver-capability.json`) binds the Build, commit/tree,
+interpreter, entry/helpers/import roots and capabilities. Execution uses
+`runtime/python/bin/python3.14 -ISB bin/entry.py` with absolute verified paths.
+Existing root entry/runtime/scripts/test paths link to those same bytes, so
+current gate command strings remain intact. Mutable Build record/log/last-start
+stay outside M. Unregistered static candidates have no D or qualified acceptance.
+Neither packaging declarations nor static inputs issue acceptance; ABR-38 binds
+the final five-repository tuples and evidence separately.
+
+Current implementation work uses test-free source syntax/type/lint checks.
+[TESTS.md](TESTS.md) owns separately requested test/Build work and the complete
+current gates. Historical workflows, test-profile examples and earlier
+format1/Build0 observations below retain their original scope.
+
+## Historical numbered Build workflow
 
 `arbol-builds build arbol-codex-driver` packages the Driver into the next
 hexadecimal Build number under
@@ -66,7 +150,7 @@ state directory, `~/Library/Application Support/Arbol/drivers/arbol-codex-driver
 not in the default one; `ARBOL_BUILD_TEST_STATE_DIR` can name another absolute
 Driver state directory with it (DRV-D41).
 
-## Development
+## Historical development and qualification notes
 
 The runtime is stdlib-only Python. Development and packaged artifacts pin
 CPython 3.14.8; the standalone interpreter comes from Python Build Standalone
