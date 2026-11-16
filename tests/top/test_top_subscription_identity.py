@@ -29,7 +29,7 @@ from identity_support import (
 from arbol_codex_driver.admission import current_session
 from arbol_codex_driver.continuity import Chats, message_digest
 from arbol_codex_driver.errors import Failure
-from arbol_codex_driver.identity import LifetimeSnapshot
+from arbol_codex_driver.identity import IdentityJournal, LifetimeSnapshot
 from arbol_codex_driver.identity_protocol import PrivateDirectory, canonical_bytes, object_fields, parse_bytes, token
 from arbol_codex_driver.process_identity import matches, process_identity
 from arbol_codex_driver.run_request import RunRequest
@@ -450,6 +450,90 @@ class LocalIdentityTests(unittest.TestCase):
             self._failure(await subject.request("list", "list-after-" + fault), "internal")
             self.assertEqual(subject.state_image(), before)
 
+    def test_public_create_cannot_add_a_second_chatgpt_subscription(self) -> None:
+        asyncio.run(self._create_refusal())
+
+    async def _create_refusal(self) -> None:
+        subject = CodexLocalSubject()
+        original = self._proof(await subject.request("identity", "proof-before-create-refusal"))
+        before = subject.state_image()
+        refusal = await public_subscription_request(
+            subject, "create-refusal", "create", "--family", "chatgpt",
+            "--id", "historical-candidate", "--label", "Additional",
+        )
+        detail = self._failure(refusal, "invalid_input")["message"]
+        self.assertEqual(detail, "ChatGPT uses the single native chatgpt Subscription; a second cannot be created.")
+        self.assertEqual(subject.state_image(), before)
+        expected = (str(original["generation"]), str(original["witness"]))
+        self.assertEqual(self._proof(await subject.request("identity", "proof-after-create-refusal", expected)),
+                         original)
+
+    def test_historical_create_journal_settles_only_the_exact_archived_witness(self) -> None:
+        for phase, present, fault in (("prepared", True, None), ("committed", False, None),
+                                      ("prepared", True, "malformed"), ("committed", True, "mismatch")):
+            with self.subTest(phase=phase, present=present, fault=fault):
+                asyncio.run(self._settle_historical_create(phase, present, fault))
+
+    async def _settle_historical_create(self, phase: str, present: bool, fault: str | None) -> None:
+        subject = CodexLocalSubject()
+        native = self._proof(await subject.request("identity", "proof-before-historical-create"))
+        identifier = "historical-created"
+        state = State(subject.state)
+        state.initialize()
+        try:
+            folder = state.subscription(identifier)
+            folder.mkdir(mode=0o700)
+            witness = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+            journal, sidecar = folder / "identity-pending.json", folder / "identity.json"
+            subject._publish(journal, canonical({"version": 1, "operation": "create", "phase": phase,
+                                                "witness": "invalid" if fault == "malformed" else witness}))
+            if present:
+                subject._publish(folder / "record.json", canonical({
+                    "id": identifier, "family": "chatgpt", "auth": "vendor_login", "label": "Historical",
+                    "state": "signed_out", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                }))
+            if fault == "mismatch":
+                other = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+                self.assertNotEqual(other, witness)
+                subject._publish(sidecar, canonical({"version": 1, "state": "active", "witness": other}))
+            before = subject.state_image()
+
+            async def settle() -> str | None:
+                record = folder / "record.json"
+                if record.exists():
+                    # Validate the same local catalogue shape the normal caller
+                    # validates before asking the journal to settle.
+                    Subscriptions(state, {}, [], subject.settings, subject.environment).record(identifier)
+                return IdentityJournal(state.assert_admitted(), identifier).settle(record_present=record.exists())
+
+            if fault is not None:
+                with self.assertRaises(Failure) as refused:
+                    await state.with_subscription_lock(identifier, settle, subject.environment)
+                self.assertEqual(refused.exception.result["code"], "internal")
+                self.assertEqual(subject.state_image(), before)
+                return
+
+            wanted = "active" if present else "retired"
+            self.assertEqual(await state.with_subscription_lock(identifier, settle, subject.environment), wanted)
+            saved = subject._read(sidecar)
+            self.assertEqual(document(saved[0]), {"version": 1, "state": wanted, "witness": witness})
+            del before[journal.relative_to(subject.state).as_posix()]
+            after = subject.state_image()
+            del after[sidecar.relative_to(subject.state).as_posix()]
+            self.assertEqual(after, before)
+            capture = await public_subscription_request(subject, "historical-create-proof", "identity", identifier)
+            if present:
+                self.assertEqual((capture.exit, capture.stderr), (0, b""))
+                self.assertEqual(document(capture.stdout), {
+                    "version": 1, "driver": "codex", "subscription": identifier,
+                    "generation": native["generation"], "witness": witness,
+                })
+            else:
+                self._failure(capture, "not_found")
+            self.assertEqual(subject._read(sidecar), saved)
+        finally:
+            state.close()
+
     def _proof(self, capture: LocalCapture) -> dict[str, object]:
         self.assertEqual((capture.exit, capture.stderr), (0, b""))
         proof = document(capture.stdout)
@@ -476,7 +560,7 @@ class LocalIdentityTests(unittest.TestCase):
 
 
 async def public_subscription_request(
-    subject: CodexLocalSubject, receipt: str, operation: str, selector: str, *options: str,
+    subject: CodexLocalSubject, receipt: str, operation: str, *arguments: str,
 ) -> LocalCapture:
     """Invoke the sealed provider with a source-owned disposable Subscription command."""
     subject.check_inputs()
@@ -486,7 +570,7 @@ async def public_subscription_request(
     process = await asyncio.create_subprocess_exec(
         str(provider.regular_file(declaration.interpreter)), "-ISB", str(provider.regular_file(declaration.entry)),
         "--qualification-launch", str(authority.registry), "arbol-codex-driver", authority.producer.declaration.build,
-        "driver", "--", "--state-dir", str(subject.state), "subscriptions", operation, selector, *options,
+        "driver", "--", "--state-dir", str(subject.state), "subscriptions", operation, *arguments,
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=subject.fixture.path, env=subject.environment, close_fds=True, limit=8192,
     )
