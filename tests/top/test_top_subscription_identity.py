@@ -31,6 +31,7 @@ from arbol_codex_driver.continuity import Chats, message_digest
 from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.identity import LifetimeSnapshot
 from arbol_codex_driver.identity_protocol import PrivateDirectory, canonical_bytes, object_fields, parse_bytes, token
+from arbol_codex_driver.process_identity import matches, process_identity
 from arbol_codex_driver.run_request import RunRequest
 from arbol_codex_driver.runs import Runs
 from arbol_codex_driver.state import State, owner_json, process_owner
@@ -262,6 +263,74 @@ class LocalIdentityTests(unittest.TestCase):
             self.assertEqual(subject.state_image(), before)
             self.assertEqual((subject._read(backup / "manifest.json"), subject._read(backup / "format")), archive)
 
+    def test_native_sign_out_and_removal_refuse_even_with_force_without_changing_proof(self) -> None:
+        asyncio.run(self._native_refusals())
+
+    async def _native_refusals(self) -> None:
+        subject = CodexLocalSubject()
+        original = self._proof(await subject.request("identity", "native-capture"))
+        # macOS volumes may compare filename casing loosely. Use a distinct
+        # display-style spelling so the fixture cannot alias the native path.
+        before = subject.state_image()
+        outcome = await public_subscription_request(subject, "display-alias", "identity", "ChatGPT Account")
+        self._failure(outcome, "invalid_input")
+        self.assertEqual(subject.state_image(), before)
+
+        for operation, message in (("sign-out", "cannot be signed out"), ("remove", "cannot be removed")):
+            for flags in ((), ("--force",)):
+                with self.subTest(operation=operation, flags=flags):
+                    name = operation + ("-forced" if flags else "-ordinary")
+                    capture = await public_subscription_request(subject, name, operation, "chatgpt", *flags)
+                    refusal = self._failure(capture, "invalid_input")
+                    detail = refusal["message"]
+                    assert isinstance(detail, str)
+                    self.assertIn(message, detail)
+                    self.assertEqual(subject.state_image(), before)
+                    subject.check_inputs()
+        expected = (str(original["generation"]), str(original["witness"]))
+        self.assertEqual(self._proof(await subject.request("identity", "after-native-refusals", expected)), original)
+        self.assertEqual(subject.state_image(), before)
+
+    def test_public_removal_retires_only_the_historical_fixture_subscription(self) -> None:
+        asyncio.run(self._historical_removal())
+
+    async def _historical_removal(self) -> None:
+        subject = CodexLocalSubject()
+        native = self._proof(await subject.request("identity", "native-before-historical-removal"))
+        identifier = "historical-chatgpt"
+        folder = subject.state / "subscriptions" / identifier
+        folder.mkdir(mode=0o700)
+        historical_record = canonical({
+            "id": identifier, "family": "chatgpt", "auth": "vendor_login", "label": "Historical",
+            "state": "signed_out", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+        })
+        subject._publish(folder / "record.json", historical_record)
+        old = await public_subscription_request(subject, "historical-capture", "identity", identifier)
+        self.assertEqual((old.exit, old.stderr), (0, b""))
+        original = document(old.stdout)
+        self.assertEqual(original["subscription"], identifier)
+        removal = await public_subscription_request(subject, "historical-remove", "remove", identifier)
+        self.assertEqual((removal.exit, removal.stdout, removal.stderr), (0, b"", b""))
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), ["identity.json"])
+        retired, _ = subject._read(folder / "identity.json")
+        self.assertEqual(document(retired), {"version": 1, "state": "retired", "witness": original["witness"]})
+        self._failure(await public_subscription_request(subject, "historical-absent", "identity", identifier),
+                      "not_found")
+
+        # The public Driver does not create additional ChatGPT accounts. The
+        # historical input is fixture data, and the new proof is observable
+        # through the ordinary public entry.
+        subject._publish(folder / "record.json", historical_record)
+        successor = await public_subscription_request(subject, "historical-successor", "identity", identifier)
+        self.assertEqual((successor.exit, successor.stderr), (0, b""))
+        proof = document(successor.stdout)
+        self.assertEqual((proof["subscription"], proof["generation"]), (identifier, original["generation"]))
+        self.assertNotEqual(proof["witness"], original["witness"])
+        expected = (str(native["generation"]), str(native["witness"]))
+        self.assertEqual(self._proof(await subject.request("identity", "native-after-historical-removal", expected)),
+                         native)
+        subject.check_inputs()
+
     def _proof(self, capture: LocalCapture) -> dict[str, object]:
         self.assertEqual((capture.exit, capture.stderr), (0, b""))
         proof = document(capture.stdout)
@@ -285,6 +354,32 @@ class LocalIdentityTests(unittest.TestCase):
         self.assertIsInstance(error, dict)
         self.assertEqual(error["code"], code)
         return dict(error)
+
+
+async def public_subscription_request(
+    subject: CodexLocalSubject, receipt: str, operation: str, selector: str, *options: str,
+) -> LocalCapture:
+    """Invoke the sealed provider with a source-owned disposable Subscription command."""
+    subject.check_inputs()
+    authority = subject.session.authority
+    provider = authority.provider
+    declaration = provider.declaration
+    process = await asyncio.create_subprocess_exec(
+        str(provider.regular_file(declaration.interpreter)), "-ISB", str(provider.regular_file(declaration.entry)),
+        "--qualification-launch", str(authority.registry), "arbol-codex-driver", authority.producer.declaration.build,
+        "driver", "--", "--state-dir", str(subject.state), "subscriptions", operation, selector, *options,
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=subject.fixture.path, env=subject.environment, close_fds=True, limit=8192,
+    )
+    owner = process_identity(process.pid)
+    require(matches(owner, parent=os.getpid()), "The public provider is no longer our verified child.")
+    invocation = LocalInvocation(process, owner)
+    try:
+        result = await subject.collect(invocation, receipt)
+    finally:
+        await subject.stop(invocation)
+    subject.check_inputs()
+    return result
 
 
 # The production app-server client must reach this real pipe reply after
