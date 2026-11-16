@@ -5,7 +5,9 @@ import asyncio
 import base64
 import json
 import os
+import shlex
 import stat
+import sys
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +27,13 @@ from identity_support import (
 )
 
 from arbol_codex_driver.admission import current_session
+from arbol_codex_driver.continuity import Chats, message_digest
+from arbol_codex_driver.errors import Failure
+from arbol_codex_driver.identity import LifetimeSnapshot
 from arbol_codex_driver.identity_protocol import PrivateDirectory, canonical_bytes, object_fields, parse_bytes, token
-from arbol_codex_driver.state import State
+from arbol_codex_driver.run_request import RunRequest
+from arbol_codex_driver.runs import Runs
+from arbol_codex_driver.state import State, owner_json, process_owner
 from arbol_codex_driver.subscriptions import Subscriptions
 
 
@@ -278,3 +285,334 @@ class LocalIdentityTests(unittest.TestCase):
         self.assertIsInstance(error, dict)
         self.assertEqual(error["code"], code)
         return dict(error)
+
+
+# The production app-server client must reach this real pipe reply after
+# observing the original lifetime. The fixture never reads or writes State.
+DELAYED_ACCOUNT_PEER = """\
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+folder = Path(sys.argv[1])
+os.umask(0o077)
+if sys.argv[2:] == ["--version"]:
+    print("codex-cli 0.162.1")
+    sys.exit(0)
+if sys.argv[2] != "app-server":
+    sys.exit(2)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        result = {"codexHome": os.environ["CODEX_HOME"], "userAgent": "codex/0.162.1"}
+    elif method == "config/read":
+        result = {"config": {"check_for_update_on_startup": False, "web_search": "live",
+                             "analytics": {"enabled": False}, "features": {"memories": False}}}
+    elif method in ("account/read", "account/rateLimits/read"):
+        record = folder / "request.tmp"
+        record.write_text(json.dumps({"method": method, "pid": os.getpid()}))
+        record.replace(folder / "request.json")
+        deadline = time.monotonic() + 20
+        while not (folder / "release").exists():
+            if time.monotonic() >= deadline:
+                sys.exit(3)
+            time.sleep(0.01)
+        if method == "account/read":
+            result = {"account": {"type": "chatgpt", "email": "old@example.invalid", "planType": "fixture"}}
+        else:
+            result = {"rateLimits": {"primary": {"usedPercent": 73, "windowDurationMins": 300}}}
+        (folder / "reply-ready").touch(exist_ok=False)
+        print(json.dumps({"id": request["id"], "result": result}), flush=True)
+        continue
+    else:
+        sys.exit(4)
+    print(json.dumps({"id": request["id"], "result": result}), flush=True)
+"""
+
+
+class LifetimeRaceTests(unittest.TestCase):
+    subscription_id = "historical-chatgpt"
+    timestamp = "2026-01-01T00:00:00.000Z"
+
+    def test_fresh_list_reaps_a_dead_predecessor_receipt_without_adopting_its_verdict(self) -> None:
+        asyncio.run(self._reap_predecessor())
+
+    def test_delayed_account_check_and_usage_preserve_successor_of_same_identifier(self) -> None:
+        for method in ("account/read", "account/rateLimits/read"):
+            with self.subTest(method=method):
+                asyncio.run(self._delayed_account_reply(method))
+
+    def test_late_run_settlement_cannot_recreate_a_map_or_remove_successor_reservation(self) -> None:
+        asyncio.run(self._late_run_settlement())
+
+    def test_failed_run_cannot_remove_a_newer_map_revision_for_the_same_conversation(self) -> None:
+        asyncio.run(self._late_map_cleanup())
+
+    def _subscriptions(self, subject: CodexLocalSubject, state: State, tool: Path | None = None) -> Subscriptions:
+        return Subscriptions(state, {} if tool is None else {"toolPath": str(tool)}, [],
+                             subject.settings, subject.environment)
+
+    def _record(self, folder: Path, label: str) -> None:
+        # Codex has no command to create a second native account. A fixture
+        # record represents a historical isolated Subscription, and after
+        # ordinary removal the same selector receives another fixture record.
+        # The real identity path, never fixture data, supplies both proofs.
+        CodexLocalSubject._publish(folder / "record.json", canonical({
+            "id": self.subscription_id, "family": "chatgpt", "auth": "vendor_login",
+            "label": label, "state": "signed_in", "createdAt": self.timestamp,
+            "updatedAt": self.timestamp, "checkedAt": self.timestamp,
+            "account": {"email": "kept@example.invalid", "plan": "fixture"},
+        }))
+
+    async def _retire_and_replace(
+        self, subscriptions: Subscriptions, folder: Path, original: Object,
+    ) -> Object:
+        identifier = self.subscription_id
+        await subscriptions.remove(identifier)
+        self.assertFalse(os.path.lexists(folder / "record.json"))
+        self.assertFalse(os.path.lexists(folder / "identity-pending.json"))
+        retired, _ = CodexLocalSubject._read(folder / "identity.json")
+        self.assertEqual(document(retired), {"version": 1, "state": "retired", "witness": original["witness"]})
+        self._record(folder, "Successor")
+        successor = await subscriptions.identity(identifier)
+        self.assertEqual(successor["generation"], original["generation"])
+        self.assertNotEqual(successor["witness"], original["witness"])
+        return successor
+
+    async def _reap_predecessor(self) -> None:
+        subject = CodexLocalSubject()
+        state = State(subject.state)
+        identifier = self.subscription_id
+        state.initialize()
+        try:
+            subscriptions = self._subscriptions(subject, state)
+            folder = state.subscription(identifier)
+            folder.mkdir(parents=True, mode=0o700)
+            self._record(folder, "Original")
+            proof = await subscriptions.identity(identifier)
+            child = await asyncio.create_subprocess_exec(
+                "/bin/cat", stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                owner = await process_owner(child.pid)
+            finally:
+                assert child.stdin is not None
+                child.stdin.close()
+                try:
+                    await asyncio.wait_for(child.wait(), 5)
+                except TimeoutError:
+                    if child.returncode is None:
+                        child.kill()
+                    await child.wait()
+                    raise
+            assert owner is not None
+            self.assertEqual(child.returncode, 0)
+            self.assertIsNone(await process_owner(child.pid))
+            successor = await self._retire_and_replace(subscriptions, folder, proof)
+
+            stale: Object = {"owner": owner_json(owner), "attempt": "dead-predecessor", "operation": "sign_in",
+                             "expiresAt": self.timestamp, "byCode": False,
+                             "lifetime": {key: proof[key] for key in ("subscription", "generation", "witness")}}
+            progress = folder / "sign-in.json"
+            subject._publish(progress, canonical(stale))
+            # Prime only the unrelated implicit catalogue entry, so its
+            # short-lock directory creation cannot change the recovery image.
+            await subscriptions.identity("chatgpt")
+            before = subject.state_image()
+            del before[progress.relative_to(subject.state).as_posix()]
+            listed = await subject.request("list", "reap-dead-predecessor")
+            self.assertEqual((listed.exit, listed.stderr), (0, b""))
+            rows = json.loads(listed.stdout)
+            self.assertEqual([(row["id"], row["state"]) for row in rows],
+                             [("chatgpt", "signed_out"), (identifier, "signed_in")])
+            self.assertFalse(os.path.lexists(progress))
+            self.assertEqual(subject.state_image(), before)
+
+            current = await subscriptions.reserve(identifier, "sign_out")
+            try:
+                before = subject.state_image()
+                with self.assertRaises(Failure) as rejected:
+                    await subscriptions.finish(identifier, stale, {"state": "signed_in"})
+                self.assertEqual(rejected.exception.result["code"], "in_use")
+                self.assertEqual(subject.state_image(), before)
+                self.assertEqual(await subscriptions.identity(identifier), successor)
+            finally:
+                await subscriptions.finish(identifier, current)
+            self.assertFalse(os.path.lexists(progress))
+            subject.check_inputs()
+        finally:
+            state.close()
+
+    async def _delayed_account_reply(self, method: str) -> None:
+        subject = CodexLocalSubject()
+        state = State(subject.state)
+        identifier = self.subscription_id
+        fixture = subject.fixture.path
+        script, tool = fixture / "peer.py", fixture / "peer-codex"
+        subject._publish(script, DELAYED_ACCOUNT_PEER.encode())
+        command = shlex.join((sys.executable, "-ISB", str(script), str(fixture)))
+        subject._publish(tool, f"#!/bin/sh\nexec {command} \"$@\"\n".encode())
+        tool.chmod(0o700)
+        state.initialize()
+        try:
+            subscriptions = self._subscriptions(subject, state, tool)
+            folder = state.subscription(identifier)
+            folder.mkdir(parents=True, mode=0o700)
+            self._record(folder, "Original")
+            proof = await subscriptions.identity(identifier)
+            check = method == "account/read"
+            async with asyncio.TaskGroup() as group:
+                pending = group.create_task(self._observe_delayed_result(subscriptions, check=check))
+                async with asyncio.timeout(15):
+                    observed = fixture / "request.json"
+                    while not observed.exists():
+                        self.assertFalse(pending.done(), "Codex returned before the app-server reply.")
+                        await asyncio.sleep(0.01)
+                    request, _ = subject._read(observed)
+                    row = document(request)
+                    self.assertEqual(row["method"], method)
+                    self.assertIs(type(row["pid"]), int)
+                    owner = await process_owner(row["pid"])
+                    self.assertIsNotNone(owner)
+                    self.assertFalse(pending.done())
+                    self.assertFalse(os.path.lexists(folder / "lock"), "Vendor reply wait holds the short lock.")
+                    successor = await self._retire_and_replace(subscriptions, folder, proof)
+                    preserved = subject.state_image()
+                    self.assertFalse(pending.done())
+                    subject._publish(fixture / "release", b"")
+            verdict = pending.result()
+            self.assertEqual(verdict["code"] if check else verdict["outcome"], "in_use" if check else "unavailable")
+            self.assertIn("lifetime changed", verdict["message"])
+            if not check:
+                self.assertEqual(verdict["windows"], [])
+            self.assertTrue((fixture / "reply-ready").is_file())
+            self.assertIsNone(await process_owner(row["pid"]), "The original vendor process was not reaped.")
+            self.assertEqual(subject.state_image(), preserved)
+            self.assertEqual(await subscriptions.identity(identifier), successor)
+            subject.check_inputs()
+        finally:
+            state.close()
+
+    async def _observe_delayed_result(self, subscriptions: Subscriptions, *, check: bool) -> Object:
+        if not check:
+            return await subscriptions.usage(self.subscription_id)
+        with self.assertRaises(Failure) as rejected:
+            await subscriptions.check(self.subscription_id)
+        return rejected.exception.result
+
+    @staticmethod
+    def _lifetime(proof: Object) -> LifetimeSnapshot:
+        return LifetimeSnapshot.parse({key: proof[key] for key in ("subscription", "generation", "witness")})
+
+    async def _late_run_settlement(self) -> None:
+        subject = CodexLocalSubject()
+        identifier = self.subscription_id
+        state = State(subject.state)
+        state.initialize()
+        try:
+            subscriptions = self._subscriptions(subject, state)
+            folder = state.subscription(identifier)
+            folder.mkdir(parents=True, mode=0o700)
+            self._record(folder, "Original")
+            proof = await subscriptions.identity(identifier)
+            old_lifetime = self._lifetime(proof)
+            request = RunRequest("reused-run", identifier, [], {}, "none",
+                                 working_directory=str(subject.fixture.path), chat_session_id="fixture-chat")
+            chats = Chats(state)
+            runs = Runs(state, subject.environment)
+            map_path = chats.path(identifier, sha(b"fixture-chat"))
+
+            async def begin() -> tuple[Object, Object]:
+                reservation = await runs.reserve(request.run_id, identifier, lifetime=old_lifetime)
+                return reservation, await chats.select(request, lifetime=old_lifetime)
+
+            reservation, plan = await state.with_subscription_lock(identifier, begin, subject.environment)
+            self.assertIsNone(plan["initialMap"])
+
+            # Exercise the actual settlement callbacks with inputs captured
+            # before retirement. The local latch supplies scheduling only.
+            release = asyncio.Event()
+
+            async def settle_original() -> None:
+                await release.wait()
+                await subscriptions.store_run_usage(
+                    old_record, {"outcome": "ok", "fetchedAt": "2099-01-01T00:00:00Z", "windows": []},
+                    lifetime=old_lifetime,
+                )
+                await chats.settle(request, plan, "old-conversation", message_digest([]), True,
+                                   lifetime=old_lifetime)
+                await runs.finish(reservation)
+
+            old_record = subscriptions.record(identifier)
+            async with asyncio.TaskGroup() as group:
+                old = group.create_task(settle_original())
+                await runs.finish(reservation)
+                self.assertFalse(os.path.lexists(runs.path(request.run_id)))
+                successor = await self._retire_and_replace(subscriptions, folder, proof)
+
+                async def begin_successor() -> Object:
+                    return await runs.reserve(request.run_id, identifier, lifetime=self._lifetime(successor))
+
+                current = await state.with_subscription_lock(identifier, begin_successor, subject.environment)
+                self.assertEqual(current["owner"], reservation["owner"])
+                self.assertNotEqual(current["lifetime"], reservation["lifetime"])
+                self.assertFalse(os.path.lexists(map_path))
+                before = subject.state_image()
+                self.assertFalse(old.done())
+                release.set()
+
+            self.assertFalse(os.path.lexists(map_path), "An older lifetime re-created the removed chat map.")
+            self.assertEqual(subject.state_image(), before)
+            self.assertEqual(await subscriptions.identity(identifier), successor)
+            await runs.finish(current)
+            self.assertFalse(os.path.lexists(runs.path(request.run_id)))
+            subject.check_inputs()
+        finally:
+            state.close()
+
+    async def _late_map_cleanup(self) -> None:
+        subject = CodexLocalSubject()
+        identifier = self.subscription_id
+        state = State(subject.state)
+        state.initialize()
+        try:
+            subscriptions = self._subscriptions(subject, state)
+            folder = state.subscription(identifier)
+            folder.mkdir(parents=True, mode=0o700)
+            self._record(folder, "Current")
+            proof = await subscriptions.identity(identifier)
+            lifetime = self._lifetime(proof)
+            request = RunRequest("map-revision", identifier, [], {}, "none",
+                                 working_directory=str(subject.fixture.path), chat_session_id="fixture-chat")
+            chats = Chats(state)
+            path = chats.path(identifier, sha(b"fixture-chat"))
+            fingerprint = message_digest([])
+            initial: Object = {"initialMap": None}
+            await chats.settle(request, initial, "same-conversation", fingerprint, True, lifetime=lifetime)
+            first = chats.entry(identifier, path.stem)
+            assert first is not None
+            previous: Object = {"continuedConversation": "same-conversation", "continuedMapRevision": first["revision"]}
+            await chats.settle(request, {"initialMap": first}, "same-conversation", fingerprint, True, lifetime=lifetime)
+            newer, _ = subject._read(path)
+            second = document(newer)
+            self.assertEqual(second["conversation"], first["conversation"])
+            self.assertEqual(second["lifetime"], first["lifetime"])
+            self.assertNotEqual(second["revision"], first["revision"])
+            before = subject.state_image()
+            await chats.settle(request, previous, None, fingerprint, False, lifetime=lifetime)
+            self.assertEqual(subject.state_image(), before)
+            # Check that the observed route actually removes an entry when
+            # the exact same conversation and current revision are supplied.
+            await chats.settle(request, {**previous, "continuedMapRevision": second["revision"]},
+                               None, fingerprint, False, lifetime=lifetime)
+            self.assertFalse(os.path.lexists(path))
+            self.assertEqual(await subscriptions.identity(identifier), proof)
+            subject.check_inputs()
+        finally:
+            state.close()
