@@ -390,6 +390,66 @@ class LocalIdentityTests(unittest.TestCase):
         self.assertEqual(subject._read(folder / "identity.json"), sidecar)
         subject.check_inputs()
 
+    def test_missing_sidecar_materializes_a_new_witness_and_rejects_old_expectation(self) -> None:
+        asyncio.run(self._missing_sidecar())
+
+    async def _missing_sidecar(self) -> None:
+        subject = CodexLocalSubject()
+        original = self._proof(await subject.request("identity", "before-sidecar-loss"))
+        record = await public_subscription_request(
+            subject, "persist-record-before-sidecar-loss", "update", "chatgpt", "--label", "Preserved record",
+        )
+        self.assertEqual((record.exit, record.stderr), (0, b""))
+        self.assertEqual(document(record.stdout)["label"], "Preserved record")
+        folder = subject.state / "subscriptions/chatgpt"
+        sidecar = folder / "identity.json"
+        before = subject.state_image()
+        del before[sidecar.relative_to(subject.state).as_posix()]
+        with PrivateDirectory(folder) as directory:
+            directory.delete(sidecar.name)
+        self.assertEqual(subject.state_image(), before)
+
+        expected = (str(original["generation"]), str(original["witness"]))
+        self._failure(await subject.request("identity", "old-expect-after-sidecar-loss", expected), "in_use")
+        persisted = subject._read(sidecar)
+        new = self._proof(await subject.request("identity", "new-capture-after-sidecar-loss"))
+        self.assertEqual(new["generation"], original["generation"])
+        self.assertNotEqual(new["witness"], original["witness"])
+        self.assertEqual(document(persisted[0]), {"version": 1, "state": "active", "witness": new["witness"]})
+        self.assertEqual(subject._read(sidecar), persisted)
+        after = subject.state_image()
+        del after[sidecar.relative_to(subject.state).as_posix()]
+        self.assertEqual(after, before)
+
+    def test_corrupt_sidecar_and_lost_or_corrupt_root_refuse_without_regenerating_proof(self) -> None:
+        for fault in ("corrupt-sidecar", "missing-root", "corrupt-root"):
+            with self.subTest(fault=fault):
+                asyncio.run(self._proof_refusal(fault))
+
+    async def _proof_refusal(self, fault: str) -> None:
+        subject = CodexLocalSubject()
+        original = self._proof(await subject.request("identity", "before-" + fault))
+        record = await public_subscription_request(
+            subject, "persist-record-before-" + fault, "update", "chatgpt", "--label", "Preserved record",
+        )
+        self.assertEqual((record.exit, record.stderr), (0, b""))
+        folder = subject.state / "subscriptions/chatgpt" if fault == "corrupt-sidecar" else subject.state
+        with PrivateDirectory(folder) as directory:
+            if fault == "missing-root":
+                directory.delete("identity.json")
+            else:
+                field = {"state": "active", "witness": "invalid"} if fault == "corrupt-sidecar" else {
+                    "generation": "invalid",
+                }
+                directory.publish("identity.json", canonical({"version": 1, **field}))
+        before = subject.state_image()
+        expected = (str(original["generation"]), str(original["witness"]))
+        self._failure(await subject.request("identity", "identity-after-" + fault, expected), "internal")
+        self.assertEqual(subject.state_image(), before)
+        if fault != "corrupt-sidecar":
+            self._failure(await subject.request("list", "list-after-" + fault), "internal")
+            self.assertEqual(subject.state_image(), before)
+
     def _proof(self, capture: LocalCapture) -> dict[str, object]:
         self.assertEqual((capture.exit, capture.stderr), (0, b""))
         proof = document(capture.stdout)
