@@ -331,6 +331,65 @@ class LocalIdentityTests(unittest.TestCase):
                          native)
         subject.check_inputs()
 
+    def test_relabel_and_recognizing_existing_login_retain_the_original_proof(self) -> None:
+        asyncio.run(self._relabel_and_recognize())
+
+    async def _relabel_and_recognize(self) -> None:
+        subject = CodexLocalSubject()
+        fixture = subject.fixture.path
+        tool = install_account_peer(subject)
+        with PrivateDirectory(subject.settings.parent) as settings:
+            settings.publish(subject.settings.name, canonical({"toolPath": str(tool)}))
+        subject.original_inputs = subject._inputs()
+        subject._publish(fixture / "release", b"")
+        state = State(subject.state)
+        state.initialize()
+        try:
+            folder = state.subscription("chatgpt")
+            folder.mkdir(parents=True, mode=0o700)
+            record = folder / "record.json"
+            subject._publish(record, canonical({
+                "id": "chatgpt", "family": "chatgpt", "auth": "vendor_login", "label": "Original label",
+                "state": "signed_in", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                "account": {"email": "previous@example.invalid", "plan": "previous"},
+            }))
+        finally:
+            state.close()
+        original = self._proof(await subject.request("identity", "before-native-relabel"))
+        expected = (str(original["generation"]), str(original["witness"]))
+        sidecar = subject._read(folder / "identity.json")
+        relabel = await public_subscription_request(
+            subject, "native-relabel", "update", "chatgpt", "--label", "Updated label",
+        )
+        self.assertEqual((relabel.exit, relabel.stderr), (0, b""))
+        self.assertEqual(document(relabel.stdout)["label"], "Updated label")
+        before_login = document(subject._read(record)[0])
+        self.assertEqual(before_login["label"], "Updated label")
+        self.assertEqual(before_login["account"], {"email": "previous@example.invalid", "plan": "previous"})
+        self.assertFalse(os.path.lexists(fixture / "request.json"))
+        after_label = await subject.request("identity", "after-native-relabel", expected)
+        self.assertEqual(self._proof(after_label), original)
+        self.assertEqual(subject._read(folder / "identity.json"), sidecar)
+
+        login = await public_subscription_request(subject, "recognize-existing-login", "sign-in", "chatgpt")
+        self.assertEqual((login.exit, login.stderr), (0, b""))
+        completed = document(login.stdout)
+        self.assertEqual(completed["step"], "done")
+        rpc = document(subject._read(fixture / "request.json")[0])
+        self.assertEqual((rpc["method"], rpc["params"]), ("account/read", {"refreshToken": False}))
+        self.assertTrue((fixture / "reply-ready").is_file())
+        self.assertIsNone(await process_owner(rpc["pid"]))
+        saved = document(subject._read(record)[0])
+        account = {"email": "old@example.invalid", "plan": "fixture"}
+        self.assertEqual((saved["label"], saved["state"], saved["account"]), ("Updated label", "signed_in", account))
+        self.assertEqual(completed["subscription"]["account"], account)
+        self.assertFalse(os.path.lexists(folder / "sign-in.json"))
+        after_login = await subject.request("identity", "after-existing-login", expected)
+        self.assertEqual(self._proof(after_login), original)
+        self.assertNotEqual(after_label.owner, after_login.owner)
+        self.assertEqual(subject._read(folder / "identity.json"), sidecar)
+        subject.check_inputs()
+
     def _proof(self, capture: LocalCapture) -> dict[str, object]:
         self.assertEqual((capture.exit, capture.stderr), (0, b""))
         proof = document(capture.stdout)
@@ -410,7 +469,7 @@ for line in sys.stdin:
                              "analytics": {"enabled": False}, "features": {"memories": False}}}
     elif method in ("account/read", "account/rateLimits/read"):
         record = folder / "request.tmp"
-        record.write_text(json.dumps({"method": method, "pid": os.getpid()}))
+        record.write_text(json.dumps({"method": method, "params": request["params"], "pid": os.getpid()}))
         record.replace(folder / "request.json")
         deadline = time.monotonic() + 20
         while not (folder / "release").exists():
@@ -428,6 +487,16 @@ for line in sys.stdin:
         sys.exit(4)
     print(json.dumps({"id": request["id"], "result": result}), flush=True)
 """
+
+
+def install_account_peer(subject: CodexLocalSubject) -> Path:
+    folder = subject.fixture.path
+    script, tool = folder / "peer.py", folder / "peer-codex"
+    subject._publish(script, DELAYED_ACCOUNT_PEER.encode())
+    command = shlex.join((sys.executable, "-ISB", str(script), str(folder)))
+    subject._publish(tool, f"#!/bin/sh\nexec {command} \"$@\"\n".encode())
+    tool.chmod(0o700)
+    return tool
 
 
 class LifetimeRaceTests(unittest.TestCase):
@@ -549,11 +618,7 @@ class LifetimeRaceTests(unittest.TestCase):
         state = State(subject.state)
         identifier = self.subscription_id
         fixture = subject.fixture.path
-        script, tool = fixture / "peer.py", fixture / "peer-codex"
-        subject._publish(script, DELAYED_ACCOUNT_PEER.encode())
-        command = shlex.join((sys.executable, "-ISB", str(script), str(fixture)))
-        subject._publish(tool, f"#!/bin/sh\nexec {command} \"$@\"\n".encode())
-        tool.chmod(0o700)
+        tool = install_account_peer(subject)
         state.initialize()
         try:
             subscriptions = self._subscriptions(subject, state, tool)
