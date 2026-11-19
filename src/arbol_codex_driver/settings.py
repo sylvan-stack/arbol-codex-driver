@@ -2,10 +2,11 @@ from pathlib import Path
 
 from .errors import Failure
 from .json_types import Object, loads
+from .paths import installation_root
 
 
 def settings_path(home: str) -> Path:
-    return Path(home) / ".arbol" / "arbol-codex-driver.json"
+    return installation_root(home) / "arbol-codex-driver.json"
 
 
 def read_settings(file: Path) -> tuple[Object, list[Object]]:

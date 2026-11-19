@@ -18,7 +18,7 @@ from .maintenance import current_maintenance
 from .run import run
 from .runs import Runs
 from .settings import read_settings, settings_path
-from .state import State, default_state_directory, fixed_wait
+from .state import State, default_state_directory, fixed_wait, prepare_default_state
 from .state_upgrade import Operation
 from .subscriptions import FAMILIES, Subscriptions
 from .tool import inspect_tool, require_tool
@@ -102,7 +102,10 @@ async def main(args: list[str], *, invocation: Invocation | None = None) -> int:
         home = os.environ.get("HOME") or str(Path.home())
         file = settings_path(home)
         env = dict(os.environ)
-        state = State(string(command.options.get("state-dir")) or default_state_directory(home))
+        default = default_state_directory(home)
+        state = State(string(command.options.get("state-dir")) or default)
+        if state.directory == Path(os.path.abspath(default)):
+            prepare_default_state(home)
         invocation.state = state
         if command.name == "subscriptions identity":
             # Proof is independent of settings, run recovery, get/reap and

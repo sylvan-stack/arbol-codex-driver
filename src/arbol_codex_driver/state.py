@@ -13,8 +13,9 @@ from typing import TypedDict, cast
 
 from .errors import Failure
 from .identity import DATA_FORMAT as DATA_FORMAT
-from .identity import IdentityState
+from .identity import IdentityState, _prepare_directory
 from .json_types import Json, dumps, iso, loads, timestamp
+from .paths import installation_root
 
 
 class Owner(TypedDict):
@@ -23,7 +24,12 @@ class Owner(TypedDict):
 
 
 def default_state_directory(home: str) -> Path:
-    return Path(home) / "Library" / "Application Support" / "Arbol" / "drivers" / "codex"
+    return installation_root(home) / "drivers" / "codex"
+
+
+def prepare_default_state(home: str) -> None:
+    root = Path(os.path.abspath(installation_root(home)))
+    _prepare_directory(root, harden=False)
 
 
 def fixed_wait(milliseconds: float, env: dict[str, str] | None = None) -> float:
