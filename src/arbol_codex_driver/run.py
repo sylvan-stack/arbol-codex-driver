@@ -269,7 +269,7 @@ async def run(
             cwd=cwd,
             env=child_env,
             arbol_chat_id=request.arbol_chat_id,
-            steady_cue_delivery=request.cue_context is not None,
+            disabled_hook_features=("cue-card-injection",) if request.cue_context is not None else (),
             cancellation=cancellation,
             request_timeout=fixed_wait(30000, env),
             launch_identity_path=temporary / "tool-owner.txt",
