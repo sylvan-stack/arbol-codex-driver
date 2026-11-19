@@ -8,6 +8,7 @@ live protocol context before reading or changing any Driver state.
 import hashlib
 import os
 import posixpath
+import pwd
 import re
 import stat
 import unicodedata
@@ -30,6 +31,7 @@ from .identity_protocol import (
     sha256,
 )
 from .json_types import Json
+from .paths import installation_root
 
 MANIFEST = "driver-payload-manifest.json"
 DECLARATION = "driver-capability.json"
@@ -498,7 +500,7 @@ def verify_authority(
         ) or current.sysname != "Darwin":
             raise invalid()
         if status == "candidate":
-            installed = Path.home() / "Library" / "Application Support" / "Arbol" / "builds"
+            installed = installation_root(pwd.getpwuid(os.getuid()).pw_dir) / "builds"
             if (
                 isolated_scope is None
                 or physical_path(str(isolated_scope)) != registry
