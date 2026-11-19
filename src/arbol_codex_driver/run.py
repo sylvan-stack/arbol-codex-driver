@@ -269,6 +269,7 @@ async def run(
             cwd=cwd,
             env=child_env,
             arbol_chat_id=request.arbol_chat_id,
+            steady_cue_delivery=request.cue_context is not None,
             cancellation=cancellation,
             request_timeout=fixed_wait(30000, env),
             launch_identity_path=temporary / "tool-owner.txt",
@@ -387,6 +388,8 @@ async def run(
                     }
                 )
         message = prepare_turn_input(turn_input, temporary)
+        if request.cue_context:
+            message.insert(1, {"type": "text", "text": "Cue Cards for this turn:\n\n" + request.cue_context})
         startup = [
             notice for notice in server.take_notifications()
             if notice.method in ("warning", "deprecationNotice", "driver/notice")

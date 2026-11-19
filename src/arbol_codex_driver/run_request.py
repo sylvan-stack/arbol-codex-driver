@@ -32,6 +32,7 @@ class RunRequest:
     control: bool = False
     output: str = "events"
     arbol_chat_id: str | None = None
+    cue_context: str | None = None
 
 
 async def read_run_request(
@@ -121,6 +122,14 @@ async def read_run_request(
         arbol_chat_id = chat_id
     if "systemPrompt" in value and not isinstance(value["systemPrompt"], str):
         bad("Invalid systemPrompt.")
+    cue_context = string(value.get("cueContext"))
+    if "cueContext" in value:
+        if arbol_chat_id is None or cue_context is None or len(cue_context) > 8000 or "\0" in cue_context:
+            raise Failure("invalid_input", "cueContext requires an Arbol chat and a string of up to 8000 characters.")
+        try:
+            cue_context.encode("utf-8")
+        except UnicodeError:
+            bad("cueContext must be valid UTF-8.")
     settings = settings or {}
     subscription_id = string(value.get("subscriptionId")) or string(settings.get("defaultSubscription")) or "chatgpt"
     defaults = object_value(object_value(settings.get("subscriptions")).get(subscription_id))
@@ -239,4 +248,5 @@ async def read_run_request(
         options.get("control") is True,
         output,
         arbol_chat_id=arbol_chat_id,
+        cue_context=cue_context,
     )

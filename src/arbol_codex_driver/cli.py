@@ -170,7 +170,7 @@ async def main(args: list[str], *, invocation: Invocation | None = None) -> int:
                     "driver": "codex",
                     **identity,
                     "contract": 1,
-                    "capabilities": qualified_capabilities(),
+                    "capabilities": {**qualified_capabilities(), "cueContext": 1},
                     "stateDirectory": str(state.directory),
                     "settingsFile": str(file),
                     "tool": tool,

@@ -158,6 +158,7 @@ class AppServer:
         home: Path | None,
         env: dict[str, str],
         arbol_chat_id: str | None = None,
+        steady_cue_delivery: bool = False,
         cwd: Path | None = None,
         cancellation: Cancellation | None = None,
         request_timeout: float = 30,
@@ -209,6 +210,8 @@ class AppServer:
         child_env = clean_environment(env, owner_home, str(isolated_home) if isolated_home is not None else None)
         if arbol_chat_id is not None:
             child_env["ARBOL_CHAT"] = arbol_chat_id
+            if steady_cue_delivery:
+                child_env["ARBOL_CUE_CARD_DELIVERY"] = "steady"
         try:
             child = await asyncio.create_subprocess_exec(
                 *arguments,
