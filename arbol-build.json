@@ -1,5 +1,6 @@
 {
   "component": "arbol-codex-driver",
+  "installationLayout": 2,
   "build": [
     "uv sync --locked --group dev",
     "uv run --no-sync ruff check src/arbol_codex_driver tests scripts bin/entry.py",
