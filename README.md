@@ -70,8 +70,10 @@ version and Build reporting without another tool check solely for capability.
 
 New admitted state starts at format2. Existing format1 retains its legacy
 record behavior and has no positive identity proof or automatic conversion.
-The normal default remains `~/Library/Application Support/Arbol/drivers/codex`;
+The default is `~/.arbol/drivers/codex`;
 `--state-dir` selects another state directory under the same component gate.
+Each Subscription's `CODEX_HOME` and `auth.json` remain relative to its Driver
+state, so the installation move carries the native home with the state.
 Root/per-Subscription evidence is separate from record.json. Relabeling and auth
 changes preserve proof; removal/retirement and delayed writes use canonical
 short locks, journals and captured lifetime checks. Pending or unsafe metadata
