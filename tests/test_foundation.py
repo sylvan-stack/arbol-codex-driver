@@ -4,7 +4,7 @@ __all__ = [
     "fixed_wait", "history_items", "labelled_history_input", "loads", "message_digest", "normalize_account",
     "normalize_models", "normalize_usage", "now", "object_value", "os", "owner_alive", "owner_json",
     "parse_arguments", "parse_owner", "prepare_turn_input", "process_owner", "read_json", "read_model_catalog",
-    "read_run_request", "read_settings", "replace", "safe_failure", "saved_conversation", "time", "utf8",
+    "read_run_request", "read_settings", "replace", "safe_failure", "time", "utf8",
     "write_json",
 ]
 # Shared fixtures; case bodies live in top/ and mid/. See TESTS.md.
@@ -26,7 +26,7 @@ from arbol_codex_driver.catalog import (
     normalize_usage,
     read_model_catalog,
 )
-from arbol_codex_driver.continuity import Chats, MessageDigest, digest, message_digest, saved_conversation
+from arbol_codex_driver.continuity import Chats, MessageDigest, digest, message_digest
 from arbol_codex_driver.environment import clean_environment
 from arbol_codex_driver.errors import Failure, safe_failure
 from arbol_codex_driver.history import history_items, labelled_history_input, prepare_turn_input

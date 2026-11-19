@@ -1120,10 +1120,10 @@
       "status": "available",
       "line_before": 230,
       "end_before": 312,
-      "reason": "Seeds real maps and rollout files, applies newer settlement then stale failure, and recovers a reused process owner. Observes retained newer mapping, private-text absence and orphan cleanup; end-to-end resume tests do not force stale settlement.",
+      "reason": "Uses the locked continuity selector and exact run reservation, applies a newer settlement followed by a stale failure, and recovers a historical run with a reused process PID. Verifies the newer mapping survives, private text stays out of the map, and orphan recovery removes its files.",
       "review": "individually-reviewed-higher-bar",
-      "line": 121,
-      "file_sha256": "3c6b9a73aff6526fb700131c51d039e303375b49f64d005c12a9b1910b7936ac",
+      "line": 150,
+      "file_sha256": "bd28a96ca5c48030082ece125d2548e2eccdf603796fa56e63d3f8bc581e5bf1",
       "previous_id": "tests/test_foundation.py::Foundation.test_continuity_selection_order_conditional_settlement_and_killed_owner",
       "previous_file": "tests/test_foundation.py",
       "previous_line": 211,
@@ -1131,9 +1131,9 @@
       "support_file": "tests/test_foundation.py",
       "description": "Continuity selection order conditional settlement and killed owner.",
       "assertion_examples": [
-        "own is not None",
-        "self.assertEqual((await chats.select(request, home))['continuity'], 'resumed')",
-        "self.assertEqual(await chats.select(replace(request, history=[]), home), {'continuity': 'fresh'})"
+        "self.assertEqual(initial['continuity'], 'resumed')",
+        "self.assertEqual((await select(request))['rebuildReason'], 'in_use')",
+        "self.assertFalse(runs.path('occupied').exists())"
       ],
       "execution": "explicit-testing-task-only",
       "restored_from_revision": "816eee1f59ad71b98175f5a06d195fe483f27c15",

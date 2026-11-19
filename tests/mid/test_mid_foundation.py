@@ -21,17 +21,17 @@ from test_foundation import (
     object_value,
     os,
     owner_alive,
-    owner_json,
     parse_owner,
     process_owner,
     read_json,
     read_run_request,
     replace,
-    saved_conversation,
     time,
     utf8,
     write_json,
 )
+
+from arbol_codex_driver.run_request import RunRequest
 
 
 class Foundation(_support.Foundation):
@@ -162,11 +162,12 @@ class Foundation(_support.Foundation):
             system_prompt="private-system",
         )
         chats = Chats(self.state)
+        runs = Runs(self.state)
         key = digest(request.chat_session_id or "")
-        home = self.state.subscription("chatgpt") / "home"
-        rollout = home / "sessions/2026/10/07/rollout-date-conversation.jsonl"
-        rollout.parent.mkdir(parents=True)
-        rollout.write_text("vendor content must not be parsed")
+
+        async def select(candidate: RunRequest) -> Object:
+            return await self.state.with_subscription_lock("chatgpt", lambda: chats.select(candidate))
+
         entry: Object = {
             "chatSessionId": request.chat_session_id,
             "conversation": "conversation",
@@ -178,56 +179,48 @@ class Foundation(_support.Foundation):
         }
         path = chats.path("chatgpt", key)
         write_json(path, entry)
-        self.assertEqual((await chats.select(request, home))["continuity"], "resumed")
-        self.assertEqual((await chats.select(replace(request, history=[]), home)), {"continuity": "fresh"})
-        self.assertEqual(
-            (await chats.select(replace(request, chat_session_id=None), home))["rebuildReason"], "no_chat_session"
-        )
+        initial = await select(request)
+        self.assertEqual(initial["continuity"], "resumed")
+        self.assertEqual(initial["conversation"], "conversation")
+        self.assertEqual(await select(replace(request, history=[])), {"continuity": "fresh"})
+        self.assertEqual((await select(replace(request, chat_session_id=None)))["rebuildReason"], "no_chat_session")
         for changes, reason in (
             ({"digest": digest("different"), "workingDirectory": "/changed"}, "history_differs"),
             ({"workingDirectory": "/changed", "systemPromptDigest": digest("different")}, "working_folder_changed"),
             ({"systemPromptDigest": digest("different")}, "system_prompt_changed"),
         ):
             write_json(path, {**entry, **changes})
-            self.assertEqual((await chats.select(request, home))["rebuildReason"], reason)
+            self.assertEqual((await select(request))["rebuildReason"], reason)
         write_json(path, entry)
-        rollout.unlink()
-        self.assertEqual((await chats.select(request, home))["rebuildReason"], "conversation_gone")
-        archived = home / "archived_sessions/nested/rollout-date-conversation.jsonl"
-        archived.parent.mkdir(parents=True)
-        archived.write_text("malformed vendor content")
-        self.assertTrue(saved_conversation(home, "conversation"))
-        own = await process_owner(os.getpid())
-        assert own is not None
-        record: Object = {
-            "runId": "occupied",
-            "subscriptionId": "chatgpt",
-            "owner": owner_json(own),
-            "startedAt": now(),
-            "conversation": "conversation",
-        }
-        runs = Runs(self.state)
-        runs.save(record)
-        self.assertEqual((await chats.select(request, home))["rebuildReason"], "in_use")
-        runs.remove("occupied")
-        plan = await chats.select(request, home)
+
+        async def reserve_active() -> Object:
+            reservation = await runs.reserve("occupied", "chatgpt")
+            reservation["conversation"] = "conversation"
+            runs.save(reservation)
+            return reservation
+
+        active = await self.state.with_subscription_lock("chatgpt", reserve_active)
+        self.assertEqual((await select(request))["rebuildReason"], "in_use")
+        await runs.finish(active)
+        plan = await select(request)
         await chats.settle(request, plan, "newer", message_digest(request.history), True)
         await chats.settle(request, plan, None, message_digest(request.history), False)
         self.assertEqual(object_value(chats.entry("chatgpt", key))["conversation"], "newer")
         for content in ("private-new-input", "private-old", "private-reply", "private-system"):
             self.assertNotIn(content, path.read_text())
-        record.update(
-            {
-                "owner": {"pid": os.getpid(), "startedAt": "1970-01-01T00:00:00Z"},
-                "chatKey": key,
-                "continuedConversation": "newer",
-            }
-        )
-        runs.save(record)
+        stale: Object = {
+            **active,
+            "owner": {"pid": os.getpid(), "startedAt": "1970-01-01T00:00:00Z"},
+            "chatKey": key,
+            "conversation": "newer",
+            "continuedConversation": "newer",
+        }
+        write_json(runs.path("occupied"), stale)
         scratch = self.state.directory / "tmp/occupied"
         scratch.mkdir(parents=True)
         (scratch / "leftover").write_text("scratch")
         self.assertEqual(await runs.list(), [])
+        self.assertFalse(runs.path("occupied").exists())
         self.assertIsNone(chats.entry("chatgpt", key))
         self.assertFalse(scratch.exists())
 # TEST-TIER-END tests/test_foundation.py::Foundation.test_continuity_selection_order_conditional_settlement_and_killed_owner

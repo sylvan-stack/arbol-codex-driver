@@ -1,5 +1,5 @@
 __all__ = [
-    "DRIVER_CONFIG", "DiagnosticScrubber", "Failure", "HEADER", "Object", "PRIVATE", "asyncio", "dumps", "patch",
+    "DiagnosticScrubber", "Failure", "HEADER", "Object", "PRIVATE", "asyncio", "dumps", "patch",
     "sanitize_diagnostic",
 ]
 # Shared fixtures; case bodies live in top/ and mid/. See TESTS.md.
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from arbol_codex_driver.app_server import DRIVER_CONFIG, AppServer
+from arbol_codex_driver.app_server import AppServer
 from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.json_types import Object, dumps
 from arbol_codex_driver.owner_setup import (

@@ -1,5 +1,5 @@
 __all__ = [
-    "AppServer", "Cancellation", "DRIVER_CONFIG", "EventStream", "Failure", "Json", "Output", "Owner", "asyncio",
+    "AppServer", "Cancellation", "EventStream", "Failure", "Json", "Output", "Owner", "asyncio",
     "cast", "object_value", "os", "owner_alive", "patch", "process_owner", "time", "utf8",
 ]
 # Shared fixtures; case bodies live in top/ and mid/. See TESTS.md.
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-from arbol_codex_driver.app_server import DRIVER_CONFIG, AppServer
+from arbol_codex_driver.app_server import AppServer
 from arbol_codex_driver.cancellation import Cancellation
 from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.event_stream import EventStream, Output
