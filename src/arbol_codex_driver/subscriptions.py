@@ -7,7 +7,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from .app_server import AppServer
 from .cancellation import Cancellation
@@ -458,6 +457,12 @@ class Subscriptions:
             ):
                 raise Failure("in_use", "The Subscription changed while Codex was answering. Try again.")
             next_ = {**current, **fields, "updatedAt": now()}
+            if "account" in fields:
+                account = fields["account"]
+                if account is None:
+                    next_.pop("account", None)
+                if "lastUsage" not in fields and (account is None or current.get("account") != account):
+                    next_.pop("lastUsage", None)
             if next_["state"] != "needs_attention":
                 next_.pop("problem", None)
             write_json(self.file(id_, "record.json"), next_)
@@ -466,34 +471,26 @@ class Subscriptions:
         return await self.get(id_)
 
     async def check(self, id_: str) -> Object:
+        self.app_server_home(id_)
         initial, lifetime = await self.observe(id_)
-        if initial["state"] == "signed_out":
-            raise Failure("not_signed_in", "Sign in to this Subscription first.", {"remedy": "Sign in again."})
+        if self.progress(id_) is not None:
+            raise Failure("in_use", "An earlier Subscription operation is still active or needs recovery.")
         server: AppServer | None = None
         try:
             server = await self.start(id_)
-            account = normalize_account(
-                await server.request("account/read", {"refreshToken": True}, cancellation=self.cancellation)
-            )
+            account = await read_native_account(server, self.cancellation)
+            if account is None:
+                raise native_sign_in_required("credential_rejected")
             return await self.merge(
-                initial,
-                {"state": "signed_in", "account": account, "checkedAt": now()}
-                if account is not None
-                else {
-                    "state": "needs_attention",
-                    "problem": Failure(
-                        "credential_rejected", "The Codex home has no ChatGPT account.", {"remedy": "Sign in again."}
-                    ).result,
-                    "checkedAt": now(),
-                },
-                lifetime=lifetime,
+                initial, {"state": "signed_in", "account": account, "checkedAt": now()}, lifetime=lifetime,
             )
         except Failure as error:
-            if error.result["code"] == "credential_rejected":
-                return await self.merge(
-                    initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
-                )
-            raise
+            if error.result["code"] != "credential_rejected":
+                raise
+            return await self.merge(
+                initial, {"state": "needs_attention", "account": None, "problem": error.result, "checkedAt": now()},
+                lifetime=lifetime,
+            )
         finally:
             if server is not None:
                 await server.close()
@@ -691,156 +688,18 @@ class Subscriptions:
 
         await self.state.with_subscription_lock(id_, change, self.env)
 
-    async def local_login(self, id_: str, own: Object) -> None:
-        def rank(progress: Object) -> str:
-            owner = parse_owner(progress.get("owner"))
-            return f"{owner['startedAt']}:{owner['pid']:012}:{progress['attempt']}"
-
-        for other_id in self.ids():
-            if other_id == id_:
-                continue
-            pending = self.progress(other_id)
-            if (
-                pending is None
-                or pending["operation"] != "sign_in"
-                or pending.get("byCode")
-                or not await owner_alive(parse_owner(pending.get("owner")))
-            ):
-                continue
-            if rank(pending) < rank(own):
-                await self.stop_pending(other_id, pending)
-            else:
-                raise Failure("in_use", "Another local ChatGPT sign-in took its place.")
-
     async def sign_in(self, id_: str, by_code: bool, emit: Callable[[Json], Awaitable[None]]) -> int:
-        progress: Object | None = None
-        server: AppServer | None = None
-        login_id: str | None = None
-        success = False
-        cancellation = Cancellation()
-        timer: asyncio.TimerHandle | None = None
-        relay: asyncio.Task[None] | None = None
-
-        async def forward_stop() -> None:
-            assert self.cancellation is not None
-            await self.cancellation.event.wait()
-            cancellation.abort()
-
         try:
-            progress = await self.reserve(id_, "sign_in", by_code)
-            expiration = timestamp(progress["expiresAt"])
-            assert expiration is not None
-            timer = asyncio.get_running_loop().call_later(max(0.001, expiration - time.time()), cancellation.abort)
-            if self.cancellation is not None:
-                relay = asyncio.create_task(forward_stop())
-            own = progress
-
-            async def spawned(tool: Owner) -> None:
-                await self.set_tool(id_, own, tool)
-
-            server = await self.start(id_, spawned, cancellation)
-            account = None
-            if id_ == "chatgpt":
-                account = normalize_account(
-                    await server.request("account/read", {"refreshToken": False}, cancellation=cancellation)
-                )
-            if account is None:
-                if not by_code:
-                    await self.local_login(id_, progress)
-                result = object_value(
-                    await server.request(
-                        "account/login/start",
-                        {"type": "chatgptDeviceCode" if by_code else "chatgpt"},
-                        cancellation=cancellation,
-                    )
-                )
-                login_id = string(result.get("loginId"))
-                if login_id is None:
-                    raise Failure("tool_failed", "Codex returned an unreadable sign-in answer.")
-                address = string(result.get("verificationUrl" if by_code else "authUrl"))
-                if address is None or by_code and not isinstance(result.get("userCode"), str):
-                    raise Failure("tool_failed", "Codex returned no sign-in address.")
-                try:
-                    url = urlsplit(address)
-                except ValueError:
-                    raise Failure("tool_failed", "Codex returned an invalid sign-in address.") from None
-                if url.scheme != "https" or url.hostname != "auth.openai.com" or url.username or url.password:
-                    raise Failure("tool_failed", "Codex returned an unexpected sign-in host.")
-                await emit(
-                    {
-                        "step": "open_url",
-                        "url": address,
-                        "allowedHosts": ["auth.openai.com", "127.0.0.1"],
-                        "expiresAt": progress["expiresAt"],
-                        **({"userCode": result["userCode"]} if by_code else {}),
-                    }
-                )
-                completed = object_value(
-                    await server.wait_for_notification(
-                        "account/login/completed",
-                        lambda value: object_value(value).get("loginId") == login_id,
-                        cancellation=cancellation,
-                        timeout=max(0.001, expiration - time.time()),
-                    )
-                )
-                if completed.get("success") is not True:
-                    raise Failure("vendor_error", string(completed.get("error")) or "Codex sign-in failed.")
-                account = normalize_account(
-                    await server.request("account/read", {"refreshToken": False}, cancellation=cancellation)
-                )
-            cancellation.check()
-            if account is None:
-                raise Failure(
-                    "credential_rejected",
-                    "Codex did not confirm a ChatGPT account after sign-in.",
-                    {"remedy": "Sign in again."},
-                )
-            pending = self.progress(id_)
-            if pending is not None and pending.get("stopReason"):
-                raise Failure("in_use", "Another sign-in took its place.")
-            await self.finish(id_, progress, {"state": "signed_in", "account": account, "checkedAt": now()})
-            success = True
-            await emit({"step": "done", "subscription": await self.get(id_)})
-            return 0
+            if by_code:
+                raise Failure("unsupported", "Complete sign-in directly in Codex.")
+            record = await self.check(id_)
+            if record["state"] != "signed_in":
+                raise native_sign_in_required()
         except Exception as error:
-            pending = self.progress(id_) if progress is not None else None
-            failure = safe_failure(error)
-            if (
-                pending is not None
-                and progress is not None
-                and pending["attempt"] == progress["attempt"]
-                and pending.get("stopReason")
-            ):
-                failure = Failure("in_use", "Another sign-in took its place.").result
-            elif progress is not None and time.time() >= (timestamp(progress["expiresAt"]) or 0):
-                failure = Failure("limit_reached", "The sign-in ended after five minutes.").result
-            elif self.cancellation is not None and self.cancellation.aborted:
-                failure = Failure("vendor_error", "The caller cancelled sign-in.").result
-            await emit({"step": "failed", "error": failure})
-            return (
-                2 if self.cancellation is not None and self.cancellation.aborted and failure["code"] != "in_use" else 1
-            )
-        finally:
-            if timer is not None:
-                timer.cancel()
-            if relay is not None:
-                relay.cancel()
-                await asyncio.gather(relay, return_exceptions=True)
-            if server is not None:
-                if not success:
-                    cleanup: list[tuple[str, Object]] = []
-                    if login_id is not None:
-                        cleanup.append(("account/login/cancel", {"loginId": login_id}))
-                    if id_ != "chatgpt":
-                        cleanup.append(("account/logout", {}))
-                    for method, params in cleanup:
-                        try:
-                            await server.request(method, params, timeout=fixed_wait(1000, self.env))
-                        except Exception:
-                            pass
-                await server.close()
-            if progress is not None:
-                await self.finish(id_, progress, None if success else {"state": "signed_out", "checkedAt": now()})
+            await emit({"step": "failed", "error": safe_failure(error)})
+            return 2 if self.cancellation is not None and self.cancellation.aborted else 1
+        await emit({"step": "done", "subscription": record})
+        return 0
 
     async def active_runs(self, id_: str, force: bool) -> None:
         runs = Runs(self.state, self.env)
