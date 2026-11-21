@@ -257,15 +257,14 @@ class Subscriptions:
 
     async def observe(self, id_: str, *, signed_in: bool = False) -> tuple[Object, LifetimeSnapshot | None]:
         # Retain normal local settings/reap behavior before the atomic capture.
-        initial = await self.get(id_)
+        await self.get(id_)
         await self.settle_identity(id_)
 
         async def capture() -> tuple[Object, LifetimeSnapshot | None]:
             current = self.record(id_)
+            if self.progress(id_) is not None:
+                raise Failure("in_use", "An earlier Subscription operation is still active or needs recovery.")
             result: Object = {**current, "settings": {}}
-            if initial["state"] == "signing_in" and self.progress(id_) is not None:
-                result["state"] = "signing_in"
-                result.pop("problem", None)
             if signed_in and result["state"] != "signed_in":
                 raise native_sign_in_required()
             return result, LifetimeSnapshot.capture(self.state.assert_admitted(), id_)
@@ -439,7 +438,7 @@ class Subscriptions:
                     return
                 raise
             if (
-                any(current.get(key) != initial.get(key) for key in ("state", "checkedAt", "createdAt"))
+                any(current.get(key) != initial.get(key) for key in ("state", "checkedAt", "createdAt", "account"))
                 or self.progress(id_) is not None
             ):
                 raise Failure("in_use", "The Subscription changed while Codex was answering. Try again.")
@@ -460,8 +459,6 @@ class Subscriptions:
     async def check(self, id_: str) -> Object:
         self.app_server_home(id_)
         initial, lifetime = await self.observe(id_)
-        if self.progress(id_) is not None:
-            raise Failure("in_use", "An earlier Subscription operation is still active or needs recovery.")
         server: AppServer | None = None
         try:
             server = await self.start(id_)
@@ -505,13 +502,15 @@ class Subscriptions:
             await self.merge(initial, {"account": account, "lastUsage": usage}, lifetime=lifetime)
             return usage
         except Exception as error:
+            if self.cancellation is not None:
+                self.cancellation.check()
             if isinstance(error, Failure) and error.result["code"] == "credential_rejected":
                 await self.merge(
                     initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
                 )
                 return {"outcome": "needs_sign_in", "fetchedAt": now(), "windows": [], "message": str(error)}
             if isinstance(error, Failure) and error.result["code"] in (
-                "tool_missing", "tool_unsupported", "unsupported", "not_signed_in",
+                "tool_missing", "tool_unsupported", "unsupported", "not_signed_in", "in_use",
             ):
                 raise
             return {
@@ -537,19 +536,22 @@ class Subscriptions:
                 assert server is not None
                 return await server.request(method, params, cancellation=self.cancellation)
 
-            return await read_model_catalog(request)
+            catalogue = await read_model_catalog(request)
+            if self.cancellation is not None:
+                self.cancellation.check()
+            return catalogue
         except Exception as error:
+            if self.cancellation is not None:
+                self.cancellation.check()
             if isinstance(error, Failure) and error.result["code"] == "credential_rejected":
                 await self.merge(
                     initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
                 )
                 raise
             if isinstance(error, Failure) and error.result["code"] in (
-                "tool_missing", "tool_unsupported", "unsupported", "not_signed_in",
+                "tool_missing", "tool_unsupported", "unsupported", "not_signed_in", "in_use",
             ):
                 raise
-            if self.cancellation is not None:
-                self.cancellation.check()
             return builtin_catalog()
         finally:
             if server is not None:
