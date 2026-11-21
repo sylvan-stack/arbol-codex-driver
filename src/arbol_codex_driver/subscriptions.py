@@ -40,6 +40,18 @@ from .state import (
 )
 from .tool import inspect_tool, require_tool
 
+
+def native_sign_in_required(code: str = "not_signed_in") -> Failure:
+    return Failure(code, "The default Codex profile needs a ChatGPT account.",
+                   {"remedy": "Sign in directly in Codex, then refresh the Subscription."})
+
+
+async def read_native_account(server: AppServer, cancellation: Cancellation | None) -> Object | None:
+    return normalize_account(
+        await server.request("account/read", {"refreshToken": False}, cancellation=cancellation)
+    )
+
+
 FAMILIES: list[Json] = [
     {
         "id": "chatgpt",
@@ -157,8 +169,11 @@ class Subscriptions:
         return self.state.subscription(id_) / name
 
     def app_server_home(self, id_: str) -> Path | None:
-        """None selects native Codex; historical isolated homes stay in place."""
-        return None if id_ == "chatgpt" else self.file(id_, "home")
+        """None lets Codex select its ordinary native home."""
+        if id_ != "chatgpt":
+            raise Failure("unsupported", "This Subscription cannot select a native Codex account.",
+                          {"remedy": "Use the chatgpt Subscription with the existing Codex login."})
+        return None
 
     def record(self, id_: str) -> Object:
         value = read_json(self.file(id_, "record.json"))
@@ -242,7 +257,7 @@ class Subscriptions:
                 result["state"] = "signing_in"
                 result.pop("problem", None)
             if signed_in and result["state"] != "signed_in":
-                raise Failure("not_signed_in", "Sign in to this Subscription first.", {"remedy": "Sign in again."})
+                raise native_sign_in_required()
             return result, LifetimeSnapshot.capture(self.state.assert_admitted(), id_)
 
         return await self.state.with_subscription_lock(id_, capture, self.env)
@@ -363,9 +378,10 @@ class Subscriptions:
         return await self.get(id_)
 
     async def require_signed_in(self, id_: str) -> Object:
+        self.app_server_home(id_)
         item = await self.get(id_)
         if item["state"] != "signed_in":
-            raise Failure("not_signed_in", "Sign in to this Subscription first.", {"remedy": "Sign in again."})
+            raise native_sign_in_required()
         return item
 
     async def run_report(
@@ -412,10 +428,11 @@ class Subscriptions:
         cancellation: Cancellation | None = None,
     ) -> AppServer:
         cancellation = cancellation or self.cancellation
+        home = self.app_server_home(id_)
         tool = await inspect_tool(self.state, string(self.settings.get("toolPath")), self.env, cancellation)
         return await AppServer.start(
             tool_path=require_tool(tool),
-            home=self.app_server_home(id_),
+            home=home,
             env=self.env,
             cancellation=cancellation,
             on_spawn=on_spawn,
@@ -482,22 +499,26 @@ class Subscriptions:
                 await server.close()
 
     async def usage(self, id_: str) -> Object:
+        self.app_server_home(id_)
         initial, lifetime = await self.observe(id_)
         if initial["state"] != "signed_in":
             return {
                 "outcome": "needs_sign_in",
                 "fetchedAt": now(),
                 "windows": [],
-                "message": "Sign in to this Subscription first.",
+                "message": "Sign in directly in Codex, then refresh the Subscription.",
             }
         server: AppServer | None = None
         try:
             server = await self.start(id_)
+            account = await read_native_account(server, self.cancellation)
+            if account is None:
+                raise native_sign_in_required("credential_rejected")
             usage = normalize_usage(
                 await server.request("account/rateLimits/read", {}, cancellation=self.cancellation),
-                string(object_value(initial.get("account")).get("plan")),
+                string(account.get("plan")),
             )
-            await self.merge(initial, {"lastUsage": usage}, lifetime=lifetime)
+            await self.merge(initial, {"account": account, "lastUsage": usage}, lifetime=lifetime)
             return usage
         except Exception as error:
             if isinstance(error, Failure) and error.result["code"] == "credential_rejected":
@@ -505,7 +526,9 @@ class Subscriptions:
                     initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
                 )
                 return {"outcome": "needs_sign_in", "fetchedAt": now(), "windows": [], "message": str(error)}
-            if isinstance(error, Failure) and error.result["code"] in ("tool_missing", "tool_unsupported"):
+            if isinstance(error, Failure) and error.result["code"] in (
+                "tool_missing", "tool_unsupported", "unsupported", "not_signed_in",
+            ):
                 raise
             return {
                 "outcome": "unavailable",
@@ -518,10 +541,13 @@ class Subscriptions:
                 await server.close()
 
     async def models(self, id_: str) -> Object:
+        self.app_server_home(id_)
         initial, lifetime = await self.observe(id_, signed_in=True)
         server: AppServer | None = None
         try:
             server = await self.start(id_)
+            if await read_native_account(server, self.cancellation) is None:
+                raise native_sign_in_required()
 
             async def request(method: str, params: Json) -> Json:
                 assert server is not None
@@ -534,7 +560,9 @@ class Subscriptions:
                     initial, {"state": "needs_attention", "problem": error.result, "checkedAt": now()}, lifetime=lifetime,
                 )
                 raise
-            if isinstance(error, Failure) and error.result["code"] in ("tool_missing", "tool_unsupported"):
+            if isinstance(error, Failure) and error.result["code"] in (
+                "tool_missing", "tool_unsupported", "unsupported", "not_signed_in",
+            ):
                 raise
             if self.cancellation is not None:
                 self.cancellation.check()

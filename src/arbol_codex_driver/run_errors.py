@@ -172,7 +172,7 @@ def classify_error(error: Json, *, tool_version: str | None = None, secrets: tup
     extra: Object = {"detail": detail}
     remedy = {
         "invalid_input": "Change the request.",
-        "credential_rejected": "Sign in again, or replace the key.",
+        "credential_rejected": "Sign in directly in Codex.",
         "rate_limited": "Wait until the limit resets, or use another Subscription.",
         "context_exceeded": "Start a new chat, or continue from a shorter history.",
         "vendor_unavailable": "Try again.",

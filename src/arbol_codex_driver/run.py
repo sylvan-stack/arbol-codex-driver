@@ -8,7 +8,7 @@ from pathlib import Path
 from .app_server import AppServer
 from .arguments import Command
 from .cancellation import Cancellation, interruptible
-from .catalog import normalize_account, read_model_catalog
+from .catalog import read_model_catalog
 from .continuity import Chats, MessageDigest
 from .errors import Failure, redact
 from .event_stream import EventStream
@@ -24,7 +24,7 @@ from .run_limits import RunLimits
 from .run_request import RunRequest, read_run_request
 from .runs import Runs
 from .state import Owner, fixed_wait, owner_json, private_directory, read_json, write_json
-from .subscriptions import Subscriptions
+from .subscriptions import Subscriptions, native_sign_in_required, read_native_account
 from .tool import inspect_tool, require_tool
 
 
@@ -125,6 +125,7 @@ async def run(
             identity=events.identity,
         )
         events.text_only = request.output == "text"
+        home = subscriptions.app_server_home(request.subscription_id)
         await runs.list()
         for item in request.history:
             fingerprint.add(item)
@@ -141,7 +142,7 @@ async def run(
                 raise Failure("in_use", "The Subscription lifetime changed before run reservation.")
             current = subscriptions.record(str(subscription["id"]))
             if current["state"] != "signed_in":
-                raise Failure("not_signed_in", "Sign in to this Subscription first.")
+                raise native_sign_in_required()
             if read_json(subscriptions.file(parsed.subscription_id, "sign-in.json")) is not None:
                 raise Failure("in_use", "An account operation is still in progress.")
             record = await runs.reserve(
@@ -265,7 +266,7 @@ async def run(
 
         server = await AppServer.start(
             tool_path=require_tool(tool),
-            home=subscriptions.app_server_home(request.subscription_id),
+            home=home,
             cwd=cwd,
             env=child_env,
             arbol_chat_id=request.arbol_chat_id,
@@ -278,16 +279,14 @@ async def run(
             private_values=private_values,
             on_notification=notification,
         )
-        account = normalize_account(await server.request("account/read", {}, cancellation=cancellation))
+        account = await read_native_account(server, cancellation)
         if account is None:
             await subscriptions.run_report(
                 subscription,
-                Failure(
-                    "credential_rejected", "The Codex home has no ChatGPT account.", {"remedy": "Sign in again."}
-                ).result,
+                native_sign_in_required("credential_rejected").result,
                 lifetime=lifetime,
             )
-            raise Failure("not_signed_in", "The Codex home has no ChatGPT account.", {"remedy": "Sign in again."})
+            raise native_sign_in_required()
 
         async def rpc(method: str, params: Json) -> Json:
             assert server is not None

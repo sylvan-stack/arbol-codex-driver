@@ -96,7 +96,8 @@ def rpc_failure(error: Object, private_values: tuple[str, ...] = ()) -> Failure:
         safe_text(message, private_values, None),
         object_value(
             sanitize_diagnostic(
-                {"detail": detail, **({"remedy": "Sign in again."} if structured or wording else {})}, private_values
+                {"detail": detail, **({"remedy": "Sign in directly in Codex."} if structured or wording else {})},
+                private_values,
             )
         ),
     )
