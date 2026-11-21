@@ -11,22 +11,19 @@ native-home app-server for canonical `chatgpt`, streams answer and reasoning blo
 sequence numbers, reports token totals, and ends with one final event after
 cleanup. Runs in progress are visible through `runs list`.
 
-Production has one canonical Subscription, `chatgpt`, using the owner's native
-Codex sign-in and default `~/.codex` home with the real HOME. It sets no
-`CODEX_HOME`, inherits no `CODEX_*` or `OPENAI_*` configuration, and writes no
-native configuration or authentication files. Creating a second Subscription,
-signing `chatgpt` out and removing it all refuse with `invalid_input`, including
-`--force`; sign out in `codex` itself. Sign-in first asks the app-server for the
-current account and returns `done` for an existing ChatGPT login. It starts a
-browser/device login only when no ChatGPT account is present, and cancellation
-never logs the native account out.
+The canonical runnable Subscription is `chatgpt`. It uses the account the owner
+signed in to directly in Codex, in the default native `~/.codex` profile. Arbol
+does not start sign-in, sign-out or credential refresh. The compatibility
+`subscriptions sign-in chatgpt` action refreshes local status from the existing
+native account and accepts no authentication codes. Use `codex login status`
+to check the native login. The old `dev probe` refuses pending a native-only
+replacement in the testing work.
 
-ABR-41 restores this boundary in source using test-free static checks. It does
-not qualify the installed selected Build or native/provider behavior. ABR-38
-owns that qualification. Historical isolated homes and records stay in place;
-none is copied, relabelled or promoted to a real qualification profile. Current
-testing and Build policies are in [TESTS.md](TESTS.md); earlier commands and
-observations below retain their historical scope.
+Additional-account execution and new Subscription creation are refused. The
+canonical record is protected from sign-out or removal in Arbol. Eligible
+legacy records can be relabelled or retired locally, while their native homes
+and credentials stay in place. The full Build and real-account qualification
+belong to ABR-38. Current testing policy is in [TESTS.md](TESTS.md).
 
 | | |
 |---|---|
@@ -72,14 +69,14 @@ New admitted state starts at format2. Existing format1 retains its legacy
 record behavior and has no positive identity proof or automatic conversion.
 The default is `~/.arbol/drivers/codex`;
 `--state-dir` selects another state directory under the same component gate.
-Each Subscription's `CODEX_HOME` and `auth.json` remain relative to its Driver
-state, so the installation move carries the native home with the state.
+The active account remains in Codex’s default native profile. Older isolated
+homes are retained as legacy data.
 Root/per-Subscription evidence is separate from record.json. Relabeling and auth
 changes preserve proof; removal/retirement and delayed writes use canonical
 short locks, journals and captured lifetime checks. Pending or unsafe metadata
-refuses proof instead of guessing continuity. Native HOME/configuration,
-account-read/sign-in cancellation and chatgpt create/sign-out/remove refusals
-remain as described above.
+refuses proof instead of guessing continuity. The real native status refresh
+uses the existing default home. Older authentication reservations with unknown
+ownership stay fenced for recovery.
 
 Offline operations are the four fixed Driver child commands `state upgrade`,
 `state identity-reset`, `state restore` and `state identity-recover`, dispatched

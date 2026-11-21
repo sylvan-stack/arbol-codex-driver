@@ -62,8 +62,10 @@ def read_schema(directory: Path, name: str) -> Json:
 async def probe(
     subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
-    result: tuple[int, Object] = await _mid_tier_namespace()['probe'](subscriptions, inherited, cancellation)
-    return result
+    raise Failure(
+        "unsupported", "The historical probe can start native authentication.",
+        {"remedy": "Use codex login status to check the native Codex account."},
+    )
 
 
 async def check_account(subscriptions: Subscriptions, refresh: bool = True, identifier: str = "chatgpt") -> Object:
