@@ -63,25 +63,7 @@ def read_settings(file: Path) -> tuple[Object, list[Object]]:
                     bad(prefix + "settings")
                 clean["settings"] = item["settings"]
             if "secret" in item:
-                secret = item["secret"]
-                if not isinstance(secret, dict):
-                    bad(prefix + "secret")
-                assert isinstance(secret, dict)
-                if secret.get("from") == "keychain":
-                    unknown(secret, ("from",), prefix + "secret.")
-                    clean["secret"] = {"from": "keychain"}
-                elif secret.get("from") == "command":
-                    unknown(secret, ("from", "command"), prefix + "secret.")
-                    command = secret.get("command")
-                    if (
-                        not isinstance(command, list)
-                        or not command
-                        or not command[0]
-                        or not all(isinstance(arg, str) for arg in command)
-                    ):
-                        bad(prefix + "secret.command")
-                    clean["secret"] = {"from": "command", "command": command}
-                else:
-                    bad(prefix + "secret.from")
+                raise Failure("invalid_input", f"Settings file {file}: {prefix}secret is obsolete.",
+                              {"remedy": "Remove the secret setting and sign in directly in Codex."})
             cleaned[id_] = clean
     return result, notices

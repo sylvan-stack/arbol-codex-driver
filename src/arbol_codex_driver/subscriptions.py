@@ -1,8 +1,6 @@
-import asyncio
 import builtins
 import os
 import shutil
-import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -32,7 +30,6 @@ from .state import (
     owner_alive,
     owner_json,
     parse_owner,
-    private_directory,
     process_owner,
     read_json,
     write_json,
@@ -122,6 +119,15 @@ def parse_record(value: Json, id_: str) -> Object:
     return value
 
 
+async def inactive_progress(progress: Object) -> bool:
+    if await owner_alive(parse_owner(progress.get("owner"))):
+        return False
+    if progress.get("localOnly") is True:
+        return True
+    # An old app server could have started before its owner was recorded.
+    return "tool" in progress and not await owner_alive(parse_owner(progress["tool"]))
+
+
 def parse_progress(value: Json) -> Object:
     if (
         not isinstance(value, dict)
@@ -130,6 +136,10 @@ def parse_progress(value: Json) -> Object:
         and value["operation"] not in ("sign_in", "sign_out", "remove")
     ):
         raise Failure("internal", "Malformed sign-in record.")
+    if "localOnly" in value and (
+        value["localOnly"] is not True or value.get("operation") not in ("sign_out", "remove") or "tool" in value
+    ):
+        raise Failure("internal", "Malformed local Subscription reservation.")
     owner = parse_owner(value.get("owner"))
     if "tool" in value:
         parse_owner(value["tool"])
@@ -220,6 +230,7 @@ class Subscriptions:
             current["attempt"] == captured["attempt"]
             and parse_owner(current.get("owner")) == parse_owner(captured.get("owner"))
             and current.get("lifetime") == captured.get("lifetime")
+            and current.get("localOnly") == captured.get("localOnly")
         )
 
     async def get(self, id_: str) -> Object:
@@ -292,11 +303,11 @@ class Subscriptions:
             await self.reap_legacy(id_)
             return
         pending = self.progress(id_)
-        if pending is None or await owner_alive(parse_owner(pending.get("owner"))):
+        if pending is None or not await inactive_progress(pending):
             return
 
         async def capture() -> tuple[Object, RecoveryObservation] | None:
-            if self.progress(id_) != pending or await owner_alive(parse_owner(pending.get("owner"))):
+            if self.progress(id_) != pending or not await inactive_progress(pending):
                 return None
             return self.record(id_), RecoveryObservation.capture(self.state.assert_admitted(), id_)
 
@@ -304,26 +315,15 @@ class Subscriptions:
         if observed is None:
             return
         record, identity = observed
-        if "tool" in pending:
-            tool = parse_owner(pending["tool"])
-            if await owner_alive(tool):
-                try:
-                    os.killpg(tool["pid"], signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                if await owner_alive(tool):
-                    return  # Cleanup uncertainty retains the original receipt.
 
         async def change() -> None:
             if (
                 self.progress(id_) != pending or self.record(id_) != record
                 or RecoveryObservation.capture(self.state.assert_admitted(), id_) != identity
-                or await owner_alive(parse_owner(pending.get("owner")))
-                or "tool" in pending and await owner_alive(parse_owner(pending["tool"]))
+                or not await inactive_progress(pending)
             ):
                 return
-            # No account verdict/proof/journal is written. A settled signed-in
-            # record remains signed in; a successor receipt is never removed.
+            # Retire only the exact dead receipt. Account state and proof remain intact.
             with PrivateDirectory(self.state.subscription(id_)) as directory:
                 directory.delete("sign-in.json")
 
@@ -331,24 +331,11 @@ class Subscriptions:
 
     async def reap_legacy(self, id_: str) -> None:
         pending = self.progress(id_)
-        if pending is None or await owner_alive(parse_owner(pending.get("owner"))):
+        if pending is None or not await inactive_progress(pending):
             return
-        if "tool" in pending:
-            tool = parse_owner(pending["tool"])
-            if await owner_alive(tool):
-                try:
-                    os.killpg(tool["pid"], signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
 
         async def change() -> None:
-            current = self.progress(id_)
-            if (
-                current is not None
-                and self.same_progress(current, pending)
-                and self.progress_matches(id_, pending)
-                and not await owner_alive(parse_owner(current.get("owner")))
-            ):
+            if self.progress(id_) == pending and self.progress_matches(id_, pending) and await inactive_progress(pending):
                 self.file(id_, "sign-in.json").unlink(missing_ok=True)
 
         await self.state.with_subscription_lock(id_, change, self.env)
@@ -369,8 +356,8 @@ class Subscriptions:
             state = self.state.assert_admitted()
             if state.format == 2 and IdentityJournal(state, id_).pending() is not None:
                 raise Failure("in_use", "Subscription identity settlement is pending.")
-            if id_ != "chatgpt":
-                private_directory(self.file(id_, "home"))
+            if self.progress(id_) is not None:
+                raise Failure("in_use", "An earlier Subscription operation is still active or needs recovery.")
             write_json(self.file(id_, "record.json"), {**current, "label": label, "updatedAt": now()})
 
         await self.state.with_subscription_lock(id_, change, self.env)
@@ -568,39 +555,12 @@ class Subscriptions:
             if server is not None:
                 await server.close()
 
-    async def stop_pending(self, id_: str, pending: Object, reason: str = "replaced") -> None:
-        owner = parse_owner(pending.get("owner"))
-        if not await owner_alive(owner):
-            await self.reap(id_)
-            return
-
-        async def change() -> bool:
-            current = self.progress(id_)
-            if current is None or not self.same_progress(current, pending) or not self.progress_matches(id_, pending):
-                return False
-            write_json(self.file(id_, "sign-in.json"), {**current, "stopReason": reason})
-            return True
-
-        if not await self.state.with_subscription_lock(id_, change, self.env):
-            raise Failure("in_use", "The account operation lifetime is no longer available.")
-        if await owner_alive(owner):
-            try:
-                os.kill(owner["pid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + fixed_wait(5000, self.env)
-        while (current := self.progress(id_)) is not None and current["attempt"] == pending["attempt"]:
-            if not await owner_alive(owner):
-                await self.reap(id_)
-                return
-            if time.monotonic() > deadline:
-                raise Failure("in_use", "The previous account operation did not stop.")
-            await asyncio.sleep(fixed_wait(25, self.env))
-
-    async def reserve(self, id_: str, operation: str, by_code: bool = False) -> Object:
+    async def reserve(self, id_: str, operation: str) -> Object:
         await self.get(id_)
         await self.settle_identity(id_)
         self.state.clear_unfinished_writes()
+        if self.cancellation is not None:
+            self.cancellation.check()
         owner = await process_owner(os.getpid())
         if owner is None:
             raise Failure("internal", "Cannot identify the Driver process.")
@@ -608,49 +568,21 @@ class Subscriptions:
             "owner": owner_json(owner),
             "attempt": str(uuid.uuid4()),
             "operation": operation,
-            "byCode": by_code,
+            "localOnly": True,
             "expiresAt": iso(time.time() + fixed_wait(300000, self.env)),
         }
-        while True:
-            if self.cancellation is not None:
-                self.cancellation.check()
-            await self.reap(id_)
 
-            async def change() -> Object | None:
-                record = self.record(id_)
-                current = self.progress(id_)
-                if current is not None:
-                    if not self.progress_matches(id_, current):
-                        raise Failure("in_use", "The prior account operation lifetime is unavailable; recover it offline.")
-                    return current
-                lifetime = LifetimeSnapshot.capture(self.state.assert_admitted(), id_)
-                if lifetime is not None:
-                    progress["lifetime"] = lifetime.document()
-                if operation == "sign_in":
-                    cleared: Object = {**record, "state": "signed_out", "updatedAt": now(), "checkedAt": now()}
-                    for key in ("account", "problem", "lastUsage"):
-                        cleared.pop(key, None)
-                    write_json(self.file(id_, "record.json"), cleared)
-                write_json(self.file(id_, "sign-in.json"), progress)
-                return None
+        async def change() -> None:
+            self.record(id_)
+            if self.progress(id_) is not None:
+                raise Failure("in_use", "An earlier Subscription operation is still active or needs recovery.")
+            lifetime = LifetimeSnapshot.capture(self.state.assert_admitted(), id_)
+            if lifetime is not None:
+                progress["lifetime"] = lifetime.document()
+            write_json(self.file(id_, "sign-in.json"), progress)
 
-            previous = await self.state.with_subscription_lock(id_, change, self.env)
-            if previous is None:
-                return progress
-            if previous["operation"] == "sign_in":
-                await self.stop_pending(id_, previous, "replaced" if operation == "sign_in" else "signed_out")
-            else:
-                deadline = time.monotonic() + fixed_wait(10000, self.env)
-                while (
-                    (current := self.progress(id_)) is not None
-                    and current["attempt"] == previous["attempt"]
-                    and await owner_alive(parse_owner(previous.get("owner")))
-                ):
-                    if self.cancellation is not None:
-                        self.cancellation.check()
-                    if time.monotonic() > deadline:
-                        raise Failure("in_use", "An account operation is still in progress.")
-                    await asyncio.sleep(fixed_wait(50, self.env))
+        await self.state.with_subscription_lock(id_, change, self.env)
+        return progress
 
     async def finish(self, id_: str, progress: Object, fields: Object | None = None) -> None:
         async def change() -> None:
@@ -659,11 +591,7 @@ class Subscriptions:
                 pending is None or not self.same_progress(pending, progress)
                 or not self.progress_matches(id_, progress)
             ):
-                if fields is not None and fields.get("state") == "signed_in":
-                    raise Failure("in_use", "Another sign-in took its place.")
                 return
-            if fields is not None and fields.get("state") == "signed_in" and pending.get("stopReason"):
-                raise Failure("in_use", "Another sign-in took its place.")
             if fields is not None:
                 next_ = {**self.record(id_), **fields, "updatedAt": now()}
                 if next_["state"] == "signed_out":
@@ -673,18 +601,6 @@ class Subscriptions:
                     next_.pop("problem", None)
                 write_json(self.file(id_, "record.json"), next_)
             self.file(id_, "sign-in.json").unlink(missing_ok=True)
-
-        await self.state.with_subscription_lock(id_, change, self.env)
-
-    async def set_tool(self, id_: str, progress: Object, tool: Owner) -> None:
-        async def change() -> None:
-            current = self.progress(id_)
-            if (
-                current is None or not self.same_progress(current, progress)
-                or not self.progress_matches(id_, progress)
-            ):
-                raise Failure("in_use", "Another account operation took its place.")
-            write_json(self.file(id_, "sign-in.json"), {**current, "tool": owner_json(tool)})
 
         await self.state.with_subscription_lock(id_, change, self.env)
 
@@ -711,31 +627,22 @@ class Subscriptions:
 
     async def sign_out(self, id_: str, force: bool = False) -> Object:
         if id_ == "chatgpt":
-            raise Failure("invalid_input", "Sign out in codex itself; the native chatgpt Subscription cannot be signed out here.")
-        await self.get(id_)
-        await self.active_runs(id_, force)
+            raise Failure("invalid_input", "The chatgpt Subscription uses the native Codex account.",
+                          {"remedy": "Sign out directly in Codex."})
         progress = await self.reserve(id_, "sign_out")
-        server: AppServer | None = None
         try:
             await self.active_runs(id_, force)
-
-            async def spawned(tool: Owner) -> None:
-                await self.set_tool(id_, progress, tool)
-
-            server = await self.start(id_, spawned)
-            await server.request("account/logout", {}, cancellation=self.cancellation)
             await self.finish(id_, progress, {"state": "signed_out", "checkedAt": now()})
             return await self.get(id_)
         finally:
-            if server is not None:
-                await server.close()
             await self.finish(id_, progress)
 
     def require_remove_receipt(self, id_: str, progress: Object) -> None:
         current = self.progress(id_)
         expected_owner = parse_owner(progress.get("owner"))
         if (
-            current is None or current["attempt"] != progress["attempt"] or current["operation"] != "remove"
+            current is None or current.get("localOnly") is not True
+            or current["attempt"] != progress["attempt"] or current["operation"] != "remove"
             or expected_owner["pid"] != os.getpid() or parse_owner(current.get("owner")) != expected_owner
         ):
             raise Failure("in_use", "The original removal no longer owns this Subscription.")
@@ -776,32 +683,28 @@ class Subscriptions:
     def remove_owned_trees(self, id_: str) -> None:
         """No short Subscription lock is held across this filesystem cleanup."""
         parent = self.state.subscription(id_)
-        for name in ("home", "chats"):
-            path = self.file(id_, name)
-            try:
-                path.lstat()
-            except FileNotFoundError:
-                continue
-            # Reject links/unsafe roots, including any redirected native home.
-            # The operation's progress/journal excludes cooperative replacement.
-            with PrivateDirectory(path):
-                shutil.rmtree(path)
-            try:
-                path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                raise Failure("internal", "Subscription cleanup did not remove its owned directory.")
-            with PrivateDirectory(parent) as directory:
-                os.fsync(directory.fd)
+        path = self.file(id_, "chats")
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return
+        # Clean only the Arbol-owned Chat Session map. Any old native home stays intact.
+        with PrivateDirectory(path):
+            shutil.rmtree(path)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise Failure("internal", "Subscription cleanup did not remove its owned directory.")
+        with PrivateDirectory(parent) as directory:
+            os.fsync(directory.fd)
 
     async def remove(self, id_: str, force: bool = False) -> None:
         if id_ == "chatgpt":
             raise Failure("invalid_input", "Sign out in codex itself; the native chatgpt Subscription cannot be removed.")
         if await self.settle_identity(id_):
             return  # A validated committed removal, not absence, supplies this outcome.
-        await self.get(id_)
-        await self.active_runs(id_, force)
         progress = await self.reserve(id_, "remove")
         pending: PendingIdentity | None = None
         potentially_pending = False
