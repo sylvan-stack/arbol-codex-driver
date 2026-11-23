@@ -483,9 +483,10 @@ class RunEvents:
 
     def agent_activity(self, item: Object) -> None:
         id_ = string(item.get("agentThreadId"))
-        if id_ is None or item.get("kind") not in ("started", "completed"):
+        kind = item.get("kind")
+        if id_ is None or kind not in ("started", "interacted", "interrupted", "completed"):
             raise protocol_failure()
-        if item["kind"] == "started":
+        if kind == "started":
             if id_ in self.agents and id_ in self.calls:
                 return
             self.closed.discard(id_)
@@ -497,7 +498,7 @@ class RunEvents:
                 "tool_started",
                 {"callId": id_, "name": "spawn_agent", "input": {"path": path} if path is not None else {}},
             )
-        elif id_ in self.calls:
+        elif kind == "completed" and id_ in self.calls:
             del self.calls[id_]
             self.closed.add(id_)
             agent = self.agents.get(id_)
