@@ -18,7 +18,18 @@ from .errors import Failure
 from .event_stream import Output
 from .input_stream import Input
 from .json_types import Object, dumps, loads
-from .stand_in import ACCOUNT, CONFIG, SOURCE, VERSION, append_record, environment_checks, fixture_models
+from .stand_in import (
+    ACCOUNT,
+    CONFIG,
+    SOURCE,
+    VERSION,
+    app_server_arguments,
+    append_record,
+    environment_checks,
+    fixture_models,
+    native_home,
+    open_native_home,
+)
 
 type Record = dict[str, Any]
 SCENARIOS = {
@@ -517,6 +528,7 @@ class RunFixture:
                 await error("Invalid initialize client identity")
                 return
             self.initialized = True
+            open_native_home(str(self.home))
             await answer(
                 {
                     "userAgent": f"arbol-codex-driver/{'0.159.1' if self.part == 'old-handshake' else VERSION} (Mac OS 27.0.1; arm64) unknown (arbol-codex-driver; 1.0.0)",
@@ -1256,7 +1268,6 @@ class RunFixture:
         owner_config = tomllib.loads((owner / ".codex/config.toml").read_text())
         supplied = self.thread_params.get("config")
         expected = {"mcp_servers": owner_config["mcp_servers"]}
-        config = tomllib.loads((self.home / "config.toml").read_text())
         skill_path = owner / ".agents/skills/fixture-skill/SKILL.md"
         return {
             "ownerMcpCorrect": supplied is None if readonly else supplied == expected,
@@ -1264,9 +1275,11 @@ class RunFixture:
             "ownerSkillCorrect": skill_path.read_text()
             == "---\nname: fixture-skill\ndescription: A sentinel skill\n---\nSkill sentinel\n",
             "ownerSkillPath": str(skill_path),
-            "onlyMemoryFeature": config.get("features") == {"memories": False},
-            "liveWebSearch": config.get("web_search") == "live",
-            "ownerSettingsAbsent": not any(key in config for key in ("model", "developer_instructions", "mcp_servers")),
+            # The Driver states these on the command line; it writes no private configuration file.
+            "onlyMemoryFeature": [
+                value for option, value in zip(self.args, self.args[1:], strict=False) if option == "--disable"
+            ] == ["memories"],
+            "liveWebSearch": 'web_search="live"' in self.args,
         }
 
     async def unexpected_requests(self) -> None:
@@ -1756,7 +1769,7 @@ async def run_stand_in(directory: Path, args: list[str], output: Output) -> int:
     scenario, part = words[0] if words else "", words[1] if len(words) > 1 else "plain"
     if len(words) > 2 or scenario not in SCENARIOS or part not in PARTS:
         raise Failure("invalid_input", "This stand-in does not implement that run scenario.")
-    home = os.environ.get("CODEX_HOME")
+    home = native_home()
     checks = {
         **environment_checks(home),
         "source": SOURCE,
@@ -1801,20 +1814,8 @@ async def run_stand_in(directory: Path, args: list[str], output: Output) -> int:
                 {"properties": {"type": {"enum": ["chatgptDeviceCode"]}}},
             ]}))
         return 0
-    if args != ["app-server"] or home is None:
-        raise Failure("unsupported", "This stand-in requires app-server and a Subscription home.")
-    config = (Path(home) / "config.toml").read_text()
-    patterns = (
-        r"check_for_update_on_startup\s*=\s*false",
-        r'web_search\s*=\s*"live"',
-        r'cli_auth_credentials_store\s*=\s*"file"',
-        r"\[analytics\]\s*enabled\s*=\s*false",
-        r"\[features\]\s*memories\s*=\s*false",
-    )
-    if (
-        not checks["privateHome"]
-        or not checks["injectedVariablesAbsent"]
-        or not all(re.search(pattern, config) for pattern in patterns)
-    ):
-        raise Failure("tool_failed", "The run stand-in requires the isolated Driver environment and configuration.")
+    if not app_server_arguments(args) or home is None:
+        raise Failure("unsupported", "This stand-in requires app-server and a Codex home.")
+    if not checks["injectedVariablesAbsent"]:
+        raise Failure("tool_failed", "The run stand-in requires the clean Driver environment.")
     return await RunFixture(directory, args, output, scenario, part, Path(home), base).run()

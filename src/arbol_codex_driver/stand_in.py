@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .app_server import APP_SERVER_OPTIONS
 from .errors import Failure
 from .event_stream import Output
 from .input_stream import Input
@@ -102,14 +103,29 @@ def fixture_models(*, descriptions: bool = False) -> list[Record]:
     return result
 
 
+def app_server_arguments(args: list[str]) -> bool:
+    """The bare command, or the Driver's exact fixed launch options."""
+    return args in (["app-server"], ["app-server", *APP_SERVER_OPTIONS])
+
+
+def native_home() -> str | None:
+    """An explicit CODEX_HOME, else the default profile Codex selects itself."""
+    explicit = os.environ.get("CODEX_HOME")
+    if explicit:
+        return explicit
+    owner = os.environ.get("HOME")
+    return str(Path(owner) / ".codex") if owner else None
+
+
+def open_native_home(home: str) -> None:
+    """Native Codex creates its default profile folder when it first starts."""
+    if not os.environ.get("CODEX_HOME"):
+        Path(home).mkdir(mode=0o700, exist_ok=True)
+
+
 def environment_checks(home: str | None) -> Record:
-    try:
-        private = home is not None and Path(home).stat().st_mode & 0o077 == 0
-    except OSError:
-        private = False
     return {
         "home": home,
-        "privateHome": private,
         "source": SOURCE,
         **{key: os.environ[name] for key, name in (("arbolRoot", "ARBOL_ROOT"), ("arbolChat", "ARBOL_CHAT"))
            if name in os.environ},  # C44: launch identity (DRV-2.37); identifiers, not secrets
@@ -169,7 +185,7 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     ):
         raise Failure("invalid_input", "This stand-in does not implement that scenario.")
     version = None if part == "missing" else "0.159.1" if part == "old" else VERSION
-    home = os.environ.get("CODEX_HOME")
+    home = native_home()
     credential = Path(home) / "auth.json" if home else None
     logged_in = credential is not None and credential.is_file()
     checks = (
@@ -196,7 +212,7 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     if args == ["--version"]:
         await output.write(f"codex-cli {version}\n")
         return 0
-    if args != ["app-server"]:
+    if not app_server_arguments(args):
         raise Failure("unsupported", "This stand-in implements only the version probe and app-server.")
     input_ = Input()
     await input_.open()
@@ -266,12 +282,14 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
             assert isinstance(params, dict)
             if method == "initialize" and not initialized:
                 initialized = True
+                if home is not None:
+                    open_native_home(home)
                 await answer(
                     {
                         "userAgent": f"arbol-codex-driver/{version} (Mac OS 27.0.1; arm64) unknown (arbol-codex-driver; 1.0.0)",
                         "codexHome": str(folder / "wrong-home")
                         if part == "wrong-home"
-                        else home or os.environ.get("HOME"),
+                        else home,
                         "platformFamily": "unix",
                         "platformOs": "macos",
                     }
