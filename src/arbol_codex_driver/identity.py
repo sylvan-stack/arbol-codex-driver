@@ -160,7 +160,10 @@ class IdentityState:
     def open(cls, root: Path) -> IdentityState:
         preflight = state_format(root)
         if preflight == 1:
-            raise Failure("invalid_input", "Upgrade Driver state under exclusive maintenance before using this Build.")
+            raise Failure(
+                "invalid_input",
+                "This Build requires Driver state layout 2. Migrate the directory under exclusive maintenance.",
+            )
         if not _qualified():
             raise invalid()
         _prepare_directory(root, harden=preflight != 2)
