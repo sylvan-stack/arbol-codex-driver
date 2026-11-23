@@ -339,61 +339,23 @@ class LocalIdentityTests(unittest.TestCase):
         asyncio.run(self._relabel_and_recognize())
 
     async def _relabel_and_recognize(self) -> None:
+        # The case ID remains stable. Real account refresh/recognition belongs
+        # to the separately admitted real-account gate, not this local case.
         subject = CodexLocalSubject()
-        fixture = subject.fixture.path
-        tool = install_account_peer(subject)
-        with PrivateDirectory(subject.settings.parent) as settings:
-            settings.publish(subject.settings.name, canonical({"toolPath": str(tool)}))
-        subject.original_inputs = subject._inputs()
-        subject._publish(fixture / "release", b"")
-        state = State(subject.state)
-        state.initialize()
-        try:
-            folder = state.subscription("chatgpt")
-            folder.mkdir(parents=True, mode=0o700)
-            record = folder / "record.json"
-            subject._publish(record, canonical({
-                "id": "chatgpt", "family": "chatgpt", "auth": "vendor_login", "label": "Original label",
-                "state": "signed_in", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
-                "account": {"email": "previous@example.invalid", "plan": "previous"},
-            }))
-        finally:
-            state.close()
-        original = self._proof(await subject.request("identity", "before-native-relabel"))
+        original = self._proof(await subject.request("identity", "before-unsigned-relabel"))
         expected = (str(original["generation"]), str(original["witness"]))
+        folder = subject.state / "subscriptions" / "chatgpt"
         sidecar = subject._read(folder / "identity.json")
         relabel = await public_subscription_request(
-            subject, "native-relabel", "update", "chatgpt", "--label", "Updated label",
+            subject, "unsigned-relabel", "update", "chatgpt", "--label", "Updated label",
         )
         self.assertEqual((relabel.exit, relabel.stderr), (0, b""))
         self.assertEqual(document(relabel.stdout)["label"], "Updated label")
-        before_login = document(subject._read(record)[0])
-        self.assertEqual(before_login["label"], "Updated label")
-        self.assertEqual(before_login["account"], {"email": "previous@example.invalid", "plan": "previous"})
-        self.assertFalse(os.path.lexists(fixture / "request.json"))
-        after_label = await subject.request("identity", "after-native-relabel", expected)
-        self.assertEqual(self._proof(after_label), original)
-        self.assertEqual(subject._read(folder / "identity.json"), sidecar)
-
-        # The compatibility sign-in only refreshes status from the native account. This private
-        # peer gives local lifetime and stale-write coverage; the positive retention proof on a
-        # real native status change belongs to the real-account gate (ABR-38).
-        login = await public_subscription_request(subject, "recognize-existing-login", "sign-in", "chatgpt")
-        self.assertEqual((login.exit, login.stderr), (0, b""))
-        completed = document(login.stdout)
-        self.assertEqual(completed["step"], "done")
-        rpc = document(subject._read(fixture / "request.json")[0])
-        self.assertEqual((rpc["method"], rpc["params"]), ("account/read", {"refreshToken": False}))
-        self.assertTrue((fixture / "reply-ready").is_file())
-        self.assertIsNone(await process_owner(rpc["pid"]))
-        saved = document(subject._read(record)[0])
-        account = {"email": "old@example.invalid", "plan": "fixture"}
-        self.assertEqual((saved["label"], saved["state"], saved["account"]), ("Updated label", "signed_in", account))
-        self.assertEqual(completed["subscription"]["account"], account)
-        self.assertFalse(os.path.lexists(folder / "sign-in.json"))
-        after_login = await subject.request("identity", "after-existing-login", expected)
-        self.assertEqual(self._proof(after_login), original)
-        self.assertNotEqual(after_label.owner, after_login.owner)
+        saved = document(subject._read(folder / "record.json")[0])
+        self.assertEqual((saved["label"], saved["state"]), ("Updated label", "signed_out"))
+        self.assertNotIn("account", saved)
+        after = await subject.request("identity", "after-unsigned-relabel", expected)
+        self.assertEqual(self._proof(after), original)
         self.assertEqual(subject._read(folder / "identity.json"), sidecar)
         subject.check_inputs()
 
@@ -665,9 +627,8 @@ class LifetimeRaceTests(unittest.TestCase):
         # The real identity path, never fixture data, supplies both proofs.
         CodexLocalSubject._publish(folder / "record.json", canonical({
             "id": self.subscription_id, "family": "chatgpt", "auth": "vendor_login",
-            "label": label, "state": "signed_in", "createdAt": self.timestamp,
-            "updatedAt": self.timestamp, "checkedAt": self.timestamp,
-            "account": {"email": "kept@example.invalid", "plan": "fixture"},
+            "label": label, "state": "signed_out", "createdAt": self.timestamp,
+            "updatedAt": self.timestamp,
         }))
 
     async def _retire_and_replace(
@@ -732,7 +693,7 @@ class LifetimeRaceTests(unittest.TestCase):
             self.assertEqual((listed.exit, listed.stderr), (0, b""))
             rows = json.loads(listed.stdout)
             self.assertEqual([(row["id"], row["state"]) for row in rows],
-                             [("chatgpt", "signed_out"), (identifier, "signed_in")])
+                             [("chatgpt", "signed_out"), (identifier, "signed_out")])
             self.assertFalse(os.path.lexists(progress))
             self.assertEqual(subject.state_image(), before)
 
@@ -741,7 +702,7 @@ class LifetimeRaceTests(unittest.TestCase):
                 before = subject.state_image()
                 # A stale receipt that no longer owns the Subscription finishes
                 # silently: it changes neither the record nor the successor.
-                await subscriptions.finish(identifier, stale, {"state": "signed_in"})
+                await subscriptions.finish(identifier, stale, {"label": "Stale completion must not write"})
                 self.assertEqual(subject.state_image(), before)
                 self.assertEqual(await subscriptions.identity(identifier), successor)
             finally:
