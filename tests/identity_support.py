@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import unittest
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Any, Literal
 
-from arbol_codex_driver.admission import HelperHandoff, Session, current_session
+from arbol_codex_driver.admission import AUTHORITY_ENV, HelperHandoff, Session, current_session
 from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.identity_protocol import PrivateDirectory, token
 from arbol_codex_driver.process_identity import Identity, identity_record, inspect, matches, process_identity
@@ -34,6 +35,33 @@ Object = dict[str, Any]
 COMPONENT = "arbol-codex-driver"
 H1_ID = "tests/top/test_top_subscription_identity.py::HelperSpanTests.test_helper_independent_lease"
 H1_EXTERNAL = "H1-span-completion"
+# Fixed source-owned candidate schedule; the future admitted inventory must contain
+# exactly these IDs. The current two-entry inventory intentionally refuses it.
+CODEX_UNIT_ORDER: tuple[str, ...] = (
+    'tests/top/test_top_app_server.py::AppServerTests.test_timeout_and_cancellation_include_blocked_stdin_drain',
+    'tests/top/test_top_process_groups.py::ForcedProcessGroupTests.test_immediate_kill_refuses_reused_or_wrong_group_leaders',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_signed_out_first_capture_contends_and_restart_accepts_persisted_proof',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_qualified_list_preserves_format1_and_identity_requires_upgrade',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_interrupted_conversion_rejects_proof_and_list_without_repair',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_native_sign_out_and_removal_refuse_even_with_force_without_changing_proof',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_public_removal_retires_only_the_historical_fixture_subscription',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_relabel_and_recognizing_existing_login_retain_the_original_proof',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_missing_sidecar_materializes_a_new_witness_and_rejects_old_expectation',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_corrupt_sidecar_and_lost_or_corrupt_root_refuse_without_regenerating_proof',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_public_create_cannot_add_a_second_chatgpt_subscription',
+    'tests/top/test_top_subscription_identity.py::LocalIdentityTests.test_historical_create_journal_settles_only_the_exact_archived_witness',
+    'tests/top/test_top_subscription_identity.py::LifetimeRaceTests.test_fresh_list_reaps_a_dead_predecessor_receipt_without_adopting_its_verdict',
+    'tests/top/test_top_subscription_identity.py::LifetimeRaceTests.test_late_run_settlement_cannot_recreate_a_map_or_remove_successor_reservation',
+    'tests/top/test_top_subscription_identity.py::LifetimeRaceTests.test_failed_run_cannot_remove_a_newer_map_revision_for_the_same_conversation',
+    'tests/top/test_top_subscription_identity.py::HelperSpanTests.test_helper_independent_lease',
+)
+# The observer must settle both the actual H1 span and the entire runner's
+# real terminal/lease interval. These names select no action or wire command.
+CODEX_EXTERNAL_OBSERVERS: tuple[tuple[str, str], ...] = (
+    ("H1-span-completion", "WholeCheckController.run_h1_positive"),
+    ("terminal-close-closure", "WholeCheckController.verify_terminal_closure"),
+)
+CODEX_EXTERNAL_IDS: tuple[str, ...] = tuple(item[0] for item in CODEX_EXTERNAL_OBSERVERS)
 LocalStatus = Literal["passed", "failed", "skipped", "unavailable", "pending"]
 
 
@@ -177,8 +205,8 @@ class SuiteControl:
             sys.stderr.flush()
             for number in (0, 1, 2):
                 fd = os.dup(number)
-                os.set_inheritable(fd, False)
                 self.control.append(fd)
+                os.set_inheritable(fd, False)
             fixture.check()
             with PrivateDirectory(fixture.path) as directory:
                 outputs: list[int] = []
@@ -260,7 +288,8 @@ class CodexH1Support:
         require(all(stat.S_ISFIFO(os.fstat(fd).st_mode) or stat.S_ISSOCK(os.fstat(fd).st_mode) for fd in (0, 1, 2)),
                 "Whole-unit control must use owned data pipes/sockets, never an owner terminal.")
         self.ordered, self.pending = identities(ordered), identities(pending)
-        require(self.ordered[-1] == H1_ID and H1_EXTERNAL in self.pending, "H1 must be the final full-local case.")
+        require(self.ordered == CODEX_UNIT_ORDER and self.pending == CODEX_EXTERNAL_IDS,
+                "Only the source-owned whole schedule and external allocation are permitted.")
         payload = self.session.authority.producer
         require("tests/identity_actor.py" in payload.declaration.helpers, "Missing actual declared H1 helper.")
         with payload.regular_file("test-tiers.json").open("rb") as source:
@@ -273,8 +302,8 @@ class CodexH1Support:
             if row.get("tier") == "top":
                 require(row.get("status") == "active" and isinstance(row.get("id"), str), "Disabled/malformed top case.")
                 active.append(row["id"])
-        require(len(set(active)) == len(active) and tuple(active) == self.ordered,
-                "Full-top schedule must match the immutable inventory in its prescribed order.")
+        require(len(set(active)) == len(active) and len(active) == len(self.ordered)
+                and set(active) == set(self.ordered), "Immutable active inventory differs from the fixed schedule.")
         self.inventory_raw = raw
         self.fixture = FixtureRoot(self.session, case)
         self.rows: list[Object] = []
@@ -781,7 +810,9 @@ class CodexPostAdmissionPhase:
 
     def __init__(self, session: Session, *, case: str, ordered: Sequence[str], pending: Sequence[str]) -> None:
         self.session = session
-        self.case, self.ordered, self.pending = case, tuple(ordered), tuple(pending)
+        require(tuple(ordered) == CODEX_UNIT_ORDER and tuple(pending) == CODEX_EXTERNAL_IDS,
+                "The fixed source-owned schedule and external allocation are required.")
+        self.case, self.ordered, self.pending = case, CODEX_UNIT_ORDER, CODEX_EXTERNAL_IDS
         self.support: CodexH1Support | None = None
         self.entered = False
         self.closed = False
@@ -847,6 +878,65 @@ class CodexPostAdmissionPhase:
                 return
             raise
         self.support.__exit__(kind, error, traceback)
+
+
+class CodexWholeUnitResult(unittest.TestResult):
+    """Actual unittest callbacks, retained inside the entered checker Session.
+
+    H1's provisional row is published by its actual test while its helper is
+    held; its final success is recorded only after that test returns normally.
+    This result never completes an outer check or clears an external duty.
+    """
+
+    def __init__(self, phase: CodexPostAdmissionPhase) -> None:
+        super().__init__()
+        require(phase.entered and not phase.closed and phase.support is not None,
+                "Actual entered local phase required.")
+        self.phase = phase
+        self.final_results: list[TerminalLocalResult] = []
+        self.started: str | None = None
+
+    @staticmethod
+    def _case_id(test: unittest.case.TestCase) -> str:
+        parts = test.id().split(".")
+        require(len(parts) >= 3, "Unexpected unittest identity.")
+        module, cls, name = parts[-3:]
+        files = {"test_top_app_server": "tests/top/test_top_app_server.py",
+                 "test_top_process_groups": "tests/top/test_top_process_groups.py",
+                 "test_top_subscription_identity": "tests/top/test_top_subscription_identity.py"}
+        require(module in files, "Case is outside the fixed candidate inventory.")
+        return files[module] + "::" + cls + "." + name
+
+    def startTest(self, test: unittest.case.TestCase) -> None:
+        case_id = self._case_id(test)
+        require(self.started is None and len(self.final_results) < len(CODEX_UNIT_ORDER)
+                and case_id == CODEX_UNIT_ORDER[len(self.final_results)], "Unexpected local case order.")
+        self.started = case_id
+        super().startTest(test)
+
+    def addSuccess(self, test: unittest.case.TestCase) -> None:
+        case_id = self._case_id(test)
+        require(case_id == self.started and self.phase.support is not None, "Unmatched successful callback.")
+        assert self.phase.support is not None
+        evidence = canonical({"version": 1, "kind": "abr38-unittest-success", "id": case_id})
+        if case_id == H1_ID:
+            require(self.phase.support.completed and self.phase.support.rows[-1]["id"] == H1_ID,
+                    "H1 has not completed its actual local follow-up.")
+        else:
+            self.phase.record(case_id, "passed", evidence)
+        self.final_results.append(TerminalLocalResult(case_id, evidence))
+        super().addSuccess(test)
+
+    def stopTest(self, test: unittest.case.TestCase) -> None:
+        require(self._case_id(test) == self.started, "Unmatched local case completion.")
+        self.started = None
+        super().stopTest(test)
+
+    def complete(self) -> tuple[TerminalLocalResult, ...]:
+        require(self.started is None and self.wasSuccessful() and not self.skipped
+                and tuple(item.case_id for item in self.final_results) == CODEX_UNIT_ORDER,
+                "Actual full local callbacks are incomplete or unsuccessful.")
+        return tuple(self.final_results)
 
 
 @dataclass(frozen=True)
@@ -1295,6 +1385,8 @@ class CodexLocalSubject:
         return paths
 
     async def spawn(self, request: LocalRequest, expected: tuple[str, str] | None = None) -> LocalInvocation:
+        require(current_session() is self.session, "The fixed provider route requires its owning Session.")
+        self.session._check()
         authority = self.session.authority
         provider = authority.provider
         declaration = provider.declaration
@@ -1309,9 +1401,10 @@ class CodexLocalSubject:
         argv = [str(provider.regular_file(declaration.interpreter)), "-ISB", str(provider.regular_file(declaration.entry)),
                 "--qualification-launch", str(authority.registry), COMPONENT, authority.producer.declaration.build,
                 "driver", "--", "--state-dir", str(self.state), *tail]
+        environment = {key: value for key, value in self.environment.items() if key not in AUTHORITY_ENV}
         process = await asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=self.fixture.path, env=self.environment, close_fds=True, limit=8192,
+            cwd=self.fixture.path, env=environment, close_fds=True, limit=8192,
         )
         owner = process_identity(process.pid)
         require(matches(owner, parent=os.getpid()), "The actual public provider is not our verified child.")
