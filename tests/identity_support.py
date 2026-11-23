@@ -62,6 +62,10 @@ CODEX_EXTERNAL_OBSERVERS: tuple[tuple[str, str], ...] = (
     ("terminal-close-closure", "WholeCheckController.verify_terminal_closure"),
 )
 CODEX_EXTERNAL_IDS: tuple[str, ...] = tuple(item[0] for item in CODEX_EXTERNAL_OBSERVERS)
+# These two fixed labels are not the complete per-case external allocation.
+# The outer controller must bind actual maintenance/recovery observations after
+# the whole runner; names alone cannot authorize terminal gate success.
+CODEX_EXTERNAL_ALLOCATION_COMPLETE = False
 LocalStatus = Literal["passed", "failed", "skipped", "unavailable", "pending"]
 
 
@@ -1208,7 +1212,7 @@ class CodexTerminalClose:
     def arm(self, support: CodexH1Support, *, tuple_pins_sha256: str,
             completed_local_results: Sequence[TerminalLocalResult], finished_helpers: Sequence[TerminalHelperWitness],
             expected_helper_entries: Sequence[str]) -> None:
-        require(self.entered and not self.armed and type(self.session) is Session
+        require(CODEX_EXTERNAL_ALLOCATION_COMPLETE and self.entered and not self.armed and type(self.session) is Session
                 and current_session() is self.session and support.session is self.session
                 and support.completed and not support.console.closed and not support.cleanup_errors
                 and len(completed_local_results) == len(support.ordered) <= 4096
