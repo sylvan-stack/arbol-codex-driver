@@ -3,59 +3,16 @@ from __future__ import annotations
 
 import test_accounts_continuity as _support
 from test_accounts_continuity import (
-    ENTRY,
     Json,
     Object,
-    asyncio,
     cast,
     digest,
     loads,
-    now,
     object_value,
-    parse_owner,
-    write_json,
 )
 
 
 class Accounts(_support.Accounts):
-# TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_local_concurrent_creation_update_preserves_owner_settings_and_remove_isolated
-    async def test_local_concurrent_creation_update_preserves_owner_settings_and_remove_isolated(self) -> None:
-        self.scenario("C1 supported")
-        replies = await asyncio.gather(
-            *(self.invoke(["subscriptions", "create", "--family", "chatgpt", "--label", "Work"]) for _ in range(4))
-        )
-        ids = sorted(str(object_value(loads(output.decode()))["id"]) for code, output, _ in replies if code == 0)
-        self.assertEqual(ids, ["chatgpt-2", "chatgpt-3", "chatgpt-4", "chatgpt-5"])
-        record_path = self.state / "subscriptions/chatgpt-2/record.json"
-        original = object_value(loads(record_path.read_text()))
-        stored: Object = {
-            **original,
-            "state": "signed_in",
-            "account": {"email": "fixture@example.invalid", "plan": "pro"},
-            "checkedAt": now(),
-            "lastUsage": {"outcome": "ok", "fetchedAt": now(), "windows": []},
-        }
-        write_json(record_path, stored)
-        settings = self.home / ".arbol/arbol-codex-driver.json"
-        before = settings.read_text()
-        code, output, error = await self.invoke(["subscriptions", "update", "chatgpt-2", "--label", "Renamed"])
-        self.assertEqual((code, error), (0, b""))
-        changed = object_value(loads(output.decode()))
-        self.assertEqual(changed["account"], stored["account"])
-        self.assertEqual(changed["lastUsage"], stored["lastUsage"])
-        self.assertEqual(changed["createdAt"], stored["createdAt"])
-        self.assertEqual(settings.read_text(), before)
-        self.assertEqual(await self.invoke(["subscriptions", "remove", "chatgpt-2"]), (0, b"", b""))
-        self.assertTrue((self.state / "subscriptions/chatgpt-3/record.json").exists())
-        self.assertFalse(record_path.exists())
-        self.assertEqual(self.records(), [])
-        for id_ in ids[1:]:
-            directory = self.state / "subscriptions" / id_
-            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-            self.assertEqual((directory / "record.json").stat().st_mode & 0o777, 0o600)
-# TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_local_concurrent_creation_update_preserves_owner_settings_and_remove_isolated
-
-
 # TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_usage_last_good_cache_rejection_and_catalog_fallback
     async def test_usage_last_good_cache_rejection_and_catalog_fallback(self) -> None:
         self.scenario("C1 supported")
@@ -80,41 +37,6 @@ class Accounts(_support.Accounts):
         self.assertEqual(record["state"], "needs_attention")
         self.assertEqual(record["lastUsage"], fresh)
 # TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_usage_last_good_cache_rejection_and_catalog_fallback
-
-
-# TEST-TIER-BEGIN tests/test_accounts_continuity.py::Accounts.test_login_replacement_cancels_pending_and_sign_out_clears_credentials
-    async def test_login_replacement_cancels_pending_and_sign_out_clears_credentials(self) -> None:
-        self.scenario("C5 waiting")
-        child = await asyncio.create_subprocess_exec(
-            str(ENTRY),
-            "subscriptions",
-            "sign-in",
-            "chatgpt",
-            "--by-code",
-            "--state-dir",
-            str(self.state),
-            env=self.env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        self.children.append(child)
-        assert child.stdout is not None
-        first = object_value(loads((await asyncio.wait_for(child.stdout.readline(), 3)).decode()))
-        self.assertEqual(first["step"], "open_url")
-        progress = object_value(loads((self.state / "subscriptions/chatgpt/sign-in.json").read_text()))
-        self.owners.append(parse_owner(progress["tool"]))
-        self.scenario("C5 success")
-        replacement = await self.invoke(["subscriptions", "sign-in", "chatgpt", "--by-code"])
-        self.assertEqual(replacement[0], 0)
-        remaining, error = await asyncio.wait_for(child.communicate(), 3)
-        self.assertEqual((child.returncode, error), (1, b""))
-        self.assertEqual(
-            object_value(object_value(loads(remaining.decode().splitlines()[-1]))["error"])["code"], "in_use"
-        )
-        self.assertFalse((self.state / "subscriptions/chatgpt/sign-in.json").exists())
-        self.assertEqual((await self.invoke(["subscriptions", "sign-out", "chatgpt"]))[0], 0)
-        self.assertFalse((self.state / "subscriptions/chatgpt/home/auth.json").exists())
-# TEST-TIER-END tests/test_accounts_continuity.py::Accounts.test_login_replacement_cancels_pending_and_sign_out_clears_credentials
 
 
 class Continuity(_support.Continuity):
@@ -252,5 +174,86 @@ class Continuity(_support.Continuity):
 #         self.assertEqual(object_value(cast(list[Json], loads(output.decode()))[0])["state"], "signed_in")
 #         self.assertFalse(progress.exists())
 #         self.assertEqual(self.records(), [])
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_accounts_continuity.py::Accounts.test_local_concurrent_creation_update_preserves_owner_settings_and_remove_isolated
+# Reason: Obsolete under OG-5 and CDX-1.2 (ABR-64): the case needs four successful creations of further ChatGPT Subscriptions, and the Driver refuses every creation because chatgpt is the single native Subscription. Retained evidence: none for concurrent creation; the refusal itself is covered by the prospective top case test_public_create_cannot_add_a_second_chatgpt_subscription.
+# Source: arbol-codex-driver@fb96ecbf681d37f649cd3eb0d276f59e4b6ef646:tests/mid/test_mid_accounts_continuity.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_local_concurrent_creation_update_preserves_owner_settings_and_remove_isolated(self) -> None:
+#         self.scenario("C1 supported")
+#         replies = await asyncio.gather(
+#             *(self.invoke(["subscriptions", "create", "--family", "chatgpt", "--label", "Work"]) for _ in range(4))
+#         )
+#         ids = sorted(str(object_value(loads(output.decode()))["id"]) for code, output, _ in replies if code == 0)
+#         self.assertEqual(ids, ["chatgpt-2", "chatgpt-3", "chatgpt-4", "chatgpt-5"])
+#         record_path = self.state / "subscriptions/chatgpt-2/record.json"
+#         original = object_value(loads(record_path.read_text()))
+#         stored: Object = {
+#             **original,
+#             "state": "signed_in",
+#             "account": {"email": "fixture@example.invalid", "plan": "pro"},
+#             "checkedAt": now(),
+#             "lastUsage": {"outcome": "ok", "fetchedAt": now(), "windows": []},
+#         }
+#         write_json(record_path, stored)
+#         settings = self.home / ".arbol/arbol-codex-driver.json"
+#         before = settings.read_text()
+#         code, output, error = await self.invoke(["subscriptions", "update", "chatgpt-2", "--label", "Renamed"])
+#         self.assertEqual((code, error), (0, b""))
+#         changed = object_value(loads(output.decode()))
+#         self.assertEqual(changed["account"], stored["account"])
+#         self.assertEqual(changed["lastUsage"], stored["lastUsage"])
+#         self.assertEqual(changed["createdAt"], stored["createdAt"])
+#         self.assertEqual(settings.read_text(), before)
+#         self.assertEqual(await self.invoke(["subscriptions", "remove", "chatgpt-2"]), (0, b"", b""))
+#         self.assertTrue((self.state / "subscriptions/chatgpt-3/record.json").exists())
+#         self.assertFalse(record_path.exists())
+#         self.assertEqual(self.records(), [])
+#         for id_ in ids[1:]:
+#             directory = self.state / "subscriptions" / id_
+#             self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+#             self.assertEqual((directory / "record.json").stat().st_mode & 0o777, 0o600)
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
+
+# LOW-TIER-BEGIN: tests/mid/test_mid_accounts_continuity.py::Accounts.test_login_replacement_cancels_pending_and_sign_out_clears_credentials
+# Reason: Obsolete under OG-5, CDX-1.6 and CDX-1.7 (ABR-64): the case starts and replaces a sign-in by code through a fake stand-in login, then signs out chatgpt and checks a credential file. The Driver starts no login, refuses --by-code and refuses sign-out of chatgpt; the stand-in login and credential file were removed. Retained evidence: the native refusals in the prospective top case test_native_sign_out_and_removal_refuse_even_with_force_without_changing_proof.
+# Source: arbol-codex-driver@fb96ecbf681d37f649cd3eb0d276f59e4b6ef646:tests/mid/test_mid_accounts_continuity.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     async def test_login_replacement_cancels_pending_and_sign_out_clears_credentials(self) -> None:
+#         self.scenario("C5 waiting")
+#         child = await asyncio.create_subprocess_exec(
+#             str(ENTRY),
+#             "subscriptions",
+#             "sign-in",
+#             "chatgpt",
+#             "--by-code",
+#             "--state-dir",
+#             str(self.state),
+#             env=self.env,
+#             stdout=asyncio.subprocess.PIPE,
+#             stderr=asyncio.subprocess.PIPE,
+#         )
+#         self.children.append(child)
+#         assert child.stdout is not None
+#         first = object_value(loads((await asyncio.wait_for(child.stdout.readline(), 3)).decode()))
+#         self.assertEqual(first["step"], "open_url")
+#         progress = object_value(loads((self.state / "subscriptions/chatgpt/sign-in.json").read_text()))
+#         self.owners.append(parse_owner(progress["tool"]))
+#         self.scenario("C5 success")
+#         replacement = await self.invoke(["subscriptions", "sign-in", "chatgpt", "--by-code"])
+#         self.assertEqual(replacement[0], 0)
+#         remaining, error = await asyncio.wait_for(child.communicate(), 3)
+#         self.assertEqual((child.returncode, error), (1, b""))
+#         self.assertEqual(
+#             object_value(object_value(loads(remaining.decode().splitlines()[-1]))["error"])["code"], "in_use"
+#         )
+#         self.assertFalse((self.state / "subscriptions/chatgpt/sign-in.json").exists())
+#         self.assertEqual((await self.invoke(["subscriptions", "sign-out", "chatgpt"]))[0], 0)
+#         self.assertFalse((self.state / "subscriptions/chatgpt/home/auth.json").exists())
 # LOW-TIER-SOURCE-END
 # LOW-TIER-END
