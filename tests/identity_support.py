@@ -26,7 +26,7 @@ from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Any, Literal
 
-from arbol_codex_driver.admission import AUTHORITY_ENV, HelperHandoff, Session, current_session
+from arbol_codex_driver.admission import AUTHORITY_ENV, HelperHandoff, Session, _join_owned, current_session
 from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.identity_protocol import PrivateDirectory, token
 from arbol_codex_driver.process_identity import Identity, identity_record, inspect, matches, process_identity
@@ -895,6 +895,8 @@ class CodexWholeUnitResult(unittest.TestResult):
         self.phase = phase
         self.final_results: list[TerminalLocalResult] = []
         self.started: str | None = None
+        self.attempted = 0
+        self.unsuccessful: list[tuple[str, str]] = []
 
     @staticmethod
     def _case_id(test: unittest.case.TestCase) -> str:
@@ -909,8 +911,9 @@ class CodexWholeUnitResult(unittest.TestResult):
 
     def startTest(self, test: unittest.case.TestCase) -> None:
         case_id = self._case_id(test)
-        require(self.started is None and len(self.final_results) < len(CODEX_UNIT_ORDER)
-                and case_id == CODEX_UNIT_ORDER[len(self.final_results)], "Unexpected local case order.")
+        require(self.started is None and self.attempted < len(CODEX_UNIT_ORDER)
+                and case_id == CODEX_UNIT_ORDER[self.attempted], "Unexpected local case order.")
+        self.attempted += 1
         self.started = case_id
         super().startTest(test)
 
@@ -927,13 +930,48 @@ class CodexWholeUnitResult(unittest.TestResult):
         self.final_results.append(TerminalLocalResult(case_id, evidence))
         super().addSuccess(test)
 
+    def addError(self, test: Any, err: Any) -> None:
+        super().addError(test, err)
+        self.unsuccessful.append((self.started or str(test), "error"))
+
+    def addFailure(self, test: Any, err: Any) -> None:
+        super().addFailure(test, err)
+        self.unsuccessful.append((self.started or str(test), "failure"))
+
+    def addSkip(self, test: Any, reason: str) -> None:
+        super().addSkip(test, reason)
+        self.unsuccessful.append((self.started or str(test), "skipped"))
+
+    def addSubTest(self, test: Any, subtest: Any, err: Any) -> None:
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            self.unsuccessful.append((self.started or str(test), "subtest"))
+
+    def addExpectedFailure(self, test: Any, err: Any) -> None:
+        super().addExpectedFailure(test, err)
+        self.unsuccessful.append((self.started or str(test), "expected-failure"))
+
+    def addUnexpectedSuccess(self, test: Any) -> None:
+        super().addUnexpectedSuccess(test)
+        self.unsuccessful.append((self.started or str(test), "unexpected-success"))
+
     def stopTest(self, test: unittest.case.TestCase) -> None:
-        require(self._case_id(test) == self.started, "Unmatched local case completion.")
+        case_id = self._case_id(test)
+        require(case_id == self.started, "Unmatched local case completion.")
+        issues = [kind for case, kind in self.unsuccessful if case == case_id]
+        if issues and case_id != H1_ID:
+            status: LocalStatus = "skipped" if all(kind == "skipped" for kind in issues) else "failed"
+            try:
+                self.phase.record(case_id, status, canonical({"version": 1, "kind": "abr38-unittest-non-success",
+                                                              "id": case_id, "callbacks": issues}))
+            except BaseException as error:
+                # Preserve unittest's original failure/skip and prevent a false pass.
+                self.unsuccessful.append((case_id, "result-recording-" + type(error).__name__))
         self.started = None
         super().stopTest(test)
 
     def complete(self) -> tuple[TerminalLocalResult, ...]:
-        require(self.started is None and self.wasSuccessful() and not self.skipped
+        require(self.started is None and self.wasSuccessful() and not self.unsuccessful and not self.skipped
                 and tuple(item.case_id for item in self.final_results) == CODEX_UNIT_ORDER,
                 "Actual full local callbacks are incomplete or unsuccessful.")
         return tuple(self.final_results)
@@ -1385,30 +1423,69 @@ class CodexLocalSubject:
         return paths
 
     async def spawn(self, request: LocalRequest, expected: tuple[str, str] | None = None) -> LocalInvocation:
+        tail: tuple[str, ...]
+        if request == "list":
+            require(expected is None, "List does not accept identity expectation.")
+            tail = ("list",)
+        else:
+            require(request == "identity", "Unexpected local Driver request.")
+            tail = ("identity", "chatgpt")
+            if expected is not None:
+                tail += ("--expect", ".".join(token(value) for value in expected))
+        return await self._spawn_subscription(tail)
+
+    async def spawn_subscription(self, operation: str, arguments: tuple[str, ...]) -> LocalInvocation:
+        """Only the literal Subscription shapes used by the authored local cases."""
+        fixed = {
+            ("identity", "ChatGPT Account"), ("identity", "historical-chatgpt"),
+            ("identity", "historical-created"),
+            ("remove", "historical-chatgpt"),
+            ("sign-in", "chatgpt"),
+            ("sign-out", "chatgpt"), ("sign-out", "chatgpt", "--force"),
+            ("remove", "chatgpt"), ("remove", "chatgpt", "--force"),
+            ("update", "chatgpt", "--label", "Updated label"),
+            ("update", "chatgpt", "--label", "Preserved record"),
+            ("create", "--family", "chatgpt", "--id", "historical-candidate", "--label", "Additional"),
+        }
+        tail = (operation, *arguments)
+        require(tail in fixed, "Subscription operation is outside the fixed local case shapes.")
+        return await self._spawn_subscription(tail)
+
+    async def _spawn_subscription(self, tail: tuple[str, ...]) -> LocalInvocation:
         require(current_session() is self.session, "The fixed provider route requires its owning Session.")
         self.session._check()
+        self.fixture.check()
         authority = self.session.authority
         provider = authority.provider
         declaration = provider.declaration
-        if request == "list":
-            require(expected is None, "List does not accept identity expectation.")
-            tail = ["subscriptions", "list"]
-        else:
-            require(request == "identity", "Unexpected local Driver request.")
-            tail = ["subscriptions", "identity", "chatgpt"]
-            if expected is not None:
-                tail.extend(("--expect", ".".join(token(value) for value in expected)))
         argv = [str(provider.regular_file(declaration.interpreter)), "-ISB", str(provider.regular_file(declaration.entry)),
                 "--qualification-launch", str(authority.registry), COMPONENT, authority.producer.declaration.build,
-                "driver", "--", "--state-dir", str(self.state), *tail]
+                "driver", "--", "--state-dir", str(self.state), "subscriptions", *tail]
         environment = {key: value for key, value in self.environment.items() if key not in AUTHORITY_ENV}
-        process = await asyncio.create_subprocess_exec(
+        spawning = asyncio.create_task(asyncio.create_subprocess_exec(
             *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd=self.fixture.path, env=environment, close_fds=True, limit=8192,
-        )
-        owner = process_identity(process.pid)
-        require(matches(owner, parent=os.getpid()), "The actual public provider is not our verified child.")
-        return LocalInvocation(process, owner)
+        ))
+        process: asyncio.subprocess.Process | None = None
+        owner: Identity | None = None
+        try:
+            process = await asyncio.shield(spawning)
+            owner = process_identity(process.pid)
+            require(matches(owner, parent=os.getpid()), "The actual public provider is not our verified child.")
+            return LocalInvocation(process, owner)
+        except BaseException as original:
+            try:
+                # Join the actual spawn even when the caller is cancelled. Never
+                # treat an unverified PID as signal authority.
+                if process is None:
+                    process = await _join_owned(spawning)
+                if owner is not None:
+                    await _join_owned(asyncio.create_task(self.stop(LocalInvocation(process, owner))))
+                else:
+                    await _join_owned(asyncio.create_task(self._reap_process(process)))
+            except BaseException as cleanup:
+                original.add_note("Provider spawn cleanup unresolved: " + type(cleanup).__name__)
+            raise
 
     async def collect(self, invocation: LocalInvocation, name: str) -> LocalCapture:
         process = invocation.process
@@ -1438,9 +1515,25 @@ class CodexLocalSubject:
     async def stop(self, invocation: LocalInvocation) -> None:
         process = invocation.process
         if process.returncode is None and matches(invocation.owner, parent=os.getpid()):
-            process.terminate()
-        async with asyncio.timeout(20):
-            await process.wait()
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+        await self._reap_process(process)
+
+    @staticmethod
+    async def _reap_process(process: asyncio.subprocess.Process) -> None:
+        """Drain and join a child without treating an unverified PID as authority."""
+        async def discard(stream: asyncio.StreamReader) -> None:
+            while await stream.read(4096):
+                pass
+
+        async with asyncio.timeout(20), asyncio.TaskGroup() as tasks:
+            if process.stdout is not None:
+                tasks.create_task(discard(process.stdout))
+            if process.stderr is not None:
+                tasks.create_task(discard(process.stderr))
+            tasks.create_task(process.wait())
 
     def _terminal(self, owner: Identity) -> None:
         registry = self.session.registry
@@ -1494,8 +1587,13 @@ class CodexLocalSubject:
         invocation = await self.spawn(request, expected)
         try:
             result = await self.collect(invocation, name)
-        finally:
-            await self.stop(invocation)
+        except BaseException as original:
+            try:
+                await _join_owned(asyncio.create_task(self.stop(invocation)))
+            except BaseException as cleanup:
+                original.add_note("Provider cleanup unresolved: " + type(cleanup).__name__)
+            raise
+        await self.stop(invocation)
         self.check_inputs()
         return result
 
