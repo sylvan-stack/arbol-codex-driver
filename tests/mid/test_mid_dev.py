@@ -28,7 +28,7 @@ class DevChecks(_support.DevChecks):
         self.assertEqual((code, error), (0, b""), output)
         result = object_value(loads(output.decode()))
         self.assertEqual((result["outcome"], result["turnsAttempted"], result["inferenceRequests"]), ("passed", 1, 1))
-        self.assertEqual(result["subscriptionId"], "test-chatgpt")
+        self.assertEqual(result["subscriptionId"], "chatgpt")
         self.assertTrue(object_value(result["tokenUsage"]))
         self.assertIn("usageChange", result)
         self.assertEqual(read_json(Path(str(result["reportPath"]))), result)
@@ -45,20 +45,23 @@ class DevChecks(_support.DevChecks):
 
 # TEST-TIER-BEGIN tests/test_dev.py::DevChecks.test_probe_no_prompt_shapes_owner_isolation_and_private_cleanup
     async def test_probe_no_prompt_shapes_owner_isolation_and_private_cleanup(self) -> None:
+        # The fixture's status refresh has already made the default native folder.
         owner = self.home / ".codex"
-        owner.mkdir()
-        sentinel = owner / "auth.json"
-        sentinel.write_text("private-owner-login-sentinel")
+        owner.mkdir(exist_ok=True)
+        # A non-authentication owner file: the probe must leave the native profile as found.
+        sentinel = owner / "preserve.txt"
+        sentinel.write_text("private-owner-file-sentinel")
         metadata = sentinel.stat()
         self.env.update(OPENAI_API_KEY="inherited-secret", CODEX_HOME=str(owner), CLAUDECODE="1")
         code, output, error = await self.invoke(["dev", "probe"])
         self.assertEqual((code, error), (0, b""), output)
         result = object_value(loads(output.decode()))
         self.assertEqual((result["inferenceRequests"], result["outcome"]), (0, "passed"))
-        self.assertEqual(sentinel.read_text(), "private-owner-login-sentinel")
+        self.assertEqual(sentinel.read_text(), "private-owner-file-sentinel")
         self.assertEqual(sentinel.stat().st_mtime_ns, metadata.st_mtime_ns)
-        self.assertFalse(any(path.name.startswith("probe-") for path in (self.state / "tmp").iterdir()))
-        for private in ("private-owner-login-sentinel", "fixture@example.invalid", "fixture-secret", "gpt-6.1-sol"):
+        temporary = self.state / "tmp"
+        self.assertFalse(temporary.is_dir() and any(path.name.startswith("probe-") for path in temporary.iterdir()))
+        for private in ("private-owner-file-sentinel", "fixture@example.invalid", "fixture-secret", "gpt-6.1-sol"):
             self.assertNotIn(private.encode(), output)
         records = self.records()
         self.assertFalse(any(record.get("stage") == "input" for record in records))
@@ -72,29 +75,27 @@ class DevChecks(_support.DevChecks):
 
 # TEST-TIER-BEGIN tests/test_dev.py::DevChecks.test_missing_unsigned_and_cached_exhaustion_refuse_before_tool_start
     async def test_missing_unsigned_and_cached_exhaustion_refuse_before_tool_start(self) -> None:
-        path = self.state / "subscriptions/test-chatgpt/record.json"
+        # A missing record cannot occur for the implicit native chatgpt Subscription; that variant is retired.
+        path = self.state / "subscriptions/chatgpt/record.json"
         original = object_value(read_json(path))
-        for kind in ("missing", "unsigned", "exhausted"):
+        for kind in ("unsigned", "exhausted"):
             self.scenario("C32 plain")
-            if kind == "missing":
-                path.unlink()
-            else:
-                record = {**original, "state": "signed_out" if kind == "unsigned" else "signed_in"}
-                if kind == "exhausted":
-                    record["lastUsage"] = {
-                        "outcome": "ok",
-                        "fetchedAt": now(),
-                        "windows": [{"usedPercent": 100}],
-                        "extra": {"credits": {"hasCredits": True}},
-                    }
-                write_json(path, record)
+            record = {**original, "state": "signed_out" if kind == "unsigned" else "signed_in"}
+            if kind == "exhausted":
+                record["lastUsage"] = {
+                    "outcome": "ok",
+                    "fetchedAt": now(),
+                    "windows": [{"usedPercent": 100}],
+                    "extra": {"credits": {"hasCredits": True}},
+                }
+            write_json(path, record)
             for mode in ("build-check", "live-check"):
                 code, output, error = await self.invoke(["dev", mode])
                 self.assertEqual((code, error), (1, b""), output)
                 result = object_value(loads(output.decode()))
                 self.assertEqual(
                     object_value(result["error"])["code"],
-                    "not_found" if kind == "missing" else "not_signed_in" if kind == "unsigned" else "rate_limited",
+                    "not_signed_in" if kind == "unsigned" else "rate_limited",
                 )
                 self.assertEqual((result["turnsAttempted"], result["inferenceRequests"]), (0, 0))
                 self.assertFalse(self.log.exists())
