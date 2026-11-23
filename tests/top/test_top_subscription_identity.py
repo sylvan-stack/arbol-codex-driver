@@ -725,9 +725,10 @@ class LifetimeRaceTests(unittest.TestCase):
             self.assertIsNone(await process_owner(child.pid))
             successor = await self._retire_and_replace(subscriptions, folder, proof)
 
-            stale: Object = {"owner": owner_json(owner), "attempt": "dead-predecessor", "operation": "sign_in",
-                             "expiresAt": self.timestamp, "byCode": False,
-                             "lifetime": {key: proof[key] for key in ("subscription", "generation", "witness")}}
+            lifetime = {key: proof[key] for key in ("subscription", "generation", "witness")}
+            # Only a dead local-only receipt is proven local metadata; the source recovers exactly that.
+            stale: Object = {"owner": owner_json(owner), "attempt": "dead-predecessor", "operation": "sign_out",
+                             "localOnly": True, "expiresAt": self.timestamp, "lifetime": lifetime}
             progress = folder / "sign-in.json"
             subject._publish(progress, canonical(stale))
             # Prime only the unrelated implicit catalogue entry, so its
@@ -746,14 +747,29 @@ class LifetimeRaceTests(unittest.TestCase):
             current = await subscriptions.reserve(identifier, "sign_out")
             try:
                 before = subject.state_image()
-                with self.assertRaises(Failure) as rejected:
-                    await subscriptions.finish(identifier, stale, {"state": "signed_in"})
-                self.assertEqual(rejected.exception.result["code"], "in_use")
+                # A stale receipt that no longer owns the Subscription finishes
+                # silently: it changes neither the record nor the successor.
+                await subscriptions.finish(identifier, stale, {"state": "signed_in"})
                 self.assertEqual(subject.state_image(), before)
                 self.assertEqual(await subscriptions.identity(identifier), successor)
             finally:
                 await subscriptions.finish(identifier, current)
             self.assertFalse(os.path.lexists(progress))
+
+            # An older sign-in receipt with no recorded native process is ambiguous:
+            # its native authentication may still run, so it stays fenced (CDX-1.14).
+            ambiguous: Object = {"owner": owner_json(owner), "attempt": "ambiguous-predecessor",
+                                 "operation": "sign_in", "expiresAt": self.timestamp, "byCode": False,
+                                 "lifetime": lifetime}
+            subject._publish(progress, canonical(ambiguous))
+            fenced = subject._read(progress)
+            before = subject.state_image()
+            with self.assertRaises(Failure) as refused:
+                await subscriptions.reserve(identifier, "sign_out")
+            self.assertEqual(refused.exception.result["code"], "in_use")
+            self.assertEqual(subject._read(progress), fenced)
+            self.assertEqual(subject.state_image(), before)
+            self.assertEqual(await subscriptions.identity(identifier), successor)
             subject.check_inputs()
         finally:
             state.close()
