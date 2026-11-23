@@ -32,16 +32,8 @@ class DevShapes(unittest.TestCase):
 
 class DevChecks(Fixture):
     async def asyncSetUp(self) -> None:
+        # The shared fixture has already refreshed the canonical chatgpt record from the native account.
         await super().asyncSetUp()
-        self.assertEqual(
-            (
-                await self.invoke(
-                    ["subscriptions", "create", "--family", "chatgpt", "--label", "Tests", "--id", "test-chatgpt"]
-                )
-            )[0],
-            0,
-        )
-        self.assertEqual((await self.invoke(["subscriptions", "sign-in", "test-chatgpt"]))[0], 0)
         self.scenario("C32 plain")
         state = State(str(self.state))
         state.initialize()

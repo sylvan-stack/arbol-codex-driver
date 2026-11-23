@@ -1123,8 +1123,9 @@ class CodexLocalSubject:
             directory.mkdir(mode=0o700)
         self.vendor_marker = self.fixture.path / "vendor-invoked"
         self.fake_secret = "abr38-disposable-output-sentinel"
-        self.auth = self.native / "auth.json"
-        self._publish(self.auth, canonical({"fixtureValue": self.fake_secret}))
+        # A non-authentication owner file: the native profile must stay exactly as found.
+        self.preserved = self.native / "preserve.txt"
+        self._publish(self.preserved, (self.fake_secret + "\n").encode())
         self._publish(self.settings, b"{deliberately unreadable fixture settings\n" if guarded_settings else canonical({
             "toolPath": str(self.tools / "codex"),
         }))
@@ -1133,7 +1134,7 @@ class CodexLocalSubject:
         tool = self.tools / "codex"
         self._publish(tool, b'#!/bin/sh\nprintf "called\\n" > "$ABR38_VENDOR_MARKER"\nexit 97\n')
         tool.chmod(0o700)
-        self.environment = {"HOME": str(self.home), "CODEX_HOME": str(self.native),
+        self.environment = {"HOME": str(self.home),
                             "PATH": str(self.tools) + ":/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC",
                             "ABR38_VENDOR_MARKER": str(self.vendor_marker), "ARBOL_TEST_TIME_SCALE": "0.1"}
         self.original_inputs = self._inputs()
@@ -1171,13 +1172,13 @@ class CodexLocalSubject:
                         "Vendor sentinel bytes changed while reading.")
             finally:
                 os.close(descriptor)
-        return self._read(self.auth), self._read(self.settings), (raw, physical)
+        return self._read(self.preserved), self._read(self.settings), (raw, physical)
 
     def check_inputs(self) -> None:
         self.fixture.check()
         require(self._inputs() == self.original_inputs, "Ordinary local request modified native or settings inputs.")
         with PrivateDirectory(self.native) as directory:
-            require(os.listdir(directory.fd) == ["auth.json"], "Ordinary local request created native/profile state.")
+            require(os.listdir(directory.fd) == ["preserve.txt"], "Ordinary local request created native/profile state.")
 
     def prepare_legacy(self, marker: bytes, *, journal: bytes | None = None, root: bytes | None = None) -> None:
         """Initial private fixture bytes for legacy/interrupted-format readers."""

@@ -15,7 +15,7 @@ class ToolRuns(_support.ToolRuns):
 # TEST-TIER-BEGIN tests/test_tool_runs.py::ToolRuns.test_resume_forwards_changed_owner_mcp_in_memory_without_polluting_saved_state
     async def test_resume_forwards_changed_owner_mcp_in_memory_without_polluting_saved_state(self) -> None:
         owner = self.home / ".codex"
-        owner.mkdir()
+        owner.mkdir(exist_ok=True)
         skill = self.home / ".agents/skills/fixture-skill/SKILL.md"
         skill.parent.mkdir(parents=True)
         skill.write_text("---\nname: fixture-skill\ndescription: A sentinel skill\n---\nSkill sentinel\n")
