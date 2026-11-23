@@ -26,12 +26,11 @@ from identity_support import (
     sha,
 )
 
-from arbol_codex_driver.admission import current_session
+from arbol_codex_driver.admission import _join_owned, current_session
 from arbol_codex_driver.continuity import Chats, message_digest
 from arbol_codex_driver.errors import Failure
 from arbol_codex_driver.identity import IdentityJournal, LifetimeSnapshot
 from arbol_codex_driver.identity_protocol import PrivateDirectory, canonical_bytes, object_fields, parse_bytes, token
-from arbol_codex_driver.process_identity import matches, process_identity
 from arbol_codex_driver.run_request import RunRequest
 from arbol_codex_driver.runs import Runs
 from arbol_codex_driver.state import State, owner_json, process_owner
@@ -572,23 +571,16 @@ async def public_subscription_request(
 ) -> LocalCapture:
     """Invoke the sealed provider with a source-owned disposable Subscription command."""
     subject.check_inputs()
-    authority = subject.session.authority
-    provider = authority.provider
-    declaration = provider.declaration
-    process = await asyncio.create_subprocess_exec(
-        str(provider.regular_file(declaration.interpreter)), "-ISB", str(provider.regular_file(declaration.entry)),
-        "--qualification-launch", str(authority.registry), "arbol-codex-driver", authority.producer.declaration.build,
-        "driver", "--", "--state-dir", str(subject.state), "subscriptions", operation, *arguments,
-        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        cwd=subject.fixture.path, env=subject.environment, close_fds=True, limit=8192,
-    )
-    owner = process_identity(process.pid)
-    require(matches(owner, parent=os.getpid()), "The public provider is no longer our verified child.")
-    invocation = LocalInvocation(process, owner)
+    invocation = await subject.spawn_subscription(operation, arguments)
     try:
         result = await subject.collect(invocation, receipt)
-    finally:
-        await subject.stop(invocation)
+    except BaseException as original:
+        try:
+            await _join_owned(asyncio.create_task(subject.stop(invocation)))
+        except BaseException as cleanup:
+            original.add_note("Provider cleanup unresolved: " + type(cleanup).__name__)
+        raise
+    await subject.stop(invocation)
     subject.check_inputs()
     return result
 
