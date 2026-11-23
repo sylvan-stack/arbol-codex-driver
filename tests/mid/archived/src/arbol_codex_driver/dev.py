@@ -115,8 +115,9 @@ async def probe(
 
 
 async def check_account(subscriptions: Subscriptions, refresh: bool = True, identifier: str = "chatgpt") -> Object:
-    if not identifier or identifier.startswith("test-") or identifier not in subscriptions.ids():
-        raise Failure("invalid_input", "Select a registered real existing Subscription; test profiles are prohibited.")
+    # Only the native account is runnable (CDX-1.2); no test or further profile can be selected.
+    if identifier != "chatgpt" or identifier not in subscriptions.ids():
+        raise Failure("invalid_input", "Select the existing native chatgpt Subscription.")
     account = await subscriptions.require_signed_in(identifier)
     if account["family"] != "chatgpt":
         raise Failure("invalid_input", "The selected existing Subscription must belong to the chatgpt family.")

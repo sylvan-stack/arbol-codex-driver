@@ -78,13 +78,14 @@ def contract(folder: Path) -> int:
 def live(folder: Path) -> int:
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     # Owner correction, 12 November 2026: qualify only an existing real profile directly.
-    existing_state = home / "Library/Application Support/Arbol/drivers/codex"
+    # Layout 2 keeps normal Driver state under the private installation root.
+    existing_state = home / ".arbol/drivers/codex"
     state = os.environ.get("ARBOL_BUILD_TEST_STATE_DIR", str(existing_state))
     identifier = os.environ.get("ARBOL_BUILD_LIVE_SUBSCRIPTION", "chatgpt")
     if not state or not Path(state).is_absolute() or not Path(state).is_dir():
         raise ValueError("ARBOL_BUILD_TEST_STATE_DIR must name an absolute existing real state directory.")
-    if not identifier or identifier.startswith("test-"):
-        raise ValueError("Select an existing real Subscription ID; test profiles are prohibited.")
+    if identifier != "chatgpt":
+        raise ValueError("ARBOL_BUILD_LIVE_SUBSCRIPTION must name the existing native chatgpt Subscription.")
     record = Path(state) / "subscriptions" / identifier / "record.json"
     if not record.is_file():
         raise ValueError("The selected real Subscription is not registered in the existing state.")
