@@ -6,6 +6,7 @@ Actual runner callbacks supply every local result; reports never mean gate succe
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -884,6 +885,22 @@ class CodexPostAdmissionPhase:
         self.support.__exit__(kind, error, traceback)
 
 
+class _PublicCallCase:
+    def __init__(self, case_id: str, session: Session) -> None:
+        self.case_id, self.session = case_id, session
+        self.calls: list[Object] = []
+        self.closed = False
+
+    def append(self, row: Object) -> None:
+        require(not self.closed and len(self.calls) < 128
+                and all(previous["invocation"] != row["invocation"] for previous in self.calls),
+                "Ordinary provider witness is outside its original case, duplicate or unbounded.")
+        self.calls.append(row)
+
+
+_public_case: contextvars.ContextVar[_PublicCallCase | None] = contextvars.ContextVar("codex_public_case", default=None)
+
+
 class CodexWholeUnitResult(unittest.TestResult):
     """Actual unittest callbacks, retained inside the entered checker Session.
 
@@ -900,6 +917,7 @@ class CodexWholeUnitResult(unittest.TestResult):
         self.final_results: list[TerminalLocalResult] = []
         self.started: str | None = None
         self.attempted = 0
+        self.public_token: contextvars.Token[_PublicCallCase | None] | None = None
         self.unsuccessful: list[tuple[str, str]] = []
 
     @staticmethod
@@ -918,19 +936,36 @@ class CodexWholeUnitResult(unittest.TestResult):
         require(self.started is None and self.attempted < len(CODEX_UNIT_ORDER)
                 and case_id == CODEX_UNIT_ORDER[self.attempted], "Unexpected local case order.")
         self.attempted += 1
+        require(_public_case.get() is None and self.public_token is None, "A foreign public case is active.")
         self.started = case_id
         super().startTest(test)
+        self.public_token = _public_case.set(_PublicCallCase(case_id, self.phase.session))
 
     def addSuccess(self, test: unittest.case.TestCase) -> None:
         case_id = self._case_id(test)
         require(case_id == self.started and self.phase.support is not None, "Unmatched successful callback.")
         assert self.phase.support is not None
+        public_case = _public_case.get()
+        require(public_case is not None and public_case.case_id == case_id and not public_case.closed,
+                "Public results belong to a different or already settled case.")
+        assert public_case is not None
+        public_case.closed = True
         evidence = canonical({"version": 1, "kind": "abr38-unittest-success", "id": case_id})
         if case_id == H1_ID:
+            require(not public_case.calls, "H1 cannot own ordinary provider calls.")
             require(self.phase.support.completed and self.phase.support.rows[-1]["id"] == H1_ID,
                     "H1 has not completed its actual local follow-up.")
         else:
+            calls = canonical({"case": case_id, "publicCalls": public_case.calls}, limit=1024 * 1024)
+            self.phase.support.fixture.publish("public-calls-" + sha(calls) + ".json", calls, limit=1024 * 1024)
+            evidence = canonical({"version": 1, "kind": "abr38-unittest-success", "id": case_id,
+                                  "publicCallsSha256": sha(calls)})
             self.phase.record(case_id, "passed", evidence)
+            # record retained a canonical status envelope around these exact success
+            # bytes. Terminal settlement must preserve that very same original.
+            result_hash = self.phase.support.rows[-1]["resultSha256"]
+            evidence = self.phase.support.fixture.read("result-" + result_hash + ".json", limit=65536)
+            require(sha(evidence) == result_hash, "Original per-case result envelope changed.")
         self.final_results.append(TerminalLocalResult(case_id, evidence))
         super().addSuccess(test)
 
@@ -971,8 +1006,17 @@ class CodexWholeUnitResult(unittest.TestResult):
             except BaseException as error:
                 # Preserve unittest's original failure/skip and prevent a false pass.
                 self.unsuccessful.append((case_id, "result-recording-" + type(error).__name__))
-        self.started = None
-        super().stopTest(test)
+        try:
+            super().stopTest(test)
+        finally:
+            require(self.public_token is not None, "Public case callback lost its original binding.")
+            assert self.public_token is not None
+            public_case = _public_case.get()
+            if public_case is not None:
+                public_case.closed = True
+            _public_case.reset(self.public_token)
+            self.public_token = None
+            self.started = None
 
     def complete(self) -> tuple[TerminalLocalResult, ...]:
         require(self.started is None and self.wasSuccessful() and not self.unsuccessful and not self.skipped
@@ -1309,6 +1353,8 @@ LocalRequest = Literal["identity", "list"]
 class LocalInvocation:
     process: asyncio.subprocess.Process
     owner: Identity
+    argv: tuple[str, ...]
+    request: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1332,6 +1378,7 @@ class CodexLocalSubject:
                 "Local proof cases require the actual complete candidate unit runner.")
         self.fixture = FixtureRoot(session, uuid.uuid4().hex)
         self.session = session
+        self.public_case = _public_case.get()
         self.state = self.fixture.path / "state"
         self.home = self.fixture.path / "home"
         self.native = self.home / ".codex"
@@ -1476,7 +1523,7 @@ class CodexLocalSubject:
             process = await asyncio.shield(spawning)
             owner = process_identity(process.pid)
             require(matches(owner, parent=os.getpid()), "The actual public provider is not our verified child.")
-            return LocalInvocation(process, owner)
+            return LocalInvocation(process, owner, tuple(argv), tail)
         except BaseException as original:
             try:
                 # Join the actual spawn even when the caller is cancelled. Never
@@ -1484,7 +1531,7 @@ class CodexLocalSubject:
                 if process is None:
                     process = await _join_owned(spawning)
                 if owner is not None:
-                    await _join_owned(asyncio.create_task(self.stop(LocalInvocation(process, owner))))
+                    await _join_owned(asyncio.create_task(self.stop(LocalInvocation(process, owner, tuple(argv), tail))))
                 else:
                     await _join_owned(asyncio.create_task(self._reap_process(process)))
             except BaseException as cleanup:
@@ -1513,7 +1560,35 @@ class CodexLocalSubject:
         }, limit=32768), limit=32768)
         require(self.fake_secret.encode() not in capture.stdout + capture.stderr,
                 "Private fixture contents escaped the public Driver output.")
-        self._terminal(capture.owner)
+        graph = self._terminal(capture.owner)
+        if self.public_case is not None:
+            require(self.public_case.session is self.session and process.pid == capture.owner["pid"]
+                    and process.returncode == capture.exit and capture.exit in (0, 1)
+                    and process.stdin is None and not capture.stderr and not matches(capture.owner),
+                    "Public result is not the fixed case's actual joined child.")
+            for reader in (process.stdout, process.stderr):
+                transport = getattr(reader, "_transport", None)
+                require(reader.at_eof() and isinstance(transport, asyncio.ReadTransport)
+                        and transport.is_closing() and transport.get_extra_info("pipe").closed,
+                        "Original asyncio output pipe is still open.")
+            refusal = None
+            if capture.exit:
+                result = document(capture.stdout)
+                require(isinstance(result.get("error"), dict)
+                        and result["error"].get("code") in ("internal", "invalid_input", "in_use", "not_found"),
+                        "Unexpected ordinary Codex refusal.")
+                refusal = result["error"]["code"]
+            detail = canonical({"case": self.public_case.case_id, "fixture": self.fixture.case,
+                                "invocation": graph["invocation"], "request": list(invocation.request),
+                                "stdoutHex": capture.stdout.hex(), "stderrHex": capture.stderr.hex()}, limit=32768)
+            self.fixture.publish("public-" + sha(graph["invocation"].encode()) + ".json", detail, limit=32768)
+            self.public_case.append({**graph, "fixture": self.fixture.case,
+                "fixtureOwnerSha256": sha(self.fixture.read(".fixture-owner.json")), "captureSha256": sha(detail),
+                "operation": invocation.request[0], "argvSha256": sha(canonical(invocation.argv, limit=65536)),
+                "provider": dict(capture.owner), "waitStatus": capture.exit,
+                "stdoutSize": len(capture.stdout), "stdoutSha256": sha(capture.stdout),
+                "stderrSize": len(capture.stderr), "stderrSha256": sha(capture.stderr),
+                "refusal": refusal, "streams": "closed"})
         return capture
 
     async def stop(self, invocation: LocalInvocation) -> None:
@@ -1539,7 +1614,7 @@ class CodexLocalSubject:
                 tasks.create_task(discard(process.stderr))
             tasks.create_task(process.wait())
 
-    def _terminal(self, owner: Identity) -> None:
+    def _terminal(self, owner: Identity) -> Object:
         registry = self.session.registry
         with registry.mutex(), PrivateDirectory(registry.folder / "writers") as writers:
             names = os.listdir(writers.fd)
@@ -1585,6 +1660,20 @@ class CodexLocalSubject:
                     expected = {token(root["writer"]) + ".json", token(writer["writer"]) + ".json"}
                     require(set(os.listdir(group.fd)) == expected,
                             "The local proof invocation left an unexpected writer.")
+                context_raw = directory.read(token(transfer["handoff"]) + ".context.json", 65536)
+                require(context_raw is not None, "Public MAIN immutable context is missing.")
+                assert context_raw is not None
+                context = document(context_raw, limit=65536)
+                require(sha(context_raw) == transfer["contextSha256"] and context["handoff"] == transfer["handoff"]
+                        and context["invocation"] == root["invocation"] and context["writer"] == writer["writer"]
+                        and context["role"] == "main" and context["entry"] == transfer["entry"]
+                        and context["parent"] == {"writer": root["writer"], **owner}
+                        and context["process"] == {key: writer[key] for key in ("pid", "startedAt")},
+                        "Ordinary MAIN context is not the actual provider's child.")
+                return {"invocation": root["invocation"], "rootWriter": root["writer"], "mainWriter": writer["writer"],
+                        "handoff": transfer["handoff"], "main": context["process"], "contextSha256": sha(context_raw),
+                        "rootSha256": sha(canonical(root)), "mainSha256": sha(canonical(writer)),
+                        "handoffSha256": sha(canonical(transfer))}
 
     async def request(self, request: LocalRequest, name: str, expected: tuple[str, str] | None = None) -> LocalCapture:
         self.check_inputs()
