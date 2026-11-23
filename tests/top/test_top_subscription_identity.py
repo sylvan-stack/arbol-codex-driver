@@ -276,7 +276,11 @@ class LocalIdentityTests(unittest.TestCase):
         self._failure(outcome, "invalid_input")
         self.assertEqual(subject.state_image(), before)
 
-        for operation, message in (("sign-out", "cannot be signed out"), ("remove", "cannot be removed")):
+        # Codex owns sign-out; removal of the protected native record is refused outright.
+        for operation, message, remedy in (
+            ("sign-out", "uses the native Codex account", "Sign out directly in Codex."),
+            ("remove", "cannot be removed", None),
+        ):
             for flags in ((), ("--force",)):
                 with self.subTest(operation=operation, flags=flags):
                     name = operation + ("-forced" if flags else "-ordinary")
@@ -285,6 +289,7 @@ class LocalIdentityTests(unittest.TestCase):
                     detail = refusal["message"]
                     assert isinstance(detail, str)
                     self.assertIn(message, detail)
+                    self.assertEqual(refusal.get("remedy"), remedy)
                     self.assertEqual(subject.state_image(), before)
                     subject.check_inputs()
         expected = (str(original["generation"]), str(original["witness"]))
