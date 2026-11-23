@@ -620,7 +620,7 @@ for line in sys.stdin:
     elif method == "config/read":
         result = {"config": {"check_for_update_on_startup": False, "web_search": "live",
                              "analytics": {"enabled": False}, "features": {"memories": False}}}
-    elif method in ("account/read", "account/rateLimits/read"):
+    elif method == "account/read":
         record = folder / "request.tmp"
         record.write_text(json.dumps({"method": method, "params": request["params"], "pid": os.getpid()}))
         record.replace(folder / "request.json")
@@ -629,10 +629,7 @@ for line in sys.stdin:
             if time.monotonic() >= deadline:
                 sys.exit(3)
             time.sleep(0.01)
-        if method == "account/read":
-            result = {"account": {"type": "chatgpt", "email": "old@example.invalid", "planType": "fixture"}}
-        else:
-            result = {"rateLimits": {"primary": {"usedPercent": 73, "windowDurationMins": 300}}}
+        result = {"account": {"type": "chatgpt", "email": "old@example.invalid", "planType": "fixture"}}
         (folder / "reply-ready").touch(exist_ok=False)
         print(json.dumps({"id": request["id"], "result": result}), flush=True)
         continue
@@ -658,11 +655,6 @@ class LifetimeRaceTests(unittest.TestCase):
 
     def test_fresh_list_reaps_a_dead_predecessor_receipt_without_adopting_its_verdict(self) -> None:
         asyncio.run(self._reap_predecessor())
-
-    def test_delayed_account_check_and_usage_preserve_successor_of_same_identifier(self) -> None:
-        for method in ("account/read", "account/rateLimits/read"):
-            with self.subTest(method=method):
-                asyncio.run(self._delayed_account_reply(method))
 
     def test_late_run_settlement_cannot_recreate_a_map_or_remove_successor_reservation(self) -> None:
         asyncio.run(self._late_run_settlement())
@@ -765,59 +757,6 @@ class LifetimeRaceTests(unittest.TestCase):
             subject.check_inputs()
         finally:
             state.close()
-
-    async def _delayed_account_reply(self, method: str) -> None:
-        subject = CodexLocalSubject()
-        state = State(subject.state)
-        identifier = self.subscription_id
-        fixture = subject.fixture.path
-        tool = install_account_peer(subject)
-        state.initialize()
-        try:
-            subscriptions = self._subscriptions(subject, state, tool)
-            folder = state.subscription(identifier)
-            folder.mkdir(parents=True, mode=0o700)
-            self._record(folder, "Original")
-            proof = await subscriptions.identity(identifier)
-            check = method == "account/read"
-            async with asyncio.TaskGroup() as group:
-                pending = group.create_task(self._observe_delayed_result(subscriptions, check=check))
-                async with asyncio.timeout(15):
-                    observed = fixture / "request.json"
-                    while not observed.exists():
-                        self.assertFalse(pending.done(), "Codex returned before the app-server reply.")
-                        await asyncio.sleep(0.01)
-                    request, _ = subject._read(observed)
-                    row = document(request)
-                    self.assertEqual(row["method"], method)
-                    self.assertIs(type(row["pid"]), int)
-                    owner = await process_owner(row["pid"])
-                    self.assertIsNotNone(owner)
-                    self.assertFalse(pending.done())
-                    self.assertFalse(os.path.lexists(folder / "lock"), "Vendor reply wait holds the short lock.")
-                    successor = await self._retire_and_replace(subscriptions, folder, proof)
-                    preserved = subject.state_image()
-                    self.assertFalse(pending.done())
-                    subject._publish(fixture / "release", b"")
-            verdict = pending.result()
-            self.assertEqual(verdict["code"] if check else verdict["outcome"], "in_use" if check else "unavailable")
-            self.assertIn("lifetime changed", verdict["message"])
-            if not check:
-                self.assertEqual(verdict["windows"], [])
-            self.assertTrue((fixture / "reply-ready").is_file())
-            self.assertIsNone(await process_owner(row["pid"]), "The original vendor process was not reaped.")
-            self.assertEqual(subject.state_image(), preserved)
-            self.assertEqual(await subscriptions.identity(identifier), successor)
-            subject.check_inputs()
-        finally:
-            state.close()
-
-    async def _observe_delayed_result(self, subscriptions: Subscriptions, *, check: bool) -> Object:
-        if not check:
-            return await subscriptions.usage(self.subscription_id)
-        with self.assertRaises(Failure) as rejected:
-            await subscriptions.check(self.subscription_id)
-        return rejected.exception.result
 
     @staticmethod
     def _lifetime(proof: Object) -> LifetimeSnapshot:
@@ -929,3 +868,71 @@ class LifetimeRaceTests(unittest.TestCase):
             subject.check_inputs()
         finally:
             state.close()
+
+
+# LOW TIER — DO NOT ENABLE OR RECREATE
+# Historical examples only. Read before adding related tests; never execute.
+# LOW-TIER-BEGIN: tests/top/test_top_subscription_identity.py::LifetimeRaceTests.test_delayed_account_check_and_usage_preserve_successor_of_same_identifier
+# Reason: Obsolete under OG-5 and CDX-1.2 (ABR-64): the case holds a native account or usage reply for the historical Subscription historical-chatgpt while that Subscription is retired and replaced. The Driver now refuses check and usage on every Subscription other than chatgpt before any native start, and chatgpt cannot be retired and replaced because its removal is refused. Retained evidence: the lifetime fence on late local settlement in test_late_run_settlement_cannot_recreate_a_map_or_remove_successor_reservation and test_failed_run_cannot_remove_a_newer_map_revision_for_the_same_conversation; the real native status refresh belongs to the real-account gate.
+# Source: arbol-codex-driver@8831123e69769467ea2b62b7186233c1d3108e3f:tests/top/test_top_subscription_identity.py
+# Historical fixtures and class context are available at the source revision; no active dependencies restored.
+# LOW-TIER-SOURCE-BEGIN
+#     def test_delayed_account_check_and_usage_preserve_successor_of_same_identifier(self) -> None:
+#         for method in ("account/read", "account/rateLimits/read"):
+#             with self.subTest(method=method):
+#                 asyncio.run(self._delayed_account_reply(method))
+#
+#     async def _delayed_account_reply(self, method: str) -> None:
+#         subject = CodexLocalSubject()
+#         state = State(subject.state)
+#         identifier = self.subscription_id
+#         fixture = subject.fixture.path
+#         tool = install_account_peer(subject)
+#         state.initialize()
+#         try:
+#             subscriptions = self._subscriptions(subject, state, tool)
+#             folder = state.subscription(identifier)
+#             folder.mkdir(parents=True, mode=0o700)
+#             self._record(folder, "Original")
+#             proof = await subscriptions.identity(identifier)
+#             check = method == "account/read"
+#             async with asyncio.TaskGroup() as group:
+#                 pending = group.create_task(self._observe_delayed_result(subscriptions, check=check))
+#                 async with asyncio.timeout(15):
+#                     observed = fixture / "request.json"
+#                     while not observed.exists():
+#                         self.assertFalse(pending.done(), "Codex returned before the app-server reply.")
+#                         await asyncio.sleep(0.01)
+#                     request, _ = subject._read(observed)
+#                     row = document(request)
+#                     self.assertEqual(row["method"], method)
+#                     self.assertIs(type(row["pid"]), int)
+#                     owner = await process_owner(row["pid"])
+#                     self.assertIsNotNone(owner)
+#                     self.assertFalse(pending.done())
+#                     self.assertFalse(os.path.lexists(folder / "lock"), "Vendor reply wait holds the short lock.")
+#                     successor = await self._retire_and_replace(subscriptions, folder, proof)
+#                     preserved = subject.state_image()
+#                     self.assertFalse(pending.done())
+#                     subject._publish(fixture / "release", b"")
+#             verdict = pending.result()
+#             self.assertEqual(verdict["code"] if check else verdict["outcome"], "in_use" if check else "unavailable")
+#             self.assertIn("lifetime changed", verdict["message"])
+#             if not check:
+#                 self.assertEqual(verdict["windows"], [])
+#             self.assertTrue((fixture / "reply-ready").is_file())
+#             self.assertIsNone(await process_owner(row["pid"]), "The original vendor process was not reaped.")
+#             self.assertEqual(subject.state_image(), preserved)
+#             self.assertEqual(await subscriptions.identity(identifier), successor)
+#             subject.check_inputs()
+#         finally:
+#             state.close()
+#
+#     async def _observe_delayed_result(self, subscriptions: Subscriptions, *, check: bool) -> Object:
+#         if not check:
+#             return await subscriptions.usage(self.subscription_id)
+#         with self.assertRaises(Failure) as rejected:
+#             await subscriptions.check(self.subscription_id)
+#         return rejected.exception.result
+# LOW-TIER-SOURCE-END
+# LOW-TIER-END
