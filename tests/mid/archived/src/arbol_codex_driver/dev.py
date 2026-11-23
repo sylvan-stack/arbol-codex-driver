@@ -2,7 +2,6 @@
 import asyncio
 import re
 import shutil
-import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -13,69 +12,33 @@ from arbol_codex_driver.app_server import AppServer
 from arbol_codex_driver.cancellation import Cancellation, interruptible
 from arbol_codex_driver.dev_support import (
     READY,
-    SUBSCRIPTION,
-    command,
     driver_environment,
     probe_shape,
     provenance,
     refuse_exhausted,
     save_report,
-    schema_enums,
     stop_child,
     usage_change,
     verify,
 )
-from arbol_codex_driver.environment import clean_environment
 from arbol_codex_driver.errors import Failure, safe_failure
-from arbol_codex_driver.history import history_items
 from arbol_codex_driver.json_types import Json, Object, loads, now, number, object_value, string
 from arbol_codex_driver.runs import Runs
 from arbol_codex_driver.state import private_directory, write_json
-from arbol_codex_driver.subscriptions import Subscriptions
+from arbol_codex_driver.subscriptions import Subscriptions, read_native_account
 from arbol_codex_driver.tool import inspect_tool, require_tool
-
-SCHEMA_FIELDS = {
-    "ThreadStartParams": {
-        "cwd",
-        "model",
-        "approvalPolicy",
-        "sandbox",
-        "serviceTier",
-        "developerInstructions",
-        "ephemeral",
-        "config",
-    },
-    "TurnStartParams": {
-        "threadId",
-        "input",
-        "model",
-        "effort",
-        "summary",
-        "approvalPolicy",
-        "sandboxPolicy",
-        "serviceTier",
-    },
-    "ThreadResumeParams": {"threadId", "model", "config"},
-    "ThreadInjectItemsParams": {"threadId", "items"},
-    "ThreadReadParams": {"threadId", "includeTurns"},
-    "TurnInterruptParams": {"threadId", "turnId"},
-    "ErrorNotification": {"threadId", "turnId", "error", "willRetry"},
-    "AccountRateLimitsUpdatedNotification": {"rateLimits"},
-    "ThreadTokenUsageUpdatedNotification": {"threadId", "turnId", "tokenUsage"},
-    "TurnCompletedNotification": {"threadId", "turn"},
-}
-
-
-def read_schema(directory: Path, name: str) -> Json:
-    try:
-        return loads((directory / "v2" / (name + ".json")).read_text())
-    except (OSError, ValueError):
-        raise Failure("tool_unsupported", f"codex did not produce a readable stable {name} schema.") from None
 
 
 async def probe(
     subscriptions: Subscriptions, inherited: dict[str, str], cancellation: Cancellation
 ) -> tuple[int, Object]:
+    """Observe the installed tool and the native account; start nothing else.
+
+    Codex owns authentication (OG-5). This probe starts no login, logout, thread,
+    hook or MCP server and uses no home other than the default native profile.
+    The earlier schema, device-login, disposable-home, history and resume
+    observations remain dated historical evidence in the Artifact Corpus.
+    """
     checks: list[Json] = []
     report: Object = {
         "check": "dev.probe",
@@ -84,225 +47,26 @@ async def probe(
         "provenance": provenance(),
         "checks": checks,
     }
-    temporary = subscriptions.state.directory / "tmp"
-    private_directory(temporary)
-    directory = Path(tempfile.mkdtemp(prefix="probe-", dir=temporary))
     server: AppServer | None = None
     status = 0
     try:
         tool = await inspect_tool(
             subscriptions.state, string(subscriptions.settings.get("toolPath")), inherited, cancellation
         )
-        program = require_tool(tool)
+        require_tool(tool)
         report["toolVersion"] = tool["version"]
-        owner = directory / "owner"
-        private_directory(owner)
-        private_directory(directory / "schema-home")
-        env = clean_environment(inherited, str(owner), str(directory / "schema-home"))
-        env["TMPDIR"] = str(directory)
-        schema_directory = directory / "schema"
-        code, _ = await command(
-            program,
-            ["app-server", "generate-json-schema", "--out", str(schema_directory)],
-            env,
-            directory,
-            cancellation,
-        )
-        verify(code == 0, "codex did not generate its stable protocol schema.")
-        schemas: Object = {}
-        for name, fields in SCHEMA_FIELDS.items():
-            schema = object_value(read_schema(schema_directory, name))
-            properties = object_value(schema.get("properties"))
-            verify(fields.issubset(properties), f"codex changed the stable {name} fields.")
-            schemas[name] = {"fields": cast(list[Json], sorted(properties)), "required": schema.get("required", [])}
-        login_schema = read_schema(schema_directory, "LoginAccountParams")
-        verify(
-            {"chatgpt", "chatgptDeviceCode"}.issubset(schema_enums(login_schema)),
-            "codex changed its stable ChatGPT login types.",
-        )
-        schemas["LoginAccountParams"] = {"loginTypes": ["chatgpt", "chatgptDeviceCode"]}
-        error_schema = object_value(
-            object_value(read_schema(schema_directory, "ErrorNotification")).get("definitions")
-        ).get("CodexErrorInfo")
-        verify(isinstance(error_schema, dict), "codex did not include its stable CodexErrorInfo definition.")
-        error_enums = schema_enums(error_schema)
-        verify(
-            {"contextWindowExceeded", "usageLimitExceeded", "other"}.issubset(error_enums),
-            "codex changed its stable error classes.",
-        )
-        schemas["CodexErrorInfo"] = {"classes": cast(list[Json], sorted(error_enums))}
-        checks.append(
-            {
-                "check": "probe.stable-schema",
-                "outcome": "passed",
-                "experimentalSchemaIncluded": False,
-                "requests": schemas,
-            }
-        )
-        config_home = directory / "home"
-        server = await AppServer.start(
-            tool_path=program, home=config_home, cwd=directory, env=env, cancellation=cancellation
-        )
+        server = await subscriptions.start("chatgpt", cancellation=cancellation)
         verify(server.tool_version == tool["version"], "codex changed its handshake version.")
-        original = (config_home / "config.toml").read_bytes()
+        # One read without a token refresh. Only booleans leave this process.
+        account = await read_native_account(server, cancellation)
         checks.append(
             {
-                "check": "probe.base-info",
+                "check": "probe.native-account",
                 "outcome": "passed",
-                "configuration": probe_shape(server.effective_config),
-                "handshakeVersion": server.tool_version,
-                "privateHome": True,
+                "handshakeVersionMatches": True,
+                "signedIn": account is not None,
             }
         )
-        account = object_value(await server.request("account/read", {}, cancellation=cancellation))
-        verify(account.get("account") is None, "A disposable Codex home unexpectedly has an account.")
-        models = await server.request("model/list", {}, cancellation=cancellation)
-        checks.append(
-            {
-                "check": "probe.subscriptions",
-                "outcome": "passed",
-                "account": probe_shape(account),
-                "models": probe_shape(models),
-            }
-        )
-        skill = owner / ".agents/skills/arbol-probe/SKILL.md"
-        private_directory(skill.parent)
-        skill.write_text(
-            "---\nname: arbol-probe\ndescription: Synthetic discovery probe\n---\nNo inference is requested.\n"
-        )
-        tools = await server.request(
-            "thread/start",
-            {
-                "cwd": str(directory),
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-                "ephemeral": True,
-                "config": {"mcp_servers": {"arbol-probe": {"command": sys.executable, "args": ["-I", "-c", "pass"]}}},
-            },
-            cancellation=cancellation,
-        )
-        skills = object_value(
-            await server.request(
-                "skills/list", {"cwds": [str(directory)], "forceReload": True}, cancellation=cancellation
-            )
-        )
-        data = skills.get("data", [])
-        found: list[Object] = []
-        if isinstance(data, list):
-            for entry in data:
-                entries = object_value(entry).get("skills", [])
-                if isinstance(entries, list):
-                    found.extend(object_value(value) for value in entries)
-        verify(
-            any(value.get("name") == "arbol-probe" for value in found),
-            "codex did not discover the disposable probe skill.",
-        )
-        checks.append(
-            {
-                "check": "probe.tools",
-                "outcome": "passed",
-                "thread": probe_shape(tools),
-                "skills": probe_shape(skills),
-                "ownerSetup": "synthetic disposable HOME only",
-            }
-        )
-        login = object_value(
-            await server.request("account/login/start", {"type": "chatgptDeviceCode"}, cancellation=cancellation)
-        )
-        login_id = string(login.get("loginId"))
-        verify(
-            login_id is not None
-            and isinstance(login.get("verificationUrl"), str)
-            and isinstance(login.get("userCode"), str),
-            "codex changed its device-code login response.",
-        )
-        cancelled = await server.request("account/login/cancel", {"loginId": login_id}, cancellation=cancellation)
-        logout = await server.request("account/logout", {}, cancellation=cancellation)
-        checks.append(
-            {
-                "check": "probe.device-login",
-                "outcome": "passed",
-                "login": probe_shape(login),
-                "cancel": probe_shape(cancelled),
-                "logout": probe_shape(logout),
-                "localLogin": "schema only; a shared browser callback can replace a pending owner login",
-            }
-        )
-        started = object_value(
-            await server.request(
-                "thread/start",
-                {"cwd": str(directory), "approvalPolicy": "never", "sandbox": "read-only", "ephemeral": False},
-                cancellation=cancellation,
-            )
-        )
-        thread = string(object_value(started.get("thread")).get("id"))
-        verify(thread is not None, "codex did not return a saved probe thread.")
-        history: list[Object] = [
-            {"type": "message", "role": "user", "text": "Synthetic history; never sent for inference."},
-            {
-                "type": "tool_call",
-                "name": "shell",
-                "input": {"command": "printf fixture"},
-                "ok": False,
-                "result": {"output": "fixture", "exitCode": 1},
-            },
-        ]
-        injected = await server.request(
-            "thread/inject_items", {"threadId": thread, "items": history_items(history)}, cancellation=cancellation
-        )
-        read = await server.request(
-            "thread/read", {"threadId": thread, "includeTurns": True}, cancellation=cancellation
-        )
-        checks.append(
-            {
-                "check": "probe.continuity",
-                "outcome": "passed",
-                "start": probe_shape(started),
-                "injected": probe_shape(injected),
-                "read": probe_shape(read),
-            }
-        )
-        # No turn has started: this checks refusal shape without a model request.
-        try:
-            await server.request(
-                "turn/interrupt",
-                {"threadId": str(uuid.uuid4()), "turnId": str(uuid.uuid4())},
-                cancellation=cancellation,
-            )
-        except Failure as failure:
-            if "vendorCode" not in object_value(failure.result.get("detail")):
-                raise
-            checks.append({"check": "probe.stopping", "outcome": "passed", "refusal": probe_shape(failure.result)})
-        else:
-            checks.append({"check": "probe.stopping", "outcome": "passed", "response": "empty success"})
-        verify((config_home / "config.toml").read_bytes() == original, "codex changed the probe configuration.")
-        await server.end()
-        server = await AppServer.start(
-            tool_path=program, home=config_home, cwd=directory, env=env, cancellation=cancellation
-        )
-        resumed = await server.request("thread/resume", {"threadId": thread}, cancellation=cancellation)
-        checks.append({"check": "probe.resume", "outcome": "passed", "response": probe_shape(resumed)})
-        await server.end()
-        server = None
-        # An existing designated test home may be queried, never copied. No
-        # thread, login or prompt is started in it, and no account values saved.
-        if SUBSCRIPTION in subscriptions.ids() and (await subscriptions.get(SUBSCRIPTION))["state"] == "signed_in":
-            verify(
-                subscriptions.file(SUBSCRIPTION, "home").is_dir(),
-                "The signed-in test Subscription home is missing; the probe will not recreate it.",
-            )
-            server = await subscriptions.start(SUBSCRIPTION)
-            signed_account = await server.request("account/read", {}, cancellation=cancellation)
-            usage = await server.request("account/rateLimits/read", {}, cancellation=cancellation)
-            checks.append(
-                {
-                    "check": "probe.signed-subscription",
-                    "outcome": "passed",
-                    "subscriptionId": SUBSCRIPTION,
-                    "account": probe_shape(signed_account),
-                    "usage": probe_shape(usage),
-                }
-            )
     except Exception as failure:
         status = 2 if cancellation.aborted else 1
         public = safe_failure(failure)
@@ -346,8 +110,6 @@ async def probe(
                 "message": "The Codex probe could not finish its process cleanup.",
             }
             checks.append({"check": "probe.cleanup", "outcome": "failed"})
-        finally:
-            shutil.rmtree(directory, ignore_errors=True)
     report["outcome"] = "passed" if status == 0 else "cancelled" if status == 2 else "failed"
     return status, save_report(subscriptions.state, report)
 
