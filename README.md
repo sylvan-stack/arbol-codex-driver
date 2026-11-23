@@ -16,8 +16,8 @@ signed in to directly in Codex, in the default native `~/.codex` profile. Arbol
 does not start sign-in, sign-out or credential refresh. The compatibility
 `subscriptions sign-in chatgpt` action refreshes local status from the existing
 native account and accepts no authentication codes. Use `codex login status`
-to check the native login. The old `dev probe` refuses pending a native-only
-replacement in the testing work.
+to check the native login. `dev probe` reads the installed tool version and
+the native account status only; it starts no authentication.
 
 Additional-account execution and new Subscription creation are refused. The
 canonical record is protected from sign-out or removal in Arbol. Eligible
@@ -354,16 +354,15 @@ bin/arbol-codex-driver dev build-check
 bin/arbol-codex-driver dev live-check
 ```
 
-`dev probe` sends no inference request. It checks stable generated schemas,
-private configuration, account/model response shapes, device-login cancellation,
-skill/MCP discovery, history injection, saved-thread resume and stop refusal.
-It uses disposable homes and optionally reads account/usage shapes from the
-existing signed-in `test-chatgpt` home. Local browser-login parameters are checked
-by schema, since starting its shared callback listener could replace another
-pending login.
+`dev probe` sends no inference request. Since ABR-64 it reads the installed
+tool version and one native account read without a token refresh, on the
+default profile, and reports booleans only. It starts no login, logout, thread,
+hook or MCP server. Its earlier schema, device-login, disposable-home, history
+and resume observations are dated historical evidence.
 
-Both live commands use only `test-chatgpt`, refuse missing, unsigned or exhausted
-accounts before inference, and refresh usage before every attempt. The build
+Both live commands use only the existing native `chatgpt` Subscription, refuse
+unsigned or exhausted accounts before inference, and refresh usage before
+every attempt. The build
 check sends exactly one no-tools ready message. The extended live check includes
 tools, a child and background work, continuity and stopping; run it only when
 requested. Reports include attempted turns, observed starts, token usage and

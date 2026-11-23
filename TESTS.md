@@ -8,7 +8,7 @@ Reviewed revision: `0c596c5960c34039bd48d05df9b66b4ea9f31680` under SYL-327 (29 
 
 ## Selection and limits
 
-2 top-tier inventory entries and 49 mid-tier entries are available after the higher-bar review. 88 low-tier entries were removed under SYL-327. Definitions, scenarios, programs and entry points overlap; this is not a runtime suite count. Top-tier bodies are unchanged. Retained mid-tier sources remain uncommented.
+2 top-tier inventory entries and 47 mid-tier entries are available. The higher-bar review left 49; two account cases that the native-only source makes impossible are preserved as comments under ABR-64. 88 low-tier entries were removed under SYL-327. Definitions, scenarios, programs and entry points overlap; this is not a runtime suite count. Top-tier bodies are unchanged. Retained mid-tier sources remain uncommented.
 
 ## Active top tier
 
@@ -63,8 +63,10 @@ archived lines are comments, including imports and registrations. They add no
 runnable coverage. Re-admission needs distinct new evidence and owner-requested
 test work; a testing request alone does not make low-tier cases useful.
 
-## Real existing profiles for live qualification · 12 November 2026
+## Real native ChatGPT Subscription · ABR-64 · 23 November 2026
 
-Live gates use a real existing provider profile and Subscription ID directly. The default is the existing `chatgpt` record. Layout 2 keeps normal Driver state under `~/.arbol/drivers/codex`. The packaged live runner still defaults to the layout-1 state directory, so set `ARBOL_BUILD_TEST_STATE_DIR` explicitly when running it with layout-2 state. `ARBOL_BUILD_LIVE_SUBSCRIPTION` selects an existing real ID. The historical environment name `ARBOL_BUILD_TEST_STATE_DIR` remains an override for an existing real state directory. Missing, unregistered, signed-out and test-* selections refuse before inference. Qualification never creates a profile, aliases one, copies authentication or starts sign-in.
+Codex owns authentication. The owner directed that authentication evidence use only the real native account. The live gate selects only the existing `chatgpt` record and the default native `~/.codex` profile. The packaged live runner defaults to the layout-2 state directory `~/.arbol/drivers/codex`; the historical name `ARBOL_BUILD_TEST_STATE_DIR` remains an override for an existing real state directory, and `ARBOL_BUILD_LIVE_SUBSCRIPTION` accepts only `chatgpt`. Unregistered, signed-out and every other selection refuse before inference. Qualification never creates a profile, aliases one, copies authentication or starts sign-in. The installed state is format 1; registered qualification uses ABR-38's admitted disposable format-2 state, where the admitted runner refreshes the status before the outer checker can find a signed-in record.
+
+The stand-ins answer the native account read from the scenario part alone and hold no login, logout or credential file. That answer is protocol input for run and catalogue cases, never authentication evidence. The no-prompt probe reads the installed tool version and the native account status only. The prospective identity cases in `tests/top/test_top_subscription_identity.py` stay outside the inventory until ABR-38 wires them; one of them is preserved as comments at the end of that file. ABR-38 owns sealed entry resolution, the admitted whole runner and the registered Build.
 
 The real profile retains its native credential binding and normal vendor behavior. Complete source/package checks, genuine inference, completion and usage observations remain required. Application databases, runtime and Build registry remain disposable. Earlier test-profile records keep their historical scope.
