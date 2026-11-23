@@ -763,6 +763,51 @@ class CodexH1Support:
         # this point; the REAL owning Session context alone finishes admission.
 
 
+class CodexPostAdmissionPhase:
+    """Prospective inner-only phase; the checker owns admission and final exit.
+
+    This object neither bootstraps a process nor returns an outer check result.
+    Its schedule is validated again by CodexH1Support against the immutable
+    inventory; the separately reviewed outer controller owns deferred work.
+    """
+
+    def __init__(self, session: Session, *, case: str, ordered: Sequence[str], pending: Sequence[str]) -> None:
+        require(session is current_session(), "The checker Session must already be entered.")
+        session._check()
+        require(session.context["role"] == "helper" and session.context["entry"] == "scripts/check_build.py"
+                and session.authority.status == "candidate" and sys.argv[1:] == ["unit"]
+                and Path(sys.argv[0]) == session.authority.producer.regular_file("scripts/check_build.py"),
+                "Only the exact admitted candidate unit checker may own this phase.")
+        self.session = session
+        self.support = CodexH1Support(case=case, ordered=ordered, pending=pending)
+        require(self.support.session is session, "The whole-runner Session changed during phase setup.")
+        self.entered = False
+        self.closed = False
+
+    def __enter__(self) -> CodexPostAdmissionPhase:
+        require(not self.entered and not self.closed and current_session() is self.session,
+                "The post-admission phase cannot be reused or transferred.")
+        self.session._check()
+        self.entered = True
+        return self
+
+    def record(self, case_id: str, status: LocalStatus, result: bytes | None) -> None:
+        require(self.entered and not self.closed and current_session() is self.session,
+                "Local results require the owning admitted phase.")
+        self.session._check()
+        self.support.record(case_id, status, result)
+
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
+                 traceback: TracebackType | None) -> None:
+        require(self.entered and not self.closed and current_session() is self.session,
+                "Only the owning admitted checker may finish the local phase.")
+        self.closed = True
+        # This joins the real H1 resources and preserves failures. The checker
+        # must still finish its own Session and the unleased outer controller
+        # must settle all deferred observations before a check can pass.
+        self.support.__exit__(kind, error, traceback)
+
+
 @dataclass(frozen=True)
 class TerminalLocalResult:
     """Actual final local callback evidence, not a provisional4da status row.
