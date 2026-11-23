@@ -206,7 +206,6 @@ class RunFixture:
         self.initialized = self.configured = self.resumed = self.turn_active = self.subagent_active = (
             self.grandchild_active
         ) = False
-        self.logged_in = (home / "auth.json").exists()
         self.thread_params: Record | None = None
         self.history_items: list[Record] = []
         self.saved_path: Path | None = None
@@ -545,41 +544,8 @@ class RunFixture:
         elif not self.configured:
             await error("Driver configuration was not checked")
         elif method == "account/read":
-            await answer({"account": ACCOUNT if self.logged_in else None, "requiresOpenaiAuth": True})
-        elif method == "account/login/start":
-            if params.get("type") not in ("chatgpt", "chatgptDeviceCode"):
-                await error("Unsupported login type")
-                return
-            await answer(
-                {
-                    "type": "chatgptDeviceCode",
-                    "loginId": "fixture-login",
-                    "verificationUrl": "https://auth.openai.com/codex/device",
-                    "userCode": "FIXT-12345",
-                }
-                if params["type"] == "chatgptDeviceCode"
-                else {
-                    "type": "chatgpt",
-                    "loginId": "fixture-login",
-                    "authUrl": "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&state=fixture",
-                }
-            )
-            fd = os.open(self.home / "auth.json", os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(dumps({"credential": "fixture-vendor-secret"}))
-            self.logged_in = True
-            await self.notify(
-                "account/login/completed",
-                {"loginId": "fixture-login", "success": True, "error": None, "onboardingEntrypoint": None},
-            )
-            await self.notify("account/updated", {"authMode": "chatgpt", "planType": "fixture"})
-        elif method == "account/login/cancel":
-            await answer({"status": "canceled" if params.get("loginId") == "fixture-login" else "notFound"})
-        elif method == "account/logout":
-            (self.home / "auth.json").unlink(missing_ok=True)
-            self.logged_in = False
-            await answer({})
-            await self.notify("account/updated", {"authMode": None, "planType": None})
+            # No run part lacks an account; nothing signs in or out here.
+            await answer({"account": ACCOUNT, "requiresOpenaiAuth": True})
         elif method == "model/list":
             if params.get("includeHidden", False) is not False or params.get("cursor") is not None:
                 await error("Invalid model list request")
@@ -614,8 +580,7 @@ class RunFixture:
             except OSError:
                 same_directory = False
             if (
-                not self.logged_in and not probe_thread
-                or self.thread_params and not probe_thread
+                self.thread_params and not probe_thread
                 or params.get("model") not in ("gpt-6.1-sol", "gpt-6-astra")
                 or not same_directory
                 or params.get("approvalPolicy") != "never"
@@ -639,8 +604,7 @@ class RunFixture:
             await self.notify("thread/started", {"thread": result["thread"]})
         elif method == "thread/resume":
             if (
-                not self.logged_in and not (self.scenario == "C32" and params.get("model") is None)
-                or self.thread_params
+                self.thread_params
                 or not isinstance(params.get("threadId"), str)
                 or set(params) - {"threadId", "model", "config"}
                 or "model" in params

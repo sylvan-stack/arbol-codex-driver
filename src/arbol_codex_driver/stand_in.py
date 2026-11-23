@@ -21,11 +21,8 @@ SUBSCRIPTION_SCENARIOS = {"C1", "C2", "C4", "C5", "C6", "C7", "C8", "C39", "C40"
 SUBSCRIPTION_PARTS = {
     "supported",
     "success",
-    "by-code",
-    "waiting",
     "rejected",
     "unavailable",
-    "failed",
     "wrong-home",
     "other-account",
     "unknown-windows",
@@ -149,9 +146,6 @@ def operation(method: object) -> str:
         "account/rateLimits/read": "usage",
         "model/list": "models",
         "account/read": "check",
-        "account/login/start": "sign-in",
-        "account/logout": "sign-out",
-        "account/login/cancel": "cancel-sign-in",
         "initialize": "setup",
         "initialized": "setup",
         "config/read": "setup",
@@ -164,7 +158,7 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     if (
         scenario in RUN_SCENARIOS
         and not (scenario == "C5" and part in SUBSCRIPTION_PARTS)
-        and not (scenario == "C7" and part in SUBSCRIPTION_PARTS and part != "failed")
+        and not (scenario == "C7" and part in SUBSCRIPTION_PARTS)
         and not (scenario == "C32" and part == "info")
         or scenario == "C40" and part not in SUBSCRIPTION_PARTS
         or scenario == "C4" and part == "success"
@@ -186,13 +180,10 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
         raise Failure("invalid_input", "This stand-in does not implement that scenario.")
     version = None if part == "missing" else "0.159.1" if part == "old" else VERSION
     home = native_home()
-    credential = Path(home) / "auth.json" if home else None
-    logged_in = credential is not None and credential.is_file()
     checks = (
         {
             **environment_checks(home),
-            "synthetic": "Successful login, account data, cursor, limit-window and failure variants of the recorded protocol",
-            "hasCredential": logged_in,
+            "synthetic": "Account data, cursor, limit-window and failure variants of the recorded protocol",
         }
         if subscriptions
         else {}
@@ -217,40 +208,11 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
     input_ = Input()
     await input_.open()
     initialized = False
-    login_id: str | None = None
-    completion: asyncio.Task[None] | None = None
     write_lock = asyncio.Lock()
 
     async def write(value: Json) -> None:
         async with write_lock:
             await output.write(dumps(value) + "\n")
-
-    async def notify(method: str, params: Json) -> None:
-        await write({"method": method, "params": params})
-
-    async def complete_login() -> None:
-        nonlocal login_id, logged_in
-        await asyncio.sleep(0.075)
-        current = login_id
-        if current is None or credential is None:
-            return
-        if part != "failed":
-            fd = os.open(credential, os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(dumps({"credential": "fixture-vendor-secret"}))
-            logged_in = True
-        login_id = None
-        await notify(
-            "account/login/completed",
-            {
-                "loginId": current,
-                "success": part != "failed",
-                "error": "Login server error: Login cancelled" if part == "failed" else None,
-                "onboardingEntrypoint": None,
-            },
-        )
-        if part != "failed":
-            await notify("account/updated", {"authMode": "chatgpt", "planType": ACCOUNT["planType"]})
 
     try:
         while (line := await input_.line()) is not None:
@@ -296,70 +258,22 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
                 )
             elif not initialized:
                 await error("Not initialized")
-            elif not subscriptions or home is None or credential is None:
+            elif not subscriptions or home is None:
                 await error("This stand-in implements only initialize.")
             elif method == "config/read":
                 await answer({"config": CONFIG, "origins": {}, "layers": None})
-            elif method == "account/login/start":
-                if params.get("type") not in ("chatgpt", "chatgptDeviceCode"):
-                    await error("Unsupported login type", -32602)
-                    continue
-                if login_id:
-                    await notify(
-                        "account/login/completed",
-                        {
-                            "loginId": login_id,
-                            "success": False,
-                            "error": "Login server error: Login cancelled",
-                            "onboardingEntrypoint": None,
-                        },
-                    )
-                    if completion is not None:
-                        completion.cancel()
-                login_id = f"fixture-login-{os.getpid()}"
-                await answer(
-                    {
-                        "type": "chatgptDeviceCode",
-                        "loginId": login_id,
-                        "verificationUrl": "https://auth.openai.com/codex/device",
-                        "userCode": "FIXT-12345",
-                    }
-                    if params["type"] == "chatgptDeviceCode"
-                    else {
-                        "type": "chatgpt",
-                        "loginId": login_id,
-                        "authUrl": f"https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&state={login_id}",
-                    }
-                )
-                if part != "waiting":
-                    completion = asyncio.create_task(complete_login())
-            elif method == "account/login/cancel":
-                current = login_id
-                if current is None or params.get("loginId") != current:
-                    await answer({"status": "notFound"})
-                    continue
-                if completion is not None:
-                    completion.cancel()
-                login_id = None
-                await answer({"status": "canceled"})
-                await notify(
-                    "account/login/completed",
-                    {
-                        "loginId": current,
-                        "success": False,
-                        "error": "Login server error: Login was not completed",
-                        "onboardingEntrypoint": None,
-                    },
-                )
             elif method == "account/read":
                 if part == "unavailable":
                     await error("Fixture account service unavailable", -32000)
                 else:
                     await answer(
                         {
-                            "account": ({"type": "apiKey"} if part == "other-account" else ACCOUNT)
-                            if logged_in and part != "rejected"
-                            else None,
+                            # The scenario part alone states the native account; nothing signs in here.
+                            "account": None
+                            if part == "rejected"
+                            else {"type": "apiKey"}
+                            if part == "other-account"
+                            else ACCOUNT,
                             "requiresOpenaiAuth": True,
                             "workspaceRouting": {
                                 "chatgptAccountId": "00000000-0000-0000-0000-000000000000",
@@ -368,11 +282,6 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
                             },
                         }
                     )
-            elif method == "account/logout":
-                credential.unlink(missing_ok=True)
-                logged_in = False
-                await answer({})
-                await notify("account/updated", {"authMode": None, "planType": None})
             elif method == "account/rateLimits/read":
                 if part == "rejected":
                     await error("Authentication failed: ChatGPT login expired; please log in again.", -32000)
@@ -422,7 +331,4 @@ async def stand_in(folder: Path, args: list[str], output: Output) -> int:
                 await error("This stand-in implements only Subscription app-server requests.", -32601)
     finally:
         input_.close()
-        if completion is not None:
-            completion.cancel()
-            await asyncio.gather(completion, return_exceptions=True)
     return 0
