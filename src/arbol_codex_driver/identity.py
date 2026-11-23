@@ -159,8 +159,9 @@ class IdentityState:
     @classmethod
     def open(cls, root: Path) -> IdentityState:
         preflight = state_format(root)
-        qualified = _qualified()
-        if preflight != 1 and not qualified:
+        if preflight == 1:
+            raise Failure("invalid_input", "Upgrade Driver state under exclusive maintenance before using this Build.")
+        if not _qualified():
             raise invalid()
         _prepare_directory(root, harden=preflight != 2)
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -170,7 +171,7 @@ class IdentityState:
         # missing guard while another invocation may still hold its old one.
         descriptor = os.open(root / "identity.guard", flags, 0o600)
         try:
-            result = cls(root, descriptor, 1, None)
+            result = cls(root, descriptor, DATA_FORMAT, None)
             result.check_guard()
             os.fsync(descriptor)
             _sync(root)
@@ -180,7 +181,7 @@ class IdentityState:
                 result.lock(exclusive=True)
                 number = state_format(root)
                 if number is None:
-                    if not qualified or set(root.iterdir()) != {root / "identity.guard"}:
+                    if set(root.iterdir()) != {root / "identity.guard"}:
                         raise invalid()
                     generation = fresh_token()
                     with PrivateDirectory(root) as directory:
@@ -190,22 +191,9 @@ class IdentityState:
                         directory.publish("identity.json", canonical_bytes({"version": 1, "generation": generation}))
                     number = 2
                 result.lock(exclusive=False)
-            if number == 2 and not qualified:
+            if number != DATA_FORMAT:
                 raise invalid()
-            result.format = number
-            if number == 1:
-                with PrivateDirectory(root) as directory:
-                    marker = os.open("format", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory.fd)
-                    try:
-                        if not same_inode(os.fstat(marker), (root / "format").lstat()):
-                            raise invalid()
-                        os.fchmod(marker, 0o600)
-                        os.fsync(marker)
-                        os.fsync(directory.fd)
-                    finally:
-                        os.close(marker)
-            else:
-                result.generation = root_generation(root)
+            result.generation = root_generation(root)
             result.check()
             return result
         except BaseException:
