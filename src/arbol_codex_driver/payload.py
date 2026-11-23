@@ -16,9 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .identity_protocol import (
+    DOCUMENT_LIMIT,
     MANIFEST_ENTRIES,
     MANIFEST_LIMIT,
     PrivateDirectory,
+    canonical_bytes,
     digest,
     integer,
     invalid,
@@ -30,12 +32,14 @@ from .identity_protocol import (
     same_inode,
     sha256,
 )
-from .json_types import Json
+from .json_types import Json, Object
 from .paths import installation_root
 
 MANIFEST = "driver-payload-manifest.json"
 DECLARATION = "driver-capability.json"
 COMPONENT = "arbol-codex-driver"
+REGISTRATION_RECORD = "driver-registration.json"
+REGISTRATION_LIMIT = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -350,26 +354,115 @@ DRIVER_COMPONENTS = (
 
 
 def registry_identity(registry: Path) -> str:
-    from .identity_protocol import canonical_bytes
-
     with PrivateDirectory(registry) as root:
         return sha256(canonical_bytes({"path": str(root.path), "device": root.info.st_dev, "inode": root.info.st_ino}))
 
 
-def _required(directory: PrivateDirectory, name: str) -> bytes:
-    value = directory.read(name)
+def _required(directory: PrivateDirectory, name: str, limit: int = DOCUMENT_LIMIT) -> bytes:
+    value = directory.read(name, limit)
     if value is None:
         raise invalid()
     return value
 
 
-def _registered_root(registry: Path, component: str, number: str) -> Path:
-    root = registry / component / build_number(number)
-    with PrivateDirectory(root) as directory:
-        record = parse_bytes(_required(directory, "build.json"), canonical=False)
-        if not isinstance(record, dict) or record.get("component") != component or record.get("build") != number:
+def _owner_home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _installed_registry() -> Path:
+    return _owner_home() / "Builds/registries/arbol"
+
+
+def _payload_root(registry: Path, component: str, number: str) -> Path:
+    base = _owner_home() / ".local/lib/sylvan-stack/arbol/stable" if registry == _installed_registry() else registry
+    return base / component / build_number(number) / "driver-payload"
+
+
+def _registration(registry: Path, component: str, number: str, raw: bytes) -> Object:
+    wrapper = object_fields(parse_bytes(raw, REGISTRATION_LIMIT), {"version", "kind", "registrationSha256", "record"})
+    integer(wrapper["version"], 1, 1)
+    record = wrapper["record"]
+    if wrapper["kind"] != "driver-registered-build" or not isinstance(record, dict):
+        raise invalid()
+    group_sha = digest(wrapper["registrationSha256"])
+    with PrivateDirectory(registry / ".driver-qualification/registrations") as directory:
+        group_bytes = _required(directory, group_sha + ".json", REGISTRATION_LIMIT)
+    if sha256(group_bytes) != group_sha:
+        raise invalid()
+    group = object_fields(parse_bytes(group_bytes, REGISTRATION_LIMIT), {"version", "kind", "scope", "builds"})
+    integer(group["version"], 1, 1)
+    builds = group["builds"]
+    names = ("arbol", *DRIVER_COMPONENTS)
+    if (group["kind"] != "driver-build-registration" or group["scope"] != str(registry)
+            or not isinstance(builds, list) or len(builds) != len(names)):
+        raise invalid()
+    selected: Object | None = None
+    for name, build in zip(names, builds, strict=True):
+        row = object_fields(build, {
+            "component", "build", "source", "manifestSha256", "descriptorSha256", "recordSha256",
+            "entry", "entrySha256", "entryMode", "candidate",
+        })
+        build_name = build_number(row["build"])
+        if row["component"] != name or len(build_name) > 16:
             raise invalid()
-    return physical_path(str(root / "driver-payload"))
+        row_source = object_fields(row["source"], {"commit", "tree"})
+        _commit(row_source["commit"])
+        _commit(row_source["tree"])
+        for field in ("manifestSha256", "descriptorSha256", "recordSha256", "entrySha256"):
+            digest(row[field])
+        relative_path(row["entry"])
+        mode = integer(row["entryMode"], 0, 0o777)
+        if mode & 0o022 or not mode & stat.S_IXUSR or not _text(row["candidate"]).startswith("/"):
+            raise invalid()
+        if name == component and build_name == number:
+            selected = row
+    if selected is None:
+        raise invalid()
+    selected_source = object_fields(selected["source"], {"commit", "tree"})
+    source = record.get("source")
+    if (
+        record.get("component") != component or record.get("build") != number
+        or record.get("entry") != selected["entry"] or record.get("status") != "working"
+        or record.get("packageOnly") is not True or record.get("stableCandidate") is not True
+        or record.get("prunedAt") or not isinstance(source, dict) or source.get("uncommittedChanges") is not False
+        or source.get("commit") != selected_source["commit"]
+        or sha256(canonical_bytes(record, REGISTRATION_LIMIT)) != selected["recordSha256"]
+    ):
+        raise invalid()
+    return selected
+
+
+def _registered_payload(registry: Path, component: str, number: str) -> Payload:
+    registry_build = registry / component / build_number(number)
+    with PrivateDirectory(registry_build) as directory:
+        wrapper = directory.read(REGISTRATION_RECORD, REGISTRATION_LIMIT)
+        record = directory.read("build.json")
+        row = None
+        if wrapper is not None:
+            if registry != _installed_registry() or record is not None:
+                raise invalid()
+            row = _registration(registry, component, number, wrapper)
+        else:
+            if record is None:
+                raise invalid()
+            legacy = parse_bytes(record, canonical=False)
+            if not isinstance(legacy, dict) or legacy.get("component") != component or legacy.get("build") != number:
+                raise invalid()
+
+        payload = verify_payload(_payload_root(registry, component, number), component, expected_build=number)
+        if row is not None:
+            declared = payload.declaration
+            if (
+                declared.payload_sha256 != row["descriptorSha256"]
+                or declared.manifest_sha256 != row["manifestSha256"]
+                or row["source"] != {"commit": declared.commit, "tree": declared.tree}
+            ):
+                raise invalid()
+            _launcher(payload.root.parent / relative_path(row["entry"]), digest(row["entrySha256"]),
+                      expected_mode=integer(row["entryMode"]))
+            if directory.read(REGISTRATION_RECORD, REGISTRATION_LIMIT) != wrapper or directory.read("build.json") is not None:
+                raise invalid()
+        return payload
 
 
 def _provider(registry: Path, expected_digest: str) -> Payload:
@@ -385,32 +478,35 @@ def _provider(registry: Path, expected_digest: str) -> Payload:
             # defaults, source checkouts and executable paths supply no proof.
             # Legacy registered Builds may coexist without a new payload.
             # Missing new metadata is not a competing qualified provider.
-            with PrivateDirectory(registry / "arbol" / number) as build_directory:
-                try:
-                    info = os.stat("driver-payload", dir_fd=build_directory.fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if not stat.S_ISDIR(info.st_mode):
-                    raise invalid()
-            root = _registered_root(registry, "arbol", number)
+            root = _payload_root(registry, "arbol", number)
+            try:
+                info = root.lstat()
+            except FileNotFoundError:
+                continue
+            private_stat(info, directory=True)
             with PrivateDirectory(root) as directory:
                 declaration = directory.read(DECLARATION)
             if declaration is not None and sha256(declaration) == expected_digest:
-                matches.append(verify_payload(root, "arbol", expected_build=number))
+                payload = _registered_payload(registry, "arbol", number)
+                if payload.declaration.payload_sha256 != expected_digest:
+                    raise invalid()
+                matches.append(payload)
         builds.check()
     if len(matches) != 1:
         raise invalid()
     return matches[0]
 
 
-def _launcher(path: Path, expected_digest: str) -> None:
+def _launcher(path: Path, expected_digest: str, *, expected_mode: int | None = None) -> None:
     path = physical_path(str(path))
     # Launcher directories need not be private; exact owner/type/bytes are
     # pinned by gate.json. Never follow a link or run the launcher to verify it.
     with_parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         info = os.stat(path.name, dir_fd=with_parent, follow_symlinks=False)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or not stat.S_IMODE(info.st_mode) & 0o111:
+        mode = stat.S_IMODE(info.st_mode)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or not mode & 0o111
+                or (expected_mode is not None and (mode != expected_mode or info.st_nlink != 1))):
             raise invalid()
         if _file_hash(with_parent, path.name, info) != expected_digest:
             raise invalid()
@@ -439,10 +535,9 @@ def verify_authority(
         registry = physical_path(str(registry))
         if registry_identity(registry) != digest(expected_registry_sha256):
             raise invalid()
-        registered = _registered_root(registry, COMPONENT, producer.declaration.build)
-        if registered != producer.root or producer.declaration.component != COMPONENT:
+        if _payload_root(registry, COMPONENT, producer.declaration.build) != producer.root:
             raise invalid()
-        fresh_producer = verify_payload(registered, expected_build=producer.declaration.build)
+        fresh_producer = _registered_payload(registry, COMPONENT, producer.declaration.build)
         if fresh_producer != producer:
             raise invalid()
         qualification = registry / ".driver-qualification"
@@ -500,11 +595,11 @@ def verify_authority(
         ) or current.sysname != "Darwin":
             raise invalid()
         if status == "candidate":
-            installed = installation_root(pwd.getpwuid(os.getuid()).pw_dir) / "builds"
+            legacy_installed = installation_root(_owner_home()) / "builds"
             if (
                 isolated_scope is None
                 or physical_path(str(isolated_scope)) != registry
-                or registry == installed.resolve()
+                or registry in (_installed_registry(), legacy_installed.resolve())
             ):
                 raise invalid()
         # Recheck authority bytes after inventory reads. Admission code must
