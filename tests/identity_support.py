@@ -198,6 +198,13 @@ class SuiteControl:
             os.set_blocking(self.control[0], False)
             os.set_blocking(self.control[1], False)
         except BaseException as original:
+            # Setup may have redirected only some standard descriptors. Restore
+            # each successfully duplicated original before closing our copies.
+            for number, fd in enumerate(self.control):
+                try:
+                    os.dup2(fd, number)
+                except BaseException as error:
+                    original.add_note("Suite stdio restoration: " + type(error).__name__)
             try:
                 self.close()
             except BaseException as error:
@@ -266,7 +273,8 @@ class CodexH1Support:
             if row.get("tier") == "top":
                 require(row.get("status") == "active" and isinstance(row.get("id"), str), "Disabled/malformed top case.")
                 active.append(row["id"])
-        require(len(set(active)) == len(active) and set(active) == set(self.ordered), "Shortened/extra full-top schedule.")
+        require(len(set(active)) == len(active) and tuple(active) == self.ordered,
+                "Full-top schedule must match the immutable inventory in its prescribed order.")
         self.inventory_raw = raw
         self.fixture = FixtureRoot(self.session, case)
         self.rows: list[Object] = []
@@ -772,15 +780,9 @@ class CodexPostAdmissionPhase:
     """
 
     def __init__(self, session: Session, *, case: str, ordered: Sequence[str], pending: Sequence[str]) -> None:
-        require(session is current_session(), "The checker Session must already be entered.")
-        session._check()
-        require(session.context["role"] == "helper" and session.context["entry"] == "scripts/check_build.py"
-                and session.authority.status == "candidate" and sys.argv[1:] == ["unit"]
-                and Path(sys.argv[0]) == session.authority.producer.regular_file("scripts/check_build.py"),
-                "Only the exact admitted candidate unit checker may own this phase.")
         self.session = session
-        self.support = CodexH1Support(case=case, ordered=ordered, pending=pending)
-        require(self.support.session is session, "The whole-runner Session changed during phase setup.")
+        self.case, self.ordered, self.pending = case, tuple(ordered), tuple(pending)
+        self.support: CodexH1Support | None = None
         self.entered = False
         self.closed = False
 
@@ -788,23 +790,62 @@ class CodexPostAdmissionPhase:
         require(not self.entered and not self.closed and current_session() is self.session,
                 "The post-admission phase cannot be reused or transferred.")
         self.session._check()
-        self.entered = True
-        return self
+        require(self.session.context["role"] == "helper"
+                and self.session.context["entry"] == "scripts/check_build.py"
+                and self.session.authority.status == "candidate" and sys.argv[1:] == ["unit"]
+                and Path(sys.argv[0]) == self.session.authority.producer.regular_file("scripts/check_build.py"),
+                "Only the exact admitted candidate unit checker may own this phase.")
+        try:
+            self.support = CodexH1Support(case=self.case, ordered=self.ordered, pending=self.pending)
+            require(self.support.session is self.session and current_session() is self.session,
+                    "The whole-runner Session changed during phase setup.")
+            self.session._check()
+            self.entered = True
+            return self
+        except BaseException as original:
+            self.closed = True
+            if self.support is not None:
+                try:
+                    failures = self.support.abort_before_session_finish()
+                    if failures:
+                        original.add_note("Phase setup cleanup: " + ",".join(failures))
+                except BaseException as cleanup:
+                    original.add_note("Phase setup cleanup: " + type(cleanup).__name__)
+            raise
 
     def record(self, case_id: str, status: LocalStatus, result: bytes | None) -> None:
         require(self.entered and not self.closed and current_session() is self.session,
                 "Local results require the owning admitted phase.")
         self.session._check()
+        assert self.support is not None
         self.support.record(case_id, status, result)
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  traceback: TracebackType | None) -> None:
-        require(self.entered and not self.closed and current_session() is self.session,
-                "Only the owning admitted checker may finish the local phase.")
+        if self.closed:
+            if error is not None:
+                error.add_note("Post-admission phase was already closed.")
+                return
+            raise FixtureFailure("Post-admission phase was already closed.")
         self.closed = True
-        # This joins the real H1 resources and preserves failures. The checker
-        # must still finish its own Session and the unleased outer controller
-        # must settle all deferred observations before a check can pass.
+        assert self.support is not None
+        try:
+            require(self.entered and current_session() is self.session,
+                    "Only the owning admitted checker may finish the local phase.")
+            self.session._check()
+        except BaseException as ownership:
+            try:
+                failures = self.support.abort_before_session_finish()
+                if failures:
+                    ownership.add_note("Phase ownership cleanup: " + ",".join(failures))
+            except BaseException as cleanup:
+                ownership.add_note("Phase ownership cleanup: " + type(cleanup).__name__)
+            if error is not None:
+                error.add_note("Phase ownership validation: " + str(ownership))
+                for note in getattr(ownership, "__notes__", ()):
+                    error.add_note(note)
+                return
+            raise
         self.support.__exit__(kind, error, traceback)
 
 
