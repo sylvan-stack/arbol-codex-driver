@@ -376,6 +376,9 @@ class LocalIdentityTests(unittest.TestCase):
         self.assertEqual(self._proof(after_label), original)
         self.assertEqual(subject._read(folder / "identity.json"), sidecar)
 
+        # The compatibility sign-in only refreshes status from the native account. This private
+        # peer gives local lifetime and stale-write coverage; the positive retention proof on a
+        # real native status change belongs to the real-account gate (ABR-38).
         login = await public_subscription_request(subject, "recognize-existing-login", "sign-in", "chatgpt")
         self.assertEqual((login.exit, login.stderr), (0, b""))
         completed = document(login.stdout)
@@ -612,7 +615,8 @@ for line in sys.stdin:
     if method == "initialized":
         continue
     if method == "initialize":
-        result = {"codexHome": os.environ["CODEX_HOME"], "userAgent": "codex/0.162.1"}
+        # The Driver sets no CODEX_HOME: native Codex reports its default profile.
+        result = {"codexHome": str(Path(os.environ["HOME"]) / ".codex"), "userAgent": "codex/0.162.1"}
     elif method == "config/read":
         result = {"config": {"check_for_update_on_startup": False, "web_search": "live",
                              "analytics": {"enabled": False}, "features": {"memories": False}}}
