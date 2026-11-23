@@ -458,8 +458,12 @@ def _registered_payload(registry: Path, component: str, number: str) -> Payload:
                 or row["source"] != {"commit": declared.commit, "tree": declared.tree}
             ):
                 raise invalid()
-            _launcher(payload.root.parent / relative_path(row["entry"]), digest(row["entrySha256"]),
-                      expected_mode=integer(row["entryMode"]))
+            image = payload.root.parent
+            entry = image / relative_path(row["entry"])
+            resolved = entry.resolve(strict=True)
+            if not resolved.is_relative_to(image) or not stat.S_ISREG(entry.lstat().st_mode):
+                raise invalid()
+            _launcher(resolved, digest(row["entrySha256"]), expected_mode=integer(row["entryMode"]))
             if directory.read(REGISTRATION_RECORD, REGISTRATION_LIMIT) != wrapper or directory.read("build.json") is not None:
                 raise invalid()
         return payload
