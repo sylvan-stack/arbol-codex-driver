@@ -56,17 +56,9 @@ CODEX_UNIT_ORDER: tuple[str, ...] = (
     'tests/top/test_top_subscription_identity.py::LifetimeRaceTests.test_failed_run_cannot_remove_a_newer_map_revision_for_the_same_conversation',
     'tests/top/test_top_subscription_identity.py::HelperSpanTests.test_helper_independent_lease',
 )
-# The observer must settle both the actual H1 span and the entire runner's
-# real terminal/lease interval. These names select no action or wire command.
-CODEX_EXTERNAL_OBSERVERS: tuple[tuple[str, str], ...] = (
-    ("H1-span-completion", "WholeCheckController.run_h1_positive"),
-    ("terminal-close-closure", "WholeCheckController.verify_terminal_closure"),
-)
-CODEX_EXTERNAL_IDS: tuple[str, ...] = tuple(item[0] for item in CODEX_EXTERNAL_OBSERVERS)
-# These two fixed labels are not the complete per-case external allocation.
-# The outer controller must bind actual maintenance/recovery observations after
-# the whole runner; names alone cannot authorize terminal gate success.
-CODEX_EXTERNAL_ALLOCATION_COMPLETE = False
+# Local reports retain both pending external obligations. The sealed Arbol
+# controller constructs their actual observers on the same original subject.
+CODEX_EXTERNAL_IDS = ("H1-span-completion", "terminal-close-closure")
 LocalStatus = Literal["passed", "failed", "skipped", "unavailable", "pending"]
 
 
@@ -1256,8 +1248,9 @@ class CodexTerminalClose:
     def arm(self, support: CodexH1Support, *, tuple_pins_sha256: str,
             completed_local_results: Sequence[TerminalLocalResult], finished_helpers: Sequence[TerminalHelperWitness],
             expected_helper_entries: Sequence[str]) -> None:
-        require(CODEX_EXTERNAL_ALLOCATION_COMPLETE and self.entered and not self.armed and type(self.session) is Session
+        require(self.entered and not self.armed and type(self.session) is Session
                 and current_session() is self.session and support.session is self.session
+                and support.ordered == CODEX_UNIT_ORDER and support.pending == CODEX_EXTERNAL_IDS
                 and support.completed and not support.console.closed and not support.cleanup_errors
                 and len(completed_local_results) == len(support.ordered) <= 4096
                 and re.fullmatch(r"[0-9a-f]{64}", tuple_pins_sha256, re.ASCII) is not None
