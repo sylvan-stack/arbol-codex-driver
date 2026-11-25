@@ -250,11 +250,12 @@ async def run(
 
         def server_request(method: str, params: Json) -> Json:
             approval = method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval")
+            permissions = method == "item/permissions/requestApproval"
             identity = object_value(params)
             notice: Object = {
                 "code": "unexpected_request",
-                "message": f"codex sent {method}; the Driver approved it automatically."
-                if approval
+                "message": f"Codex requested approval through {method}, and this run has no permission approval channel."
+                if approval or permissions
                 else f"codex sent {method}; this request is unsupported and was answered with an error.",
                 **{key: identity[key] for key in ("threadId", "turnId") if isinstance(identity.get(key), str)},
             }
@@ -262,7 +263,11 @@ async def run(
                 server.notify("driver/notice", notice)
             else:
                 pending_request_notices.append(notice)
-            return {"decision": "accept"} if approval else None
+            if approval:
+                return {"decision": "decline"}
+            if permissions:
+                return {"permissions": {}, "scope": "turn"}
+            return None
 
         server = await AppServer.start(
             tool_path=require_tool(tool),
@@ -292,50 +297,22 @@ async def run(
             assert server is not None
             return await server.request(method, params, cancellation=cancellation)
 
-        catalog = await read_model_catalog(rpc, fallback=False)
-        models = catalog["models"]
-        assert isinstance(models, list)
-        configured_model = string(server.effective_config.get("model"))
-        wanted = request.model or configured_model
-        model = next(
-            (
-                item
-                for item in models
-                if isinstance(item, dict) and (item["id"] == wanted if wanted is not None else item.get("isDefault"))
-            ),
-            None,
-        )
-        if not isinstance(model, dict):
-            raise Failure(
-                "invalid_input" if request.model else "tool_failed",
-                "The requested model is not in the tool catalog."
-                if request.model
-                else "Codex did not identify its default model in the catalog.",
-            )
-        configured_effort = string(server.effective_config.get("model_reasoning_effort"))
-        effort = request.effort or configured_effort or string(model.get("defaultEffort"))
-        efforts = model.get("efforts", [])
-        tiers = model.get("serviceTiers", [])
-        assert isinstance(efforts, list) and isinstance(tiers, list)
-        if request.effort_from_settings and request.effort and request.effort not in efforts:
-            pending_notices.append(
-                {
-                    "code": "ignored_default_effort",
-                    "message": "The Subscription default effort is not supported by this model; the tool default is used.",
-                }
-            )
-            effort = configured_effort or string(model.get("defaultEffort"))
-        if effort and effort not in efforts:
-            raise Failure("invalid_input", "The requested effort is not supported by the model.")
-        if request.service_tier and request.service_tier not in tiers:
-            raise Failure("invalid_input", "The requested service tier is not supported by the model.")
+        models: list[Json] = []
+        if request.model or request.effort or request.service_tier:
+            catalog = await read_model_catalog(rpc, fallback=False)
+            catalog_models = catalog["models"]
+            assert isinstance(catalog_models, list)
+            models = catalog_models
+            if request.model and not any(isinstance(item, dict) and item.get("id") == request.model for item in models):
+                raise Failure("invalid_input", "The requested model is not in the tool catalog.")
+        model_params: Object = {"model": request.model} if request.model is not None else {}
         assert plan is not None
         thread: Json = None
         if plan["continuity"] == "resumed":
             try:
                 thread = await rpc(
                     "thread/resume",
-                    {"threadId": plan["conversation"], "model": model["id"]},
+                    {"threadId": plan["conversation"], **model_params},
                 )
             except Failure as failure:
                 if "vendorCode" not in object_value(failure.result.get("detail")) or cancellation.aborted:
@@ -351,9 +328,8 @@ async def run(
                 "thread/start",
                 {
                     "cwd": str(cwd),
-                    "model": model["id"],
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only" if request.tools == "none" else "danger-full-access",
+                    **model_params,
+                    **({"sandbox": "read-only"} if request.tools == "none" else {}),
                     **({"serviceTier": request.service_tier} if request.service_tier is not None else {}),
                     **({"developerInstructions": request.system_prompt} if request.system_prompt is not None else {}),
                     **({"ephemeral": True} if request.tools == "none" and request.working_directory is None else {}),
@@ -370,6 +346,16 @@ async def run(
             else set()
         )
         conversation, current_model = str(native_thread["id"]), str(thread_record["model"])
+        active_model = next((item for item in models if isinstance(item, dict) and item.get("id") == current_model), None)
+        if isinstance(active_model, dict):
+            efforts = active_model.get("efforts", [])
+            tiers = active_model.get("serviceTiers", [])
+            assert isinstance(efforts, list) and isinstance(tiers, list)
+            if request.effort and request.effort not in efforts:
+                raise Failure("invalid_input", "The requested effort is not supported by the model.")
+            if request.service_tier and request.service_tier not in tiers:
+                raise Failure("invalid_input", "The requested service tier is not supported by the model.")
+        effort = request.effort or string(thread_record.get("reasoningEffort"))
         record["conversation"] = conversation
         await runs.update(record)
         turn_input = request.input
@@ -399,13 +385,10 @@ async def run(
                 {
                     "threadId": conversation,
                     "input": message,
-                    "model": model["id"],
-                    "effort": effort,
-                    "summary": "detailed",
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "readOnly", "networkAccess": False}
-                    if request.tools == "none"
-                    else {"type": "dangerFullAccess"},
+                    **model_params,
+                    **({"effort": request.effort} if request.effort is not None else {}),
+                    **({"sandboxPolicy": {"type": "readOnly", "networkAccess": False}}
+                       if request.tools == "none" else {}),
                     **({"serviceTier": request.service_tier} if request.service_tier is not None else {}),
                 },
             )

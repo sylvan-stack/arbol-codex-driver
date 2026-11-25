@@ -20,7 +20,6 @@ class RunRequest:
     tools: str
     model: str | None = None
     effort: str | None = None
-    effort_from_settings: bool = False
     service_tier: str | None = None
     system_prompt: str | None = None
     working_directory: str | None = None
@@ -132,7 +131,6 @@ async def read_run_request(
             bad("cueContext must be valid UTF-8.")
     settings = settings or {}
     subscription_id = string(value.get("subscriptionId")) or string(settings.get("defaultSubscription")) or "chatgpt"
-    defaults = object_value(object_value(settings.get("subscriptions")).get(subscription_id))
     run_id = string(value.get("runId")) or str(uuid.uuid4())
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", run_id):
         bad("The run identifier is not a safe file name.")
@@ -234,9 +232,8 @@ async def read_run_request(
         cast(list[Object], history),
         input_,
         str(tools),
-        string(value.get("model")) or string(defaults.get("defaultModel")),
-        string(value.get("effort")) or string(defaults.get("defaultEffort")),
-        "effort" not in value and "defaultEffort" in defaults,
+        string(value.get("model")),
+        string(value.get("effort")),
         string(value.get("serviceTier")),
         string(value.get("systemPrompt")),
         work,

@@ -26,12 +26,7 @@ from .process_identity import process_identity as admission_process_identity
 from .state import Owner, fixed_wait, owner_json, private_directory, process_owner, ps_time
 from .tool import OLDEST_SUPPORTED, supported_version
 
-APP_SERVER_OPTIONS = (
-    "--disable", "memories",
-    "-c", "check_for_update_on_startup=false",
-    "-c", "analytics.enabled=false",
-    "-c", 'web_search="live"',
-)
+APP_SERVER_OPTIONS: tuple[str, ...] = ()
 
 
 # The shell reads only the private pipe, closes its inherited barrier, then
@@ -53,19 +48,6 @@ def startup_ledger(owner: Owner) -> bytes:
     if ps_time(line) != owner["startedAt"]:
         raise Failure("internal", "Cannot preserve the tool process identity.")
     return f"{owner['pid']}\n{line}\n".encode("ascii")
-
-
-def validate_driver_config(value: Json) -> Object:
-    config = object_value(object_value(value).get("config"))
-    if (
-        config.get("check_for_update_on_startup") is not False
-        or config.get("web_search") != "live"
-        or object_value(config.get("analytics")).get("enabled") is not False
-        or object_value(config.get("features")).get("memories") is not False
-    ):
-        raise Failure("tool_unsupported", "codex did not apply the Driver configuration.",
-                      {"remedy": "Update codex."})
-    return config
 
 
 def rpc_failure(error: Object, private_values: tuple[str, ...] = ()) -> Failure:
@@ -138,7 +120,6 @@ class AppServer:
         self.watchers: list[tuple[str, Callable[[Json], bool], asyncio.Future[Json]]] = []
         self.notification_waiter: asyncio.Future[Notification] | None = None
         self.failure: Failure | None = None
-        self.effective_config: Object = {}
         self.tool_version: str | None = None
         self.log_tail = ""
         self.groups: dict[int, Owner] = {owner["pid"]: owner}
@@ -209,6 +190,8 @@ class AppServer:
             arguments = ["/bin/sh", "-c", _EXEC_BARRIER, "arbol-codex-launch", str(barrier_read), *arguments]
         # The clean environment excludes inherited Arbol identity.
         child_env = clean_environment(env, owner_home, str(isolated_home) if isolated_home is not None else None)
+        if "SHELL" in env:
+            child_env["SHELL"] = env["SHELL"]
         if arbol_chat_id is not None:
             child_env["ARBOL_CHAT"] = arbol_chat_id
             if disabled_hook_features:
@@ -304,9 +287,6 @@ class AppServer:
                               {"detail": {"basis": "fields", "toolVersion": server.tool_version,
                                           "neededVersion": OLDEST_SUPPORTED}, "remedy": "Update codex."})
             await server.send({"method": "initialized"})
-            server.effective_config = validate_driver_config(
-                await server.request("config/read", {}, cancellation=cancellation)
-            )
             return server
         except BaseException:
             close_barrier()  # EOF prevents vendor exec before bounded cleanup.
