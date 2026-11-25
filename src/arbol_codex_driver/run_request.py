@@ -211,8 +211,7 @@ async def read_run_request(
         for directory in [*([work] if work is not None else []), *additional]
     ):
         bad("A working or additional directory does not exist.")
-    if work is not None:
-        work = str(Path(work).resolve(strict=True))
+    work = str(Path(work).resolve(strict=True) if work is not None else Path.cwd())
     if "limits" in value and (
         not isinstance(value["limits"], dict)
         or any(

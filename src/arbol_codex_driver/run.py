@@ -12,7 +12,7 @@ from .catalog import read_model_catalog
 from .continuity import Chats, MessageDigest
 from .errors import Failure, redact
 from .event_stream import EventStream
-from .history import history_items, labelled_history_input, prepare_turn_input
+from .history import labelled_history_input, prepare_turn_input
 from .identity import LifetimeSnapshot, lifetime_matches
 from .input_stream import Input
 from .json_types import Json, Object, loads, object_value, string
@@ -160,10 +160,7 @@ async def run(
         record = await subscriptions.state.with_subscription_lock(request.subscription_id, reserve, env)
         temporary = subscriptions.state.directory / "tmp" / request.run_id
         private_directory(temporary)
-        work = Path(request.working_directory) if request.working_directory is not None else temporary / "work"
-        if request.working_directory is None:
-            private_directory(work)
-        cwd = work.resolve(strict=True)
+        cwd = (Path(request.working_directory) if request.working_directory is not None else Path.cwd()).resolve(strict=True)
         child_env = env.copy()
         owner_config = owner_mcp_config(env) if request.tools == "all" else {}
         private_values = diagnostic_values(owner_config)
@@ -332,7 +329,6 @@ async def run(
                     **({"sandbox": "read-only"} if request.tools == "none" else {}),
                     **({"serviceTier": request.service_tier} if request.service_tier is not None else {}),
                     **({"developerInstructions": request.system_prompt} if request.system_prompt is not None else {}),
-                    **({"ephemeral": True} if request.tools == "none" and request.working_directory is None else {}),
                 },
             )
         thread_record = object_value(thread)
@@ -360,18 +356,13 @@ async def run(
         await runs.update(record)
         turn_input = request.input
         if plan["continuity"] == "rebuilt" and request.history:
-            try:
-                await rpc("thread/inject_items", {"threadId": conversation, "items": history_items(request.history)})
-            except Failure as failure:
-                if "vendorCode" not in object_value(failure.result.get("detail")) or cancellation.aborted:
-                    raise
-                turn_input = labelled_history_input(request.history, request.input)
-                pending_notices.append(
-                    {
-                        "code": "history_as_text",
-                        "message": "Codex refused the native history; the earlier conversation was sent as labelled text.",
-                    }
-                )
+            turn_input = labelled_history_input(request.history, request.input)
+            pending_notices.append(
+                {
+                    "code": "history_as_text",
+                    "message": "The earlier Arbol conversation was supplied as labelled prompt context.",
+                }
+            )
         message = prepare_turn_input(turn_input, temporary)
         if request.cue_context:
             message.insert(1, {"type": "text", "text": "Cue Cards for this turn:\n\n" + request.cue_context})
