@@ -796,6 +796,7 @@ async def _join_owned[T](task: asyncio.Task[T]) -> T:
 
 
 _CURRENT: ContextVar[Session | None] = ContextVar("codex_driver_admission", default=None)
+standalone_launch: ContextVar[bool] = ContextVar("codex_standalone_launch", default=False)
 
 
 def current_session() -> Session:

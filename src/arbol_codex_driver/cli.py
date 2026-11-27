@@ -6,7 +6,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import cast
 
-from .admission import current_session
+from .admission import current_session, standalone_launch
 from .arguments import Options, parse_arguments
 from .build import build_identity, qualified_capabilities
 from .cancellation import Cancellation
@@ -92,8 +92,8 @@ async def main(args: list[str], *, invocation: Invocation | None = None) -> int:
             cancellation.check()
             await write_json(output, administrative_result)
             return 0
-        # The new program never supplies a format1/source admission bypass.
-        current_session()
+        if not standalone_launch.get():
+            current_session()
         if command.name == "dev stand-in":
             from .stand_in import stand_in
 
@@ -236,12 +236,16 @@ async def main(args: list[str], *, invocation: Invocation | None = None) -> int:
             loop.remove_signal_handler(signum)
 
 
-def entry() -> None:
+def entry(*, standalone: bool = True) -> None:
     invocation = Invocation()
+    token = standalone_launch.set(standalone)
     try:
         code = asyncio.run(main(sys.argv[1:], invocation=invocation))
     finally:
         # asyncio.run has joined every remaining task and executor worker;
         # component authority is still retained by the outer trusted entry.
-        invocation.close()
+        try:
+            invocation.close()
+        finally:
+            standalone_launch.reset(token)
     sys.exit(code)

@@ -45,6 +45,15 @@ def bootstrap() -> None:
         module_file = getattr(module, "__file__", None)
         if module_file is not None:
             confined(root, module_file)
+    if not any(name in os.environ for name in (
+        "ARBOL_DRIVER_ADMISSION_FD", "ARBOL_DRIVER_ADMISSION_CONTEXT",
+        "ARBOL_DRIVER_MAINTENANCE_FD", "ARBOL_DRIVER_MAINTENANCE_CONTEXT",
+    )):
+        sys.path.insert(0, os.path.join(root, "src"))
+        from arbol_codex_driver.cli import entry
+
+        entry()
+        return
     info = os.stat(root, follow_symlinks=False)
     if info.st_uid != os.getuid() or info.st_mode & 0o7777 != 0o700 or info.st_mode & 0o170000 != 0o040000:
         refuse()

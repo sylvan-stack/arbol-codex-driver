@@ -679,4 +679,4 @@ def bootstrap_entry(root_path: str, entry_path: str, declaration_bytes: bytes) -
     with factory(payload, selected_context, selected_descriptor):
         from .cli import entry as cli_entry
 
-        cli_entry()
+        cli_entry(standalone=False)

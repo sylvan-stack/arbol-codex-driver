@@ -7,10 +7,10 @@ from .json_types import Object, loads
 
 
 def qualified_capabilities() -> Object:
-    from .admission import current_session
+    from .admission import current_session, standalone_launch
 
-    # Admission already verified this exact D's integer capability fields.
-    current_session()
+    if not standalone_launch.get():
+        current_session()
     return {"subscriptionIdentity": 1}
 
 
@@ -37,6 +37,8 @@ def build_identity(start: Path | None = None) -> Object:
     directory = start or Path(__file__).resolve().parent
     while True:
         file = directory / "build.json"
+        if not file.exists():
+            file = directory / "package-manifest.json"
         try:
             value = loads(file.read_text())
         except FileNotFoundError:
@@ -48,7 +50,7 @@ def build_identity(start: Path | None = None) -> Object:
                 not isinstance(value, dict)
                 or value.get("component") != "arbol-codex-driver"
                 or not isinstance(value.get("build"), str)
-                or not re.fullmatch(r"[1-9a-f][0-9a-f]*", str(value["build"]))
+                or not re.fullmatch(r"0|[1-9a-f][0-9a-f]*", str(value["build"]))
                 or not isinstance(value.get("packageVersion"), str)
                 or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", str(value["packageVersion"]))
             ):

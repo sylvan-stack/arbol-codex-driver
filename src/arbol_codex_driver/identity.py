@@ -139,7 +139,10 @@ def root_generation(root: Path) -> str:
 
 
 def _qualified() -> bool:
-    from .admission import current_session
+    from .admission import current_session, standalone_launch
+
+    if standalone_launch.get():
+        return True
 
     try:
         current_session()

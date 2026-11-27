@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
-from .admission import current_session
+from .admission import current_session, standalone_launch
 from .build import build_identity
 from .cancellation import Cancellation, interruptible
 from .environment import clean_environment
@@ -172,9 +172,10 @@ class AppServer:
                     os.close(descriptor)
 
         if launch_identity_path is not None:
-            session = current_session()
-            with session.registry.mutex():
-                session._check()
+            if not standalone_launch.get():
+                session = current_session()
+                with session.registry.mutex():
+                    session._check()
             raw_read, raw_write = os.pipe()
             try:
                 # Keep the private barrier distinct from child stdio even if
@@ -254,7 +255,9 @@ class AppServer:
                     or await process_owner(child.pid) != owner or child.returncode is not None
                 ):
                     raise Failure("tool_failed", "The app-server startup process changed.")
-                current_session().registry.check_lock("admission.lock", current_session().lease)
+                if not standalone_launch.get():
+                    session = current_session()
+                    session.registry.check_lock("admission.lock", session.lease)
                 if os.write(barrier_write, b"go\n") != 3:
                     raise Failure("tool_failed", "Cannot release the app-server startup barrier.")
                 close_barrier()

@@ -2,11 +2,12 @@
 """Packaged, explicit no-prompt probes and quota-spending checks."""
 
 import asyncio
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, cast
 
-from .admission import current_session
+from .admission import current_session, standalone_launch
 from .cancellation import Cancellation, interruptible
 from .dev_support import (
     driver_environment,
@@ -120,11 +121,21 @@ async def execute_run(
     """Exercise the same public program from source or a relocated Build."""
     path = directory / (uuid.uuid4().hex + ".json")
     write_json(path, request)
-    child = await current_session().spawn_helper_async(
-        ["run", "--request", str(path), "--state-dir", str(subscriptions.state.directory),
-         *(["--control"] if stop else [])],
-        entry="bin/entry.py", environment=driver_environment(env), cwd=directory, limit=1024 * 1024,
-    )
+    arguments = ["run", "--request", str(path), "--state-dir", str(subscriptions.state.directory)]
+    if stop:
+        arguments.append("--control")
+    environment = driver_environment(env)
+    if standalone_launch.get():
+        entry = Path(__file__).resolve().parents[2] / "bin" / "entry.py"
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, "-ISB", str(entry), *arguments, env=environment, cwd=directory,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True, limit=1024 * 1024,
+        )
+    else:
+        child = await current_session().spawn_helper_async(
+            arguments, entry="bin/entry.py", environment=environment, cwd=directory, limit=1024 * 1024,
+        )
     assert child.stdin is not None and child.stdout is not None and child.stderr is not None
     stderr = asyncio.create_task(child.stderr.read())
     events: list[Object] = []
